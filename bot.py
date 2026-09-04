@@ -1,5 +1,7 @@
 import asyncio
+import json
 import logging
+import os
 from contextlib import suppress
 
 from aiocryptopay import AioCryptoPay, Networks
@@ -26,8 +28,32 @@ dp = Dispatcher(storage=MemoryStorage())
 
 crypto: AioCryptoPay = None
 
-# Базы данных в памяти
-products = {}
+# --- Работа с хранением данных (JSON) ---
+PRODUCTS_FILE = "products.json"
+
+
+def load_products():
+    if os.path.exists(PRODUCTS_FILE):
+        try:
+            with open(PRODUCTS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return {int(k): v for k, v in data.items()}
+        except Exception as e:
+            logging.error(f"Ошибка чтения products.json: {e}")
+            return {}
+    return {}
+
+
+def save_products(products_data):
+    try:
+        with open(PRODUCTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(products_data, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        logging.error(f"Ошибка сохранения products.json: {e}")
+
+
+# Загружаем товары из файла
+products = load_products()
 users = {}
 
 
@@ -36,6 +62,10 @@ class AddProduct(StatesGroup):
     name = State()
     price = State()
     content = State()
+
+
+class DuplicateProduct(StatesGroup):
+    waiting_for_content = State()
 
 
 class WithdrawStates(StatesGroup):
@@ -128,7 +158,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     user_data = get_user(user_id)
 
-    # Обработка реферальной ссылки
     args = message.text.split()
     if len(args) > 1 and args[1].startswith("ref_"):
         with suppress(ValueError):
@@ -377,8 +406,9 @@ async def check_payment(call: types.CallbackQuery):
             inv = invoices if not isinstance(invoices, list) else invoices[0]
 
             if str(inv.status).lower() == "paid":
-                # Автоматически удаляем товар из базы
+                # Автоматически удаляем товар из базы и сохраняем
                 del products[p_id]
+                save_products(products)
 
                 buyer = call.from_user
                 buyer_data = get_user(buyer.id)
@@ -475,8 +505,9 @@ async def process_successful_payment(message: types.Message):
         product = products.get(p_id)
 
         if product:
-            # Автоматически удаляем товар из базы
+            # Автоматически удаляем товар из базы и сохраняем
             del products[p_id]
+            save_products(products)
 
             buyer = message.from_user
             buyer_data = get_user(buyer.id)
@@ -549,11 +580,68 @@ async def adm_list(call: types.CallbackQuery):
         await call.message.answer("Список товаров пуст.")
         await call.answer()
         return
-    text = "📋 **Список товаров:**\n\n"
+
     for p_id, data in products.items():
-        text += f"ID: `{p_id}` | **{data['name']}** — {data['price']}₽\nТекст выдачи: `{data['content']}`\n\n"
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Дублировать", callback_data=f"adm_dup_{p_id}")],
+                [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"delprod_{p_id}")]
+            ]
+        )
+        text = f"📦 **Товар ID: `{p_id}`**\n🏷 Название: **{data['name']}**\n💰 Цена: **{data['price']}₽**\n🔗 Выдача: `{data['content']}`"
+        await call.message.answer(text, reply_markup=kb, parse_mode="Markdown")
     await call.answer()
-    await call.message.answer(text, parse_mode="Markdown")
+
+
+@dp.callback_query(F.data.startswith("adm_dup_"))
+async def adm_dup_start(call: types.CallbackQuery, state: FSMContext):
+    if call.from_user.id != ADMIN_ID:
+        return
+
+    p_id = int(call.data.split("_")[2])
+    target_product = products.get(p_id)
+
+    if not target_product:
+        await call.answer("Товар не найден!", show_alert=True)
+        return
+
+    await state.update_data(
+        dup_name=target_product["name"],
+        dup_price=target_product["price"]
+    )
+    await state.set_state(DuplicateProduct.waiting_for_content)
+
+    await call.message.answer(
+        f"📋 **Создание дубликата товара:**\n"
+        f"🏷 Название: **{target_product['name']}**\n"
+        f"💰 Цена: **{target_product['price']}₽**\n\n"
+        f"👇 Отправьте **ссылку** или **текст**, который получит покупатель:",
+        parse_mode="Markdown"
+    )
+    await call.answer()
+
+
+@dp.message(DuplicateProduct.waiting_for_content)
+async def process_dup_content(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+
+    new_id = max(products.keys(), default=0) + 1
+    products[new_id] = {
+        "name": data["dup_name"],
+        "price": data["dup_price"],
+        "content": message.text.strip(),
+    }
+    save_products(products)
+
+    await state.clear()
+    await message.answer(
+        f"✅ **Дубликат товара успешно создан!**\n\n"
+        f"📦 ID: `{new_id}`\n"
+        f"🏷 Название: **{data['dup_name']}**\n"
+        f"💰 Цена: **{data['dup_price']}₽**\n"
+        f"🔗 Ссылка/Выдача: `{message.text.strip()}`",
+        parse_mode="Markdown"
+    )
 
 
 @dp.callback_query(F.data == "adm_del")
@@ -584,6 +672,7 @@ async def adm_del_confirm(call: types.CallbackQuery):
     p_id = int(call.data.replace("delprod_", ""))
     if p_id in products:
         deleted_item = products.pop(p_id)
+        save_products(products)
         await call.answer(f"Товар «{deleted_item['name']}» удален!", show_alert=True)
 
     await call.message.edit_text("⚙️ Админ-панель", reply_markup=admin_keyboard())
@@ -594,7 +683,7 @@ async def adm_add_start(call: types.CallbackQuery, state: FSMContext):
     if call.from_user.id != ADMIN_ID:
         return
     await state.set_state(AddProduct.name)
-    await call.message.answer("Введите название товара:")
+    await call.message.answer("Введите название товара (например: 100k монет):")
     await call.answer()
 
 
@@ -602,7 +691,7 @@ async def adm_add_start(call: types.CallbackQuery, state: FSMContext):
 async def process_name(message: types.Message, state: FSMContext):
     await state.update_data(name=message.text)
     await state.set_state(AddProduct.price)
-    await message.answer("Введите цену в рублях (например: 35):")
+    await message.answer("Введите цену в рублях (например: 30):")
 
 
 @dp.message(AddProduct.price)
@@ -622,10 +711,11 @@ async def process_content(message: types.Message, state: FSMContext):
     products[new_id] = {
         "name": data["name"],
         "price": data["price"],
-        "content": message.text,
+        "content": message.text.strip(),
     }
+    save_products(products)
     await state.clear()
-    await message.answer(f"✅ Товар **{data['name']}** успешно добавлен!", parse_mode="Markdown")
+    await message.answer(f"✅ Товар **{data['name']}** ({data['price']}₽) успешно добавлен!", parse_mode="Markdown")
 
 
 # --- Глобальная обработка ошибок Telegram ---
