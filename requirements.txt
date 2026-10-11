@@ -3,3 +3,8 @@ requests
 aiogram==3.18.0
 aiohttp==3.11.12
 python-3.11.9
+python-telegram-bot==21.11
+requests==2.31.0
+aiogram==3.18.0
+aiohttp==3.11.12
+pydantic==2.10.6
