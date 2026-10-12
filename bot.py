@@ -16,7 +16,7 @@ from aiogram.types import (
     Message,
 )
 
-BOT_TOKEN = "8707492747:AAGXm74I8HMQuMN8oIZyGHxfdmq8LnBT0nA"
+BOT_TOKEN = "8707492747:AAFdthVShZttIT44JeKU2kcebr_xUDJhHHE"
 ADMIN_ID = 619112100  # Ваш ID администратора
 
 # Настройки сервисов
