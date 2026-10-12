@@ -180,7 +180,6 @@ async def start_handler(message: Message, command: CommandObject) -> None:
             referrer_id = int(args.split("_")[1])
             if referrer_id != user_id and user_id not in pending_referrals:
                 pending_referrals[user_id] = referrer_id
-                # Уведомляем реферера о новом переходе
                 if referrer_id in user_data_db:
                     ref_msg = (
                         f"реферал: {username_str}\n"
@@ -219,7 +218,7 @@ async def start_handler(message: Message, command: CommandObject) -> None:
 
 
 @router.message(F.contact)
-async def contact_handler(message: Message, session: aiohttp.ClientSession) -> None:
+async def contact_handler(message: Message) -> None:
     user_id = message.from_user.id
     contact = message.contact
 
@@ -243,7 +242,7 @@ async def contact_handler(message: Message, session: aiohttp.ClientSession) -> N
     verified_users.add(user_id)
     await message.answer("✅ Проверка номера успешно пройдена!", reply_markup=ReplyKeyboardRemove())
     
-    await show_sponsors(message, session)
+    await show_sponsors(message)
 
 
 @router.message()
@@ -483,7 +482,7 @@ async def any_message_handler(message: Message, state: FSMContext) -> None:
         return
 
 
-async def show_sponsors(message: Message, session: aiohttp.ClientSession = None):
+async def show_sponsors(message: Message):
     user = message.from_user
     user_id = user.id
     chat_id = message.chat.id
@@ -494,9 +493,8 @@ async def show_sponsors(message: Message, session: aiohttp.ClientSession = None)
         "is_premium": user.is_premium,
     }
 
-    async with aiohttp.ClientSession() as temp_session:
-        current_session = session or temp_session
-
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as current_session:
         collected_tgrass = []
         collected_piarflow = []
         collected_trafsly = []
@@ -529,7 +527,6 @@ async def show_sponsors(message: Message, session: aiohttp.ClientSession = None)
     for sponsor in collected_trafsly:
         all_links.append(sponsor["link"])
 
-    # Формируем кнопки по 2 в ряд (сетка)
     buttons = []
     temp_row = []
     for link in all_links:
@@ -550,7 +547,6 @@ async def show_sponsors(message: Message, session: aiohttp.ClientSession = None)
                 user_data_db[ref_id]["balance"] += global_stats["referral_reward"]
                 user_data_db[ref_id]["referrals"] += 1
                 
-                # Уведомляем реферера об успешном завершении подписок
                 ref_username = user_data_db[user_id]["username"]
                 total_bal = user_data_db[ref_id]["balance"]
                 success_ref_msg = (
@@ -721,11 +717,11 @@ async def done_task_handler(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("skip_task_"))
-async def skip_task_handler(callback: CallbackQuery) -> None:
+async def skip_task_handler(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     if admin_tasks_db:
         admin_tasks_db.pop(0)
-    await task_menu_handler(callback, FSMContext(None, None))
+    await task_menu_handler(callback, state)
 
 
 @router.callback_query(F.data == "menu_profile")
@@ -1292,7 +1288,7 @@ async def back_to_main_handler(callback: CallbackQuery, state: FSMContext) -> No
 
 
 @router.callback_query(F.data == "check_all_tasks")
-async def check_all_tasks_handler(callback: CallbackQuery, session: aiohttp.ClientSession) -> None:
+async def check_all_tasks_handler(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
     tasks_data = user_active_tasks.get(user_id)
 
@@ -1301,65 +1297,67 @@ async def check_all_tasks_handler(callback: CallbackQuery, session: aiohttp.Clie
         await callback.answer()
         return
 
-    # 1. Проверяем Tgrass
-    tg_offers = tasks_data.get("tgrass", [])
-    if tg_offers:
-        try:
-            payload = {
-                "tg_user_id": int(user_id),
-                "tg_login": callback.from_user.username,
-                "lang": callback.from_user.language_code or "ru",
-                "is_premium": bool(callback.from_user.is_premium),
-            }
-            async with session.post(
-                f"{TGRASS_API_URL}/offers",
-                json=payload,
-                headers={"Auth": TGRASS_API_KEY, "Content-Type": "application/json", "accept": "application/json"}
-            ) as resp:
-                res = await resp.json(content_type=None)
-                if res.get("status") == "ok":
-                    tasks_data["tgrass"] = []
-                else:
-                    offers = res.get("offers", [])
-                    active_links = {o["link"] for o in offers if not o.get("subscribed", True)}
-                    tasks_data["tgrass"] = [o for o in tg_offers if o["link"] in active_links]
-        except:
-            pass
-
-    # 2. Проверяем Piarflow
-    pf_links = tasks_data.get("piarflow", [])
-    if pf_links:
-        try:
-            links_only = [item["link"] for item in pf_links]
-            async with session.post(
-                f"{PIARFLOW_API_URL}/sponsors/check",
-                json={"user_id": user_id, "links": links_only},
-                headers={"Authorization": f"Bearer {PIARFLOW_API_KEY}", "Content-Type": "application/json"}
-            ) as resp:
-                res = await resp.json(content_type=None)
-                sponsors = res.get("sponsors", [])
-                subscribed_links = {s["link"] for s in sponsors if s.get("status") == "subscribed"}
-                tasks_data["piarflow"] = [item for item in pf_links if item["link"] not in subscribed_links]
-        except:
-            pass
-
-    # 3. Проверяем Trafsly
-    tf_sponsors = tasks_data.get("trafsly", [])
-    if tf_sponsors:
-        remaining_trafsly = []
-        for sponsor in tf_sponsors:
+    timeout = aiohttp.ClientTimeout(total=15)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        # 1. Проверяем Tgrass
+        tg_offers = tasks_data.get("tgrass", [])
+        if tg_offers:
             try:
+                payload = {
+                    "tg_user_id": int(user_id),
+                    "tg_login": callback.from_user.username,
+                    "lang": callback.from_user.language_code or "ru",
+                    "is_premium": bool(callback.from_user.is_premium),
+                }
                 async with session.post(
-                    f"{TRAFSLY_API_URL}/api/v1/confirm-subscription",
-                    json={"user_id": user_id, "ads_id": sponsor.get("ads_id")},
-                    headers={"Auth": TRAFSLY_API_KEY, "Content-Type": "application/json"}
+                    f"{TGRASS_API_URL}/offers",
+                    json=payload,
+                    headers={"Auth": TGRASS_API_KEY, "Content-Type": "application/json", "accept": "application/json"}
                 ) as resp:
                     res = await resp.json(content_type=None)
-                    if not res.get("subscribed", False):
-                        remaining_trafsly.append(sponsor)
+                    if res.get("status") == "ok":
+                        tasks_data["tgrass"] = []
+                    else:
+                        offers = res.get("offers", [])
+                        active_links = {o["link"] for o in offers if not o.get("subscribed", True)}
+                        tasks_data["tgrass"] = [o for o in tg_offers if o["link"] in active_links]
             except:
-                remaining_trafsly.append(sponsor)
-        tasks_data["trafsly"] = remaining_trafsly
+                pass
+
+        # 2. Проверяем Piarflow
+        pf_links = tasks_data.get("piarflow", [])
+        if pf_links:
+            try:
+                links_only = [item["link"] for item in pf_links]
+                async with session.post(
+                    f"{PIARFLOW_API_URL}/sponsors/check",
+                    json={"user_id": user_id, "links": links_only},
+                    headers={"Authorization": f"Bearer {PIARFLOW_API_KEY}", "Content-Type": "application/json"}
+                ) as resp:
+                    res = await resp.json(content_type=None)
+                    sponsors = res.get("sponsors", [])
+                    subscribed_links = {s["link"] for s in sponsors if s.get("status") == "subscribed"}
+                    tasks_data["piarflow"] = [item for item in pf_links if item["link"] not in subscribed_links]
+            except:
+                pass
+
+        # 3. Проверяем Trafsly
+        tf_sponsors = tasks_data.get("trafsly", [])
+        if tf_sponsors:
+            remaining_trafsly = []
+            for sponsor in tf_sponsors:
+                try:
+                    async with session.post(
+                        f"{TRAFSLY_API_URL}/api/v1/confirm-subscription",
+                        json={"user_id": user_id, "ads_id": sponsor.get("ads_id")},
+                        headers={"Auth": TRAFSLY_API_KEY, "Content-Type": "application/json"}
+                    ) as resp:
+                        res = await resp.json(content_type=None)
+                        if not res.get("subscribed", False):
+                            remaining_trafsly.append(sponsor)
+                except:
+                    remaining_trafsly.append(sponsor)
+            tasks_data["trafsly"] = remaining_trafsly
 
     left_tgrass = tasks_data.get("tgrass", [])
     left_piarflow = tasks_data.get("piarflow", [])
@@ -1427,12 +1425,9 @@ async def check_all_tasks_handler(callback: CallbackQuery, session: aiohttp.Clie
 
 
 async def main() -> None:
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        dp.workflow_data["session"] = session
-        dp.include_router(router)
-        print("✅ Бот успешно запущен!")
-        await dp.start_polling(bot)
+    dp.include_router(router)
+    print("✅ Бот успешно запущен!")
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
