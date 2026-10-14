@@ -1433,6 +1433,7 @@ def webhook():
     if request.headers.get("content-type") == "application/json":
         json_data = request.get_json(force=True)
         try:
+            # Использован правильный современный метод для aiogram 3.x
             update = Update.model_validate(json_data, context={"bot": bot})
             asyncio.run(dp.feed_update(bot, update))
         except Exception as e:
