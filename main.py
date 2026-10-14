@@ -1,4 +1,5 @@
 import asyncio
+import os
 import aiohttp
 from datetime import datetime, timedelta
 from flask import Flask, request
@@ -18,7 +19,8 @@ from aiogram.types import (
     Update,
 )
 
-BOT_TOKEN = "8707492747:AAFdthVShZttIT44JeKU2kcebr_xUDJhHHE"
+# Токен берется из безопасных переменных окружения Vercel
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = 619112100  # Ваш ID администратора
 
 # Настройки сервисов
@@ -1433,7 +1435,6 @@ def webhook():
     if request.headers.get("content-type") == "application/json":
         json_data = request.get_json(force=True)
         try:
-            # Использован правильный современный метод для aiogram 3.x
             update = Update.model_validate(json_data, context={"bot": bot})
             asyncio.run(dp.feed_update(bot, update))
         except Exception as e:
