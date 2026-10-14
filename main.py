@@ -1,3 +1,4 @@
+import os
 import asyncio
 import aiohttp
 from datetime import datetime, timedelta
@@ -14,19 +15,21 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     Message,
+    Update,
 )
+from flask import Flask, request
 
 BOT_TOKEN = "8707492747:AAFdthVShZttIT44JeKU2kcebr_xUDJhHHE"
 ADMIN_ID = 619112100  # Ваш ID администратора
 
 # Настройки сервисов
-PIARFLOW_API_KEY = "kXTxlA61jxLHuIQVIGGkHy_LeW09A9nk"
+PIARFLOW_API_KEY = "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv"
 PIARFLOW_API_URL = "https://piarflow.com/v1"
 
-TRAFSLY_API_KEY = "at_071d4c162055016409c9f1aae472ecea"
+TRAFSLY_API_KEY = "at_99ddd0618296db80b905c92ff9adaa8c"
 TRAFSLY_API_URL = "https://api.trafsly.com"
 
-TGRASS_API_KEY = "4fa41e31955c4fdf86f893e81d9b9347"
+TGRASS_API_KEY = "6d6e9e9701e7440a81fe099d360710d5"
 TGRASS_API_URL = "https://tgrass.space"
 
 # Изображения
@@ -39,6 +42,9 @@ WITHDRAW_PHOTO_URL = "https://i.postimg.cc/RVdQKYYf/6219881422739149362.jpg"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
+
+# Flask приложение для Vercel (требуется переменная app)
+app = Flask(__name__)
 
 # Состояния для FSM
 class WithdrawStates(StatesGroup):
@@ -71,7 +77,7 @@ class AdminRewardStates(StatesGroup):
 user_active_tasks: dict[int, dict] = {}
 verified_users: set[int] = set()
 fully_passed_users: set[int] = set()
-user_data_db: dict[int, dict] = {}  # {user_id: {"name": str, "username": str, "balance": float, "referrals": int, "join_date": datetime}}
+user_data_db: dict[int, dict] = {}  
 pending_referrals: dict[int, int] = {}
 withdraw_temp_data: dict[int, dict] = {}
 
@@ -198,7 +204,8 @@ async def start_handler(message: Message, command: CommandObject) -> None:
         return
 
     if user_id in verified_users:
-        await show_sponsors(message)
+        async with aiohttp.ClientSession() as session:
+            await show_sponsors(message, session)
         return
 
     keyboard = ReplyKeyboardMarkup(
@@ -242,7 +249,8 @@ async def contact_handler(message: Message) -> None:
     verified_users.add(user_id)
     await message.answer("✅ Проверка номера успешно пройдена!", reply_markup=ReplyKeyboardRemove())
     
-    await show_sponsors(message)
+    async with aiohttp.ClientSession() as session:
+        await show_sponsors(message, session)
 
 
 @router.message()
@@ -482,7 +490,7 @@ async def any_message_handler(message: Message, state: FSMContext) -> None:
         return
 
 
-async def show_sponsors(message: Message):
+async def show_sponsors(message: Message, session: aiohttp.ClientSession):
     user = message.from_user
     user_id = user.id
     chat_id = message.chat.id
@@ -493,25 +501,23 @@ async def show_sponsors(message: Message):
         "is_premium": user.is_premium,
     }
 
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as current_session:
-        collected_tgrass = []
-        collected_piarflow = []
-        collected_trafsly = []
+    collected_tgrass = []
+    collected_piarflow = []
+    collected_trafsly = []
 
-        remaining = TARGET_COUNT
-        tg_offers = await fetch_tgrass(current_session, user_id, user_data, remaining)
-        collected_tgrass.extend(tg_offers)
-        remaining -= len(collected_tgrass)
+    remaining = TARGET_COUNT
+    tg_offers = await fetch_tgrass(session, user_id, user_data, remaining)
+    collected_tgrass.extend(tg_offers)
+    remaining -= len(collected_tgrass)
 
-        if remaining > 0:
-            pf_links = await fetch_piarflow(current_session, user_id, chat_id, remaining)
-            collected_piarflow.extend(pf_links)
-            remaining -= len(collected_piarflow)
+    if remaining > 0:
+        pf_links = await fetch_piarflow(session, user_id, chat_id, remaining)
+        collected_piarflow.extend(pf_links)
+        remaining -= len(collected_piarflow)
 
-        if remaining > 0:
-            tf_sponsors = await fetch_trafsly(current_session, user_id, chat_id, user_data, remaining)
-            collected_trafsly.extend(tf_sponsors)
+    if remaining > 0:
+        tf_sponsors = await fetch_trafsly(session, user_id, chat_id, user_data, remaining)
+        collected_trafsly.extend(tf_sponsors)
 
     user_active_tasks[user_id] = {
         "tgrass": collected_tgrass,
@@ -555,7 +561,7 @@ async def show_sponsors(message: Message):
                     f"доход: {total_bal:.1f} ⭐"
                 )
                 try:
-                    await message.bot.send_message(chat_id=ref_id, text=success_ref_msg)
+                    await bot.send_message(chat_id=ref_id, text=success_ref_msg)
                 except:
                     pass
 
@@ -717,11 +723,11 @@ async def done_task_handler(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("skip_task_"))
-async def skip_task_handler(callback: CallbackQuery, state: FSMContext) -> None:
+async def skip_task_handler(callback: CallbackQuery) -> None:
     await callback.answer()
     if admin_tasks_db:
         admin_tasks_db.pop(0)
-    await task_menu_handler(callback, state)
+    await task_menu_handler(callback, FSMContext(None, None))
 
 
 @router.callback_query(F.data == "menu_profile")
@@ -957,7 +963,7 @@ async def confirm_withdraw_handler(callback: CallbackQuery, state: FSMContext) -
         ]
     )
     try:
-        await callback.bot.send_message(chat_id=ADMIN_ID, text=admin_text, reply_markup=admin_markup)
+        await bot.send_message(chat_id=ADMIN_ID, text=admin_text, reply_markup=admin_markup)
     except:
         pass
 
@@ -1071,7 +1077,7 @@ async def admin_bc_send(callback: CallbackQuery, state: FSMContext) -> None:
     sent_count = 0
     for uid in user_data_db.keys():
         try:
-            await callback.bot.send_message(chat_id=uid, text=bc_text)
+            await bot.send_message(chat_id=uid, text=bc_text)
             sent_count += 1
         except:
             pass
@@ -1297,8 +1303,7 @@ async def check_all_tasks_handler(callback: CallbackQuery) -> None:
         await callback.answer()
         return
 
-    timeout = aiohttp.ClientTimeout(total=15)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
         # 1. Проверяем Tgrass
         tg_offers = tasks_data.get("tgrass", [])
         if tg_offers:
@@ -1383,7 +1388,7 @@ async def check_all_tasks_handler(callback: CallbackQuery) -> None:
                     f"доход: {total_bal:.1f} ⭐"
                 )
                 try:
-                    await callback.bot.send_message(chat_id=ref_id, text=success_ref_msg)
+                    await bot.send_message(chat_id=ref_id, text=success_ref_msg)
                 except:
                     pass
 
@@ -1424,11 +1429,21 @@ async def check_all_tasks_handler(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-async def main() -> None:
-    dp.include_router(router)
-    print("✅ Бот успешно запущен!")
-    await dp.start_polling(bot)
+# Регистрация роутера в диспетчере
+dp.include_router(router)
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+# Webhook роут для Vercel
+@app.route("/", methods=["POST"])
+def webhook():
+    if request.headers.get("content-type") == "application/json":
+        json_data = request.get_json(force=True)
+        update = Update.de_json(json_data, bot)
+        asyncio.run(dp.feed_update(bot, update))
+        return "", 200
+    return "OK", 200
+
+
+@app.route("/", methods=["GET"])
+def index():
+    return "Bot is running on Vercel!", 200
