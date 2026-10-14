@@ -1,7 +1,7 @@
-import os
 import asyncio
 import aiohttp
 from datetime import datetime, timedelta
+from flask import Flask, request
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
@@ -17,7 +17,6 @@ from aiogram.types import (
     Message,
     Update,
 )
-from flask import Flask, request
 
 BOT_TOKEN = "8707492747:AAFdthVShZttIT44JeKU2kcebr_xUDJhHHE"
 ADMIN_ID = 619112100  # Ваш ID администратора
@@ -42,9 +41,6 @@ WITHDRAW_PHOTO_URL = "https://i.postimg.cc/RVdQKYYf/6219881422739149362.jpg"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
-
-# Flask приложение для Vercel (требуется переменная app)
-app = Flask(__name__)
 
 # Состояния для FSM
 class WithdrawStates(StatesGroup):
@@ -204,8 +200,7 @@ async def start_handler(message: Message, command: CommandObject) -> None:
         return
 
     if user_id in verified_users:
-        async with aiohttp.ClientSession() as session:
-            await show_sponsors(message, session)
+        await show_sponsors(message)
         return
 
     keyboard = ReplyKeyboardMarkup(
@@ -490,7 +485,7 @@ async def any_message_handler(message: Message, state: FSMContext) -> None:
         return
 
 
-async def show_sponsors(message: Message, session: aiohttp.ClientSession):
+async def show_sponsors(message: Message, session: aiohttp.ClientSession = None):
     user = message.from_user
     user_id = user.id
     chat_id = message.chat.id
@@ -501,23 +496,26 @@ async def show_sponsors(message: Message, session: aiohttp.ClientSession):
         "is_premium": user.is_premium,
     }
 
-    collected_tgrass = []
-    collected_piarflow = []
-    collected_trafsly = []
+    async with aiohttp.ClientSession() as temp_session:
+        current_session = session or temp_session
 
-    remaining = TARGET_COUNT
-    tg_offers = await fetch_tgrass(session, user_id, user_data, remaining)
-    collected_tgrass.extend(tg_offers)
-    remaining -= len(collected_tgrass)
+        collected_tgrass = []
+        collected_piarflow = []
+        collected_trafsly = []
 
-    if remaining > 0:
-        pf_links = await fetch_piarflow(session, user_id, chat_id, remaining)
-        collected_piarflow.extend(pf_links)
-        remaining -= len(collected_piarflow)
+        remaining = TARGET_COUNT
+        tg_offers = await fetch_tgrass(current_session, user_id, user_data, remaining)
+        collected_tgrass.extend(tg_offers)
+        remaining -= len(collected_tgrass)
 
-    if remaining > 0:
-        tf_sponsors = await fetch_trafsly(session, user_id, chat_id, user_data, remaining)
-        collected_trafsly.extend(tf_sponsors)
+        if remaining > 0:
+            pf_links = await fetch_piarflow(current_session, user_id, chat_id, remaining)
+            collected_piarflow.extend(pf_links)
+            remaining -= len(collected_piarflow)
+
+        if remaining > 0:
+            tf_sponsors = await fetch_trafsly(current_session, user_id, chat_id, user_data, remaining)
+            collected_trafsly.extend(tf_sponsors)
 
     user_active_tasks[user_id] = {
         "tgrass": collected_tgrass,
@@ -561,7 +559,7 @@ async def show_sponsors(message: Message, session: aiohttp.ClientSession):
                     f"доход: {total_bal:.1f} ⭐"
                 )
                 try:
-                    await bot.send_message(chat_id=ref_id, text=success_ref_msg)
+                    await message.bot.send_message(chat_id=ref_id, text=success_ref_msg)
                 except:
                     pass
 
@@ -949,9 +947,7 @@ async def confirm_withdraw_handler(callback: CallbackQuery, state: FSMContext) -
 
     admin_text = (
         "📥 Заявка на вывод\n"
-        "Enter\n"
         f"Получатель: {username}\n"
-        "enter\n"
         f"Количество: {amount}⭐"
     )
     admin_markup = InlineKeyboardMarkup(
@@ -963,7 +959,7 @@ async def confirm_withdraw_handler(callback: CallbackQuery, state: FSMContext) -
         ]
     )
     try:
-        await bot.send_message(chat_id=ADMIN_ID, text=admin_text, reply_markup=admin_markup)
+        await callback.bot.send_message(chat_id=ADMIN_ID, text=admin_text, reply_markup=admin_markup)
     except:
         pass
 
@@ -1077,7 +1073,7 @@ async def admin_bc_send(callback: CallbackQuery, state: FSMContext) -> None:
     sent_count = 0
     for uid in user_data_db.keys():
         try:
-            await bot.send_message(chat_id=uid, text=bc_text)
+            await callback.bot.send_message(chat_id=uid, text=bc_text)
             sent_count += 1
         except:
             pass
@@ -1288,7 +1284,6 @@ async def admin_reward_apply(callback: CallbackQuery, state: FSMContext) -> None
 @router.callback_query(F.data == "back_to_main")
 async def back_to_main_handler(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    print("👉 Нажата кнопка: Назад")
     await callback.answer()
     await send_main_menu(callback)
 
@@ -1388,7 +1383,7 @@ async def check_all_tasks_handler(callback: CallbackQuery) -> None:
                     f"доход: {total_bal:.1f} ⭐"
                 )
                 try:
-                    await bot.send_message(chat_id=ref_id, text=success_ref_msg)
+                    await callback.bot.send_message(chat_id=ref_id, text=success_ref_msg)
                 except:
                     pass
 
@@ -1429,20 +1424,21 @@ async def check_all_tasks_handler(callback: CallbackQuery) -> None:
     await callback.answer()
 
 
-# Регистрация роутера в диспетчере
+# ================= FLASK WEBHOOK (ДЛЯ VERCEL) =================
+app = Flask(__name__)
 dp.include_router(router)
 
-
-# Webhook роут для Vercel
 @app.route("/", methods=["POST"])
 def webhook():
     if request.headers.get("content-type") == "application/json":
         json_data = request.get_json(force=True)
-        update = Update.de_json(json_data, bot)
-        asyncio.run(dp.feed_update(bot, update))
-        return "", 200
-    return "OK", 200
-
+        try:
+            update = Update.model_validate(json_data, context={"bot": bot})
+            asyncio.run(dp.feed_update(bot, update))
+        except Exception as e:
+            print(f"Webhook error: {e}")
+        return "OK", 200
+    return "Error", 403
 
 @app.route("/", methods=["GET"])
 def index():
