@@ -617,25 +617,15 @@ async def send_main_menu(message_or_callback):
 
     try:
         if isinstance(message_or_callback, CallbackQuery):
-            await message_or_callback.message.edit_media(
-                media=InputMediaPhoto(media=PHOTO_URL, caption=text),
-                reply_markup=main_menu_markup
-            )
+            await message_or_callback.message.answer_photo(photo=PHOTO_URL, caption=text, reply_markup=main_menu_markup)
+            try:
+                await message_or_callback.message.delete()
+            except:
+                pass
         else:
             await message.answer_photo(photo=PHOTO_URL, caption=text, reply_markup=main_menu_markup)
-    except Exception as e:
-        print(f"Ошибка при отправке главного меню: {e}")
-        try:
-            if isinstance(message_or_callback, CallbackQuery):
-                await message_or_callback.message.answer_photo(photo=PHOTO_URL, caption=text, reply_markup=main_menu_markup)
-                try:
-                    await message_or_callback.message.delete()
-                except:
-                    pass
-            else:
-                await message.answer_photo(photo=PHOTO_URL, caption=text, reply_markup=main_menu_markup)
-        except Exception as ex:
-            print(f"Критическая ошибка главного меню: {ex}")
+    except Exception as ex:
+        print(f"Критическая ошибка главного меню: {ex}")
 
 
 @router.callback_query(F.data == "menu_task")
