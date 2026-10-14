@@ -91,11 +91,6 @@ global_stats = {
 
 TARGET_COUNT = 10
 
-CIS_PHONE_PREFIXES = (
-    "+7", "+375", "+380", "+998", "+996", 
-    "+374", "+994", "+373", "+992", "+993", "+995"
-)
-
 
 async def fetch_tgrass(session, user_id, user_data, limit):
     try:
@@ -197,55 +192,7 @@ async def start_handler(message: Message, command: CommandObject) -> None:
         except ValueError:
             pass
 
-    if user_id in fully_passed_users:
-        await send_main_menu(message)
-        return
-
-    if user_id in verified_users:
-        await show_sponsors(message)
-        return
-
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Пройти проверку 🤝", request_contact=True)]
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True
-    )
-    
-    text = (
-        "Пройти проверку на бота 👇🏻\n\n"
-        "Чтобы избежать массовой накрутки со стороны нечестных пользователей, мы вынуждены установить данную проверку. 🤝\n\n"
-        "Спасибо за понимание! 🫂"
-    )
-    await message.answer(text, reply_markup=keyboard)
-
-
-@router.message(F.contact)
-async def contact_handler(message: Message) -> None:
-    user_id = message.from_user.id
-    contact = message.contact
-
-    if contact.user_id != user_id:
-        await message.answer("⚠️ Пожалуйста, поделитесь именно вашим контактом с помощью кнопки ниже.")
-        return
-
-    phone_number = contact.phone_number
-    if not phone_number.startswith("+"):
-        phone_number = "+" + phone_number
-
-    is_cis = any(phone_number.startswith(prefix) for prefix in CIS_PHONE_PREFIXES)
-
-    if not is_cis:
-        await message.answer(
-            "❌ Доступ разрешен только для пользователей из стран СНГ.",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return
-
     verified_users.add(user_id)
-    await message.answer("✅ Проверка номера успешно пройдена!", reply_markup=ReplyKeyboardRemove())
-    
     async with aiohttp.ClientSession() as session:
         await show_sponsors(message, session)
 
@@ -481,10 +428,6 @@ async def any_message_handler(message: Message, state: FSMContext) -> None:
             )
             await message.answer(text_out, reply_markup=markup)
             return
-
-    if user_id not in verified_users:
-        await message.answer("⚠️ Пожалуйста, нажмите на кнопку «Пройти проверку 🤝» внизу, чтобы получить доступ к боту.")
-        return
 
 
 async def show_sponsors(message: Message, session: aiohttp.ClientSession = None):
