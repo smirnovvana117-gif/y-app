@@ -441,26 +441,40 @@ async def show_sponsors(message: Message, session: aiohttp.ClientSession = None)
         "is_premium": user.is_premium,
     }
 
-    async with aiohttp.ClientSession() as temp_session:
-        current_session = session or temp_session
+    timeout = aiohttp.ClientTimeout(total=3)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as temp_session:
+            current_session = session or temp_session
 
-        collected_tgrass = []
-        collected_piarflow = []
-        collected_trafsly = []
+            collected_tgrass = []
+            collected_piarflow = []
+            collected_trafsly = []
 
-        remaining = TARGET_COUNT
-        tg_offers = await fetch_tgrass(current_session, user_id, user_data, remaining)
-        collected_tgrass.extend(tg_offers)
-        remaining -= len(collected_tgrass)
+            remaining = TARGET_COUNT
+            
+            try:
+                tg_offers = await fetch_tgrass(current_session, user_id, user_data, remaining)
+                collected_tgrass.extend(tg_offers)
+                remaining -= len(collected_tgrass)
+            except:
+                pass
 
-        if remaining > 0:
-            pf_links = await fetch_piarflow(current_session, user_id, chat_id, remaining)
-            collected_piarflow.extend(pf_links)
-            remaining -= len(collected_piarflow)
+            if remaining > 0:
+                try:
+                    pf_links = await fetch_piarflow(current_session, user_id, chat_id, remaining)
+                    collected_piarflow.extend(pf_links)
+                    remaining -= len(collected_piarflow)
+                except:
+                    pass
 
-        if remaining > 0:
-            tf_sponsors = await fetch_trafsly(current_session, user_id, chat_id, user_data, remaining)
-            collected_trafsly.extend(tf_sponsors)
+            if remaining > 0:
+                try:
+                    tf_sponsors = await fetch_trafsly(current_session, user_id, chat_id, user_data, remaining)
+                    collected_trafsly.extend(tf_sponsors)
+                except:
+                    pass
+    except:
+        collected_tgrass, collected_piarflow, collected_trafsly = [], [], []
 
     user_active_tasks[user_id] = {
         "tgrass": collected_tgrass,
@@ -475,16 +489,6 @@ async def show_sponsors(message: Message, session: aiohttp.ClientSession = None)
         all_links.append(item["link"])
     for sponsor in collected_trafsly:
         all_links.append(sponsor["link"])
-
-    buttons = []
-    temp_row = []
-    for link in all_links:
-        temp_row.append(InlineKeyboardButton(text="✉️ Подписаться", url=link))
-        if len(temp_row) == 2:
-            buttons.append(temp_row)
-            temp_row = []
-    if temp_row:
-        buttons.append(temp_row)
 
     if not all_links:
         if user_id not in fully_passed_users:
@@ -510,6 +514,16 @@ async def show_sponsors(message: Message, session: aiohttp.ClientSession = None)
 
         await send_main_menu(message)
         return
+
+    buttons = []
+    temp_row = []
+    for link in all_links:
+        temp_row.append(InlineKeyboardButton(text="✉️ Подписаться", url=link))
+        if len(temp_row) == 2:
+            buttons.append(temp_row)
+            temp_row = []
+    if temp_row:
+        buttons.append(temp_row)
 
     buttons.append([InlineKeyboardButton(text='Проверить подписку', callback_data="check_all_tasks")])
     markup = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1369,10 +1383,7 @@ def webhook():
         json_data = request.get_json(force=True)
         try:
             update = Update.model_validate(json_data, context={"bot": bot})
-            
-            # Корректный запуск для Vercel без зависаний цикла
             asyncio.run(dp.feed_update(bot, update))
-            
         except Exception as e:
             print(f"Webhook error: {e}")
         return "OK", 200
