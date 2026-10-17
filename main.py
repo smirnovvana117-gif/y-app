@@ -16,9 +16,9 @@ from aiogram.types import (
     Update,
 )
 
-# =====================================================================
+# ======================================================================
 #                         НАСТРОЙКИ — ВСТАВЬТЕ КЛЮЧИ ЗДЕСЬ
-# =====================================================================
+# ======================================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")   # токен бота (из Vercel)
 ADMIN_ID = 619112100                      # ID администратора
 
@@ -568,6 +568,7 @@ def build_sponsor_markup(all_links: list[str]) -> InlineKeyboardMarkup:
 
 
 async def reward_referrer_if_needed(bot: Bot, user_id: int) -> None:
+    """Реферал реально подписался на спонсоров — начисляем награду."""
     if user_id in pending_referrals:
         ref_id = pending_referrals.pop(user_id)
         if ref_id in user_data_db:
@@ -584,6 +585,24 @@ async def reward_referrer_if_needed(bot: Bot, user_id: int) -> None:
             )
             try:
                 await bot.send_message(chat_id=ref_id, text=success_ref_msg)
+            except Exception:
+                pass
+
+
+async def notify_referrer_no_sponsors(bot: Bot, user_id: int) -> None:
+    """Обязательных подписок не было — награды нет, пригласившему приходит уведомление."""
+    if user_id in pending_referrals:
+        ref_id = pending_referrals.pop(user_id)
+        if ref_id in user_data_db:
+            ref_username = user_data_db.get(user_id, {}).get("username", f"id{user_id}")
+            total_bal = user_data_db[ref_id]["balance"]
+            msg = (
+                f"реферал: {ref_username}\n"
+                f"не подписался на спонсоров ваш доход 0.00 ⭐\n"
+                f"доход: {total_bal:.2f} ⭐"
+            )
+            try:
+                await bot.send_message(chat_id=ref_id, text=msg)
             except Exception:
                 pass
 
@@ -636,10 +655,11 @@ async def show_sponsors(message: Message, user=None):
     )
 
     if not all_links:
+        # Обязательных подписок не было
         if user_id not in fully_passed_users:
             global_stats["total_sponsors_completed"] += 1
         fully_passed_users.add(user_id)
-        await reward_referrer_if_needed(message.bot, user_id)
+        await notify_referrer_no_sponsors(message.bot, user_id)
         await send_main_menu(message, user)
         return
 
@@ -1309,6 +1329,7 @@ async def check_all_tasks_handler(callback: CallbackQuery) -> None:
             global_stats["total_sponsors_completed"] += 1
         fully_passed_users.add(user_id)
 
+        # Пользователь реально подписался на спонсоров — награда пригласившему
         await reward_referrer_if_needed(callback.bot, user_id)
         await safe_answer(callback)
         await send_main_menu(callback)  # удалит старое сообщение сам
