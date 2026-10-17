@@ -648,10 +648,8 @@ async def show_sponsors(message: Message, user=None):
         "🤖 Для использования бота подпишись на каналы ниже\n\n"
         "🔻 После подписки нажимай на кнопку \"Проверить подписку\""
     )
-    try:
-        await message.answer_photo(photo=PHOTO_URL, caption=text, reply_markup=markup)
-    except Exception:
-        await message.answer(text, reply_markup=markup)
+    # Без картинки — только текст и кнопки
+    await message.answer(text, reply_markup=markup)
 
 
 # ================= ГЛАВНОЕ МЕНЮ =================
