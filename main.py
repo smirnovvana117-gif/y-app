@@ -27,9 +27,9 @@ from aiogram.types import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN")   # токен бота (из Vercel)
 ADMIN_ID = 619112100                      # ID администратора
  
-TGRASS_API_KEY = os.environ.get("TGRASS_API_KEY", "ВСТАВЬТЕ_КЛЮЧ_TGRASS")
-PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "ВСТАВЬТЕ_КЛЮЧ_PIARFLOW")
-TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "ВСТАВЬТЕ_КЛЮЧ_TRAFSLY")
+TGRASS_API_KEY = os.environ.get("TGRASS_API_KEY", "6d6e9e9701e7440a81fe099d360710d5")
+PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv")
+TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "at_99ddd0618296db80b905c92ff9adaa8c")
  
 # Upstash Redis (для топа рефералов): Vercel -> Storage -> Upstash Redis
 UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
