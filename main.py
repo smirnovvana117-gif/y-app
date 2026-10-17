@@ -1369,12 +1369,19 @@ def webhook():
         json_data = request.get_json(force=True)
         try:
             update = Update.model_validate(json_data, context={"bot": bot})
-            asyncio.run(dp.feed_update(bot, update))
+            
+            # Безопасный запуск для среды Vercel (без ошибки закрытого цикла)
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_closed():
+                    raise RuntimeError
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                
+            loop.run_until_complete(dp.feed_update(bot, update))
+            
         except Exception as e:
             print(f"Webhook error: {e}")
         return "OK", 200
     return "Error", 403
-
-@app.route("/", methods=["GET"])
-def index():
-    return "Bot is running on Vercel!", 200
