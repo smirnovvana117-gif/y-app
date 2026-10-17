@@ -1,8 +1,10 @@
 import asyncio
 import json
 import os
-import aiohttp
 from datetime import datetime, timedelta
+from typing import Optional
+
+import aiohttp
 from flask import Flask, request
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart, CommandObject
@@ -17,14 +19,20 @@ from aiogram.types import (
 )
 
 # ======================================================================
-#                         НАСТРОЙКИ — ВСТАВЬТЕ КЛЮЧИ ЗДЕСЬ
+#                         НАСТРОЙКИ
+#  Лучше задать всё через переменные окружения Vercel.
+#  Если переменной нет — используется значение-заглушка.
 # ======================================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")   # токен бота (из Vercel)
 ADMIN_ID = 619112100                      # ID администратора
 
-TGRASS_API_KEY = "ВСТАВЬТЕ_КЛЮЧ_TGRASS"
-PIARFLOW_API_KEY = "ВСТАВЬТЕ_КЛЮЧ_PIARFLOW"
-TRAFSLY_API_KEY = "ВСТАВЬТЕ_КЛЮЧ_TRAFSLY"
+TGRASS_API_KEY = os.environ.get("TGRASS_API_KEY", "ВСТАВЬТЕ_КЛЮЧ_TGRASS")
+PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "ВСТАВЬТЕ_КЛЮЧ_PIARFLOW")
+TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "ВСТАВЬТЕ_КЛЮЧ_TRAFSLY")
+
+# Upstash Redis (для топа рефералов): Vercel -> Storage -> Upstash Redis
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 # ======================================================================
 
 PIARFLOW_API_URL = "https://piarflow.com/v1"
@@ -43,6 +51,8 @@ for _name, _val in (
     ("TGRASS_API_KEY", TGRASS_API_KEY),
     ("PIARFLOW_API_KEY", PIARFLOW_API_KEY),
     ("TRAFSLY_API_KEY", TRAFSLY_API_KEY),
+    ("UPSTASH_REDIS_REST_URL", UPSTASH_URL),
+    ("UPSTASH_REDIS_REST_TOKEN", UPSTASH_TOKEN),
 ):
     if not key_filled(_val):
         print(f"⚠️ НЕ ЗАПОЛНЕНО: {_name}")
@@ -91,6 +101,7 @@ class AdminRewardStates(StatesGroup):
 
 # ================= ХРАНИЛИЩА (в памяти!) =================
 # ВНИМАНИЕ: на Vercel память не постоянная. Для боевого бота нужна внешняя БД.
+# Топ рефералов хранится в Redis (см. блок REDIS ниже).
 user_active_tasks: dict[int, dict] = {}
 verified_users: set[int] = set()
 fully_passed_users: set[int] = set()
@@ -164,6 +175,61 @@ async def replace_with_photo(callback: CallbackQuery, photo: str, text: str, mar
         await callback.message.delete()
     except Exception:
         pass
+
+
+# ================= REDIS (ТОП РЕФЕРАЛОВ) =================
+async def redis_cmd(*args):
+    """Выполняет команду Redis через Upstash REST. Если не настроен — None."""
+    if not UPSTASH_URL or not UPSTASH_TOKEN:
+        return None
+    try:
+        timeout = aiohttp.ClientTimeout(total=4)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                UPSTASH_URL,
+                json=list(args),
+                headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+            ) as resp:
+                data = await resp.json()
+                return data.get("result")
+    except Exception as e:
+        print(f"redis error: {e!r}")
+        return None
+
+
+async def add_referral_to_top(ref_id: int, name: str) -> None:
+    """+1 реферал пригласившему и сохранение его имени."""
+    await redis_cmd("ZINCRBY", "top_refs", 1, str(ref_id))
+    await redis_cmd("HSET", "top_names", str(ref_id), name or f"id{ref_id}")
+
+
+async def get_top(limit: int = 5) -> list[tuple[int, str, int]]:
+    """Возвращает [(user_id, имя, рефералов), ...] от большего к меньшему."""
+    res = await redis_cmd("ZREVRANGE", "top_refs", 0, limit - 1, "WITHSCORES")
+
+    if res is None:
+        # Redis не настроен — запасной вариант из памяти
+        items = sorted(user_data_db.items(), key=lambda i: i[1]["referrals"], reverse=True)
+        return [(uid, d["name"], d["referrals"]) for uid, d in items[:limit] if d["referrals"] > 0]
+
+    ids = res[0::2]
+    scores = res[1::2]
+    names = await redis_cmd("HMGET", "top_names", *ids) if ids else []
+    names = names or [None] * len(ids)
+
+    return [
+        (int(uid), name or f"id{uid}", int(float(score)))
+        for uid, name, score in zip(ids, names, scores)
+    ]
+
+
+async def get_user_refs_and_rank(user_id: int) -> tuple[int, Optional[int]]:
+    """Возвращает (кол-во рефералов, место в рейтинге или None)."""
+    score = await redis_cmd("ZSCORE", "top_refs", str(user_id))
+    if score is None:
+        return user_data_db.get(user_id, {}).get("referrals", 0), None
+    rank = await redis_cmd("ZREVRANK", "top_refs", str(user_id))
+    return int(float(score)), (rank + 1 if rank is not None else None)
 
 
 # ================= API СПОНСОРОВ =================
@@ -302,6 +368,7 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
         f"TGRASS_API_KEY: {key_status(TGRASS_API_KEY)}",
         f"PIARFLOW_API_KEY: {key_status(PIARFLOW_API_KEY)}",
         f"TRAFSLY_API_KEY: {key_status(TRAFSLY_API_KEY)}",
+        f"REDIS (топ): {'настроен' if UPSTASH_URL and UPSTASH_TOKEN else 'НЕ НАСТРОЕН'}",
         "",
     ]
 
@@ -570,6 +637,11 @@ def build_sponsor_markup(all_links: list[str]) -> InlineKeyboardMarkup:
 async def reward_referrer_if_needed(bot: Bot, user_id: int) -> None:
     if user_id in pending_referrals:
         ref_id = pending_referrals.pop(user_id)
+
+        # Записываем реферала в топ (Redis) — работает, даже если память сбросилась
+        ref_name = user_data_db.get(ref_id, {}).get("name") or f"id{ref_id}"
+        await add_referral_to_top(ref_id, ref_name)
+
         if ref_id in user_data_db:
             reward = global_stats["referral_reward"]
             user_data_db[ref_id]["balance"] += reward
@@ -841,27 +913,27 @@ async def top_handler(callback: CallbackQuery, state: FSMContext) -> None:
 
     user_id = callback.from_user.id
     ensure_user(callback.from_user)
-    sorted_users = sorted(user_data_db.items(), key=lambda item: item[1]["referrals"], reverse=True)
 
-    top_lines = []
-    medals = ["🥇", "🥈", "🥉", "✨", "✨"]
-    for index, (u_id, data) in enumerate(sorted_users[:5]):
-        if data["referrals"] > 0:
-            prefix = medals[index] if index < len(medals) else "✨"
-            top_lines.append(f"{prefix} {data['name']} | Рефералов: {data['referrals']}")
+    top = await get_top(5)
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
 
-    if not top_lines:
-        top_lines.append("📉 Список лидеров пока пуст.")
+    lines = []
+    for i in range(5):
+        if i < len(top):
+            _, name, refs = top[i]
+            lines.append(f"{medals[i]} {name} — рефералов: {refs}")
+        else:
+            lines.append(f"{medals[i]} —")
 
-    current_user_refs = user_data_db.get(user_id, {}).get("referrals", 0)
-    user_in_top = any(u_id == user_id and d["referrals"] > 0 for u_id, d in sorted_users[:5])
-
-    if user_in_top:
-        footer = "🏆 Ты входишь в топ рефералов!"
+    my_refs, my_rank = await get_user_refs_and_rank(user_id)
+    if my_rank is not None and my_rank <= 5:
+        footer = f"🏆 Ты на {my_rank} месте! Рефералов: {my_refs}"
+    elif my_rank is not None:
+        footer = f"📍 Твоё место: {my_rank} | Рефералов: {my_refs}"
     else:
-        footer = f"🚫 Ты не попал в топ! | {current_user_refs} рефералов."
+        footer = f"🚫 Ты не попал в топ! | {my_refs} рефералов."
 
-    text = "Топ 5 рефералов за месяц:\n" + "\n".join(top_lines) + f"\n\n{footer}"
+    text = "🏆 Топ 5 по приглашениям:\n\n" + "\n".join(lines) + f"\n\n{footer}"
     await replace_with_photo(callback, TOP_PHOTO_URL, text, back_markup("back_to_main"))
 
 
