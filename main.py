@@ -11,11 +11,12 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     Message,
     Update,
 )
 
-# Токен берется из безопасных переменных окружения Vercel
+# Токен берется из переменных окружения Vercel
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = 619112100  # Ваш ID администратора
 
@@ -28,6 +29,13 @@ TRAFSLY_API_URL = "https://api.trafsly.com"
 
 TGRASS_API_KEY = "6d6e9e9701e7440a81fe099d360710d5"
 TGRASS_API_URL = "https://tgrass.space"
+
+# Ссылки на изображения
+PHOTO_URL = "https://i.postimg.cc/XvPS1pB2/5883351235946024467.jpg"
+REFERRAL_PHOTO_URL = "https://i.postimg.cc/TYbwVvFM/6219881422739149359.jpg"
+PROFILE_PHOTO_URL = "https://i.postimg.cc/bvcFZkbf/6219881422739149361.jpg"
+TOP_PHOTO_URL = "https://i.postimg.cc/tJfCWpFM/6219881422739149363.jpg"
+WITHDRAW_PHOTO_URL = "https://i.postimg.cc/RVdQKYYf/6219881422739149362.jpg"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -69,7 +77,7 @@ pending_referrals: dict[int, int] = {}
 withdraw_temp_data: dict[int, dict] = {}
 
 promocodes_db: dict[str, dict] = {}  
-admin_tasks_db: list[dict] = {}     
+admin_tasks_db: list[dict] = []     
 user_completed_tasks: dict[int, set[int]] = {} 
 
 global_stats = {
@@ -284,140 +292,6 @@ async def any_message_handler(message: Message, state: FSMContext) -> None:
         await message.answer(text_out, reply_markup=markup, parse_mode="Markdown")
         return
 
-    if user_id == ADMIN_ID:
-        if current_state == AdminTaskStates.text.state:
-            await state.update_data(task_text=text_msg)
-            await state.set_state(AdminTaskStates.link)
-            markup = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")]]
-            )
-            await message.answer("отправьте ссылку на спонсора", reply_markup=markup)
-            return
-
-        if current_state == AdminTaskStates.link.state:
-            await state.update_data(task_link=text_msg)
-            await state.set_state(AdminTaskStates.reward)
-            markup = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")]]
-            )
-            await message.answer("введите вознаграждение", reply_markup=markup)
-            return
-
-        if current_state == AdminTaskStates.reward.state:
-            try:
-                reward_val = float(text_msg.replace(",", "."))
-            except ValueError:
-                await message.answer("❌ Введите корректное число для вознаграждения:")
-                return
-            await state.update_data(task_reward=reward_val)
-            await state.set_state(AdminTaskStates.max_completions)
-            markup = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")]]
-            )
-            await message.answer("введите лимит выполнений (целое число):", reply_markup=markup)
-            return
-
-        if current_state == AdminTaskStates.max_completions.state:
-            if not text_msg.isdigit():
-                await message.answer("❌ Введите целое число для лимита выполнений:")
-                return
-            await state.update_data(task_max_completions=int(text_msg))
-            await state.set_state(AdminTaskStates.preview)
-            
-            data = await state.get_data()
-            t_link = data.get("task_link")
-            reward_val = data.get("task_reward")
-            max_comp = data.get("task_max_completions")
-            
-            preview_text = (
-                f"🎯 Доступно задание №{len(admin_tasks_db) + 1}!\n"
-                f"- Подпишитесь на канал —>\n {t_link}\n-\n"
-                f"Награда: {reward_val}⭐\n"
-                f"Лимит выполнений: {max_comp}"
-            )
-            markup = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(text="опубликовать", callback_data="admin_task_pub"),
-                        InlineKeyboardButton(text="отмена", callback_data="admin_panel")
-                    ]
-                ]
-            )
-            await message.answer(preview_text, reply_markup=markup)
-            return
-
-        if current_state == PromocodeStates.admin_name.state:
-            await state.update_data(p_name=text_msg)
-            await state.set_state(PromocodeStates.admin_activations)
-            markup = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="admin_panel")]]
-            )
-            await message.answer("введите количество активаций:", reply_markup=markup)
-            return
-
-        if current_state == PromocodeStates.admin_activations.state:
-            if not text_msg.isdigit():
-                await message.answer("❌ Введите число:")
-                return
-            await state.update_data(p_activations=int(text_msg))
-            await state.set_state(PromocodeStates.admin_price)
-            markup = InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="admin_panel")]]
-            )
-            await message.answer("введите цену промокоду:", reply_markup=markup)
-            return
-
-        if current_state == PromocodeStates.admin_price.state:
-            try:
-                price_val = float(text_msg.replace(",", "."))
-            except ValueError:
-                await message.answer("❌ Введите корректную цену:")
-                return
-            data = await state.get_data()
-            p_name = data.get("p_name")
-            p_act = data.get("p_activations")
-            
-            promocodes_db[p_name] = {
-                "name": p_name,
-                "activations": p_act,
-                "price": price_val,
-                "used_by": set()
-            }
-            await state.clear()
-            
-            text_out = (
-                f"промокод на {p_act}\n"
-                f"название: {p_name}\n"
-                f"цена: {price_val}"
-            )
-            markup = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="опубликовать", callback_data="admin_promo_pub")],
-                    [InlineKeyboardButton(text="назад", callback_data="admin_promo_menu")]
-                ]
-            )
-            await message.answer(text_out, reply_markup=markup)
-            return
-
-        if current_state == AdminRewardStates.waiting_for_new_value.state:
-            try:
-                new_val = float(text_msg.replace(",", "."))
-            except ValueError:
-                await message.answer("❌ Введите число:")
-                return
-            await state.update_data(new_reward=new_val)
-            await state.set_state(AdminRewardStates.confirm)
-            
-            text_out = f"изменить вознаграждение за реферала на {new_val} ⭐"
-            markup = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="да, изменить", callback_data="admin_reward_apply")],
-                    [InlineKeyboardButton(text="Назад", callback_data="admin_reward_menu")]
-                ]
-            )
-            await message.answer(text_out, reply_markup=markup)
-            return
-
 
 async def show_sponsors(message: Message, session: aiohttp.ClientSession = None):
     user = message.from_user
@@ -521,7 +395,10 @@ async def show_sponsors(message: Message, session: aiohttp.ClientSession = None)
         "🤖 Для использования бота подпишись на каналы ниже\n\n"
         "🔻 После подписки нажимай на кнопку \"Проверить подписку\""
     )
-    await message.answer(text, reply_markup=markup)
+    try:
+        await message.answer_photo(photo=PHOTO_URL, caption=text, reply_markup=markup)
+    except:
+        await message.answer(text, reply_markup=markup)
 
 
 async def send_main_menu(message_or_callback):
@@ -563,13 +440,13 @@ async def send_main_menu(message_or_callback):
 
     try:
         if isinstance(message_or_callback, CallbackQuery):
-            await message_or_callback.message.answer(text, reply_markup=main_menu_markup)
+            await message_or_callback.message.answer_photo(photo=PHOTO_URL, caption=text, reply_markup=main_menu_markup)
             try:
                 await message_or_callback.message.delete()
             except:
                 pass
         else:
-            await message.answer(text, reply_markup=main_menu_markup)
+            await message.answer_photo(photo=PHOTO_URL, caption=text, reply_markup=main_menu_markup)
     except Exception as ex:
         print(f"Критическая ошибка главного меню: {ex}")
 
@@ -693,8 +570,11 @@ async def profile_handler(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     try:
-        await callback.message.answer(text, reply_markup=profile_markup)
-        await callback.message.delete()
+        await callback.message.answer_photo(photo=PROFILE_PHOTO_URL, caption=text, reply_markup=profile_markup)
+        try:
+            await callback.message.delete()
+        except:
+            pass
     except Exception as e:
         print(f"⚠️ Ошибка профиля: {e}")
         try:
@@ -726,8 +606,11 @@ async def referrals_handler(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     try:
-        await callback.message.answer(text, reply_markup=referral_markup)
-        await callback.message.delete()
+        await callback.message.answer_photo(photo=REFERRAL_PHOTO_URL, caption=text, reply_markup=referral_markup)
+        try:
+            await callback.message.delete()
+        except:
+            pass
     except:
         try:
             await callback.message.answer(text, reply_markup=referral_markup)
@@ -772,8 +655,11 @@ async def top_handler(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     try:
-        await callback.message.answer(text, reply_markup=top_markup)
-        await callback.message.delete()
+        await callback.message.answer_photo(photo=TOP_PHOTO_URL, caption=text, reply_markup=top_markup)
+        try:
+            await callback.message.delete()
+        except:
+            pass
     except Exception as e:
         print(f"Ошибка в топ меню: {e}")
         try:
@@ -806,8 +692,11 @@ async def withdraw_handler(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     try:
-        await callback.message.answer(text, reply_markup=withdraw_markup)
-        await callback.message.delete()
+        await callback.message.answer_photo(photo=WITHDRAW_PHOTO_URL, caption=text, reply_markup=withdraw_markup)
+        try:
+            await callback.message.delete()
+        except:
+            pass
     except Exception as e:
         print(f"Ошибка в меню вывода: {e}")
         try:
