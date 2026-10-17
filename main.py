@@ -783,14 +783,12 @@ async def top_handler(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     try:
-        await callback.message.edit_media(
-            media=InputMediaPhoto(media=TOP_PHOTO_URL, caption=text),
-            reply_markup=top_markup
-        )
-    except:
+        await callback.message.answer_photo(photo=TOP_PHOTO_URL, caption=text, reply_markup=top_markup)
+        await callback.message.delete()
+    except Exception as e:
+        print(f"Ошибка в топ меню: {e}")
         try:
-            await callback.message.answer_photo(photo=TOP_PHOTO_URL, caption=text, reply_markup=top_markup)
-            await callback.message.delete()
+            await callback.message.answer(text, reply_markup=top_markup)
         except:
             pass
 
@@ -819,14 +817,12 @@ async def withdraw_handler(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     try:
-        await callback.message.edit_media(
-            media=InputMediaPhoto(media=WITHDRAW_PHOTO_URL, caption=text),
-            reply_markup=withdraw_markup
-        )
-    except:
+        await callback.message.answer_photo(photo=WITHDRAW_PHOTO_URL, caption=text, reply_markup=withdraw_markup)
+        await callback.message.delete()
+    except Exception as e:
+        print(f"Ошибка в меню вывода: {e}")
         try:
-            await callback.message.answer_photo(photo=WITHDRAW_PHOTO_URL, caption=text, reply_markup=withdraw_markup)
-            await callback.message.delete()
+            await callback.message.answer(text, reply_markup=withdraw_markup)
         except:
             pass
 
