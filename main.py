@@ -27,9 +27,9 @@ from aiogram.types import (
 BOT_TOKEN = os.environ.get("BOT_TOKEN")   # токен бота (из Vercel)
 ADMIN_ID = 619112100                      # ID администратора
  
-TGRASS_API_KEY = os.environ.get("TGRASS_API_KEY", "6d6e9e9701e7440a81fe099d360710d5")
-PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv")
-TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "at_99ddd0618296db80b905c92ff9adaa8c")
+TGRASS_API_KEY = os.environ.get("TGRASS_API_KEY", "ВСТАВЬТЕ_КЛЮЧ_TGRASS")
+PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "ВСТАВЬТЕ_КЛЮЧ_PIARFLOW")
+TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "ВСТАВЬТЕ_КЛЮЧ_TRAFSLY")
  
 # Upstash Redis (для топа рефералов): Vercel -> Storage -> Upstash Redis
 UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
@@ -118,9 +118,11 @@ global_stats = {
     "total_sponsors_completed": 0,
     "total_withdrawals_stars": 0.0,
     "referral_reward": 4.5,
+    "income_sponsors": 0,   # сколько всего подписок на спонсоров сделали пользователи
 }
  
 TARGET_COUNT = 10
+INCOME_PER_SPONSOR = 1.0   # доход (руб) за одну подписку на спонсора
  
  
 # ================= ХЕЛПЕРЫ =================
@@ -233,6 +235,47 @@ async def get_user_refs_and_rank(user_id: int) -> tuple[int, Optional[int]]:
     return int(float(score)), (rank + 1 if rank is not None else None)
  
  
+# ================= ДОХОД ОТ СПОНСОРОВ =================
+async def add_income(user_id: int, count: int) -> None:
+    """Добавляет к доходу количество спонсоров, на которых подписался пользователь.
+    Каждый пользователь учитывается только один раз."""
+    if count <= 0:
+        return
+ 
+    added = await redis_cmd("SADD", "income_users", str(user_id))
+    if added is None:
+        # Redis не настроен — защита от повторов только в памяти
+        if user_id in fully_passed_users:
+            return
+    elif int(added) == 0:
+        return  # этот пользователь уже был учтён
+ 
+    global_stats["income_sponsors"] += count
+    await redis_cmd("INCRBY", "income_sponsors", count)
+ 
+ 
+async def pop_sponsor_total(user_id: int, fallback: int = 0) -> int:
+    """Достаёт из Redis исходное число показанных спонсоров и удаляет ключ."""
+    val = await redis_cmd("GET", f"sp_total:{user_id}")
+    await redis_cmd("DEL", f"sp_total:{user_id}")
+    try:
+        n = int(val)
+    except (TypeError, ValueError):
+        n = 0
+    return max(n, fallback)
+ 
+ 
+async def get_income_sponsors() -> int:
+    """Всего подписок на спонсоров (из Redis, иначе из памяти)."""
+    val = await redis_cmd("GET", "income_sponsors")
+    if val is None:
+        return global_stats["income_sponsors"]
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return global_stats["income_sponsors"]
+ 
+ 
 # ================= API СПОНСОРОВ =================
 async def api_post(session, name, url, payload, headers):
     """Возвращает (http_status, json_или_None, сырое_тело). Всё логирует."""
@@ -331,6 +374,7 @@ async def start_handler(message: Message, command: CommandObject, state: FSMCont
             referrer_id = int(args.split("_")[1])
             if referrer_id != user_id and user_id not in pending_referrals:
                 pending_referrals[user_id] = referrer_id
+                await redis_cmd("SET", f"pending_ref:{user_id}", referrer_id, "EX", 2592000)
                 if referrer_id in user_data_db:
                     ref_msg = (
                         f"реферал: {username_str}\n"
@@ -412,6 +456,20 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
  
     text = "\n".join(lines)
     await message.answer(text[:4000])
+ 
+ 
+# ================= /resetme (только админ, для тестов) =================
+@router.message(Command("resetme"))
+async def resetme_handler(message: Message, state: FSMContext) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    uid = message.from_user.id
+    await redis_cmd("SREM", "income_users", str(uid))
+    await redis_cmd("DEL", f"sp_total:{uid}")
+    fully_passed_users.discard(uid)
+    user_active_tasks.pop(uid, None)
+    await message.answer("✅ Ваш аккаунт сброшен для теста. Нажмите /start — доход снова будет засчитан.")
  
  
 # ================= ВВОД ТЕКСТА (по состояниям) =================
@@ -636,45 +694,69 @@ def build_sponsor_markup(all_links: list[str]) -> InlineKeyboardMarkup:
  
  
 async def reward_referrer_if_needed(bot: Bot, user_id: int, had_sponsors: bool = True) -> None:
-    if user_id in pending_referrals:
-        ref_id = pending_referrals.pop(user_id)
+    """Сообщает пригласившему о результате.
+    had_sponsors=True  -> реферал подписался на спонсоров: награда + сообщение «подписался»
+    had_sponsors=False -> спонсоров не было: награды нет + сообщение «не подписался»
+    Пригласивший берётся из памяти, а если память сбросилась — из Redis."""
+    ref_id = pending_referrals.pop(user_id, None)
  
-        # Спонсоров не было -> реферал ничего не подписывал, награды нет
-        if not had_sponsors:
-            if ref_id in user_data_db:
-                ref_username = user_data_db.get(user_id, {}).get("username", f"id{user_id}")
-                total_bal = user_data_db[ref_id]["balance"]
-                no_sponsors_msg = (
-                    f"реферал: {ref_username}\n"
-                    f"не подписался на спонсоров ваш доход 0.00 ⭐\n"
-                    f"доход: {total_bal:.2f} ⭐"
-                )
-                try:
-                    await bot.send_message(chat_id=ref_id, text=no_sponsors_msg)
-                except Exception:
-                    pass
-            return
- 
-        # Записываем реферала в топ (Redis) — работает, даже если память сбросилась
-        ref_name = user_data_db.get(ref_id, {}).get("name") or f"id{ref_id}"
-        await add_referral_to_top(ref_id, ref_name)
- 
-        if ref_id in user_data_db:
-            reward = global_stats["referral_reward"]
-            user_data_db[ref_id]["balance"] += reward
-            user_data_db[ref_id]["referrals"] += 1
- 
-            ref_username = user_data_db.get(user_id, {}).get("username", f"id{user_id}")
-            total_bal = user_data_db[ref_id]["balance"]
-            success_ref_msg = (
-                f"реферал: {ref_username}\n"
-                f"подписался на спонсоров ваш доход {reward} ⭐\n"
-                f"доход: {total_bal:.1f} ⭐"
-            )
+    redis_ref = await redis_cmd("GET", f"pending_ref:{user_id}")
+    if redis_ref is not None:
+        await redis_cmd("DEL", f"pending_ref:{user_id}")
+        if ref_id is None:
             try:
-                await bot.send_message(chat_id=ref_id, text=success_ref_msg)
-            except Exception:
-                pass
+                ref_id = int(redis_ref)
+            except (TypeError, ValueError):
+                ref_id = None
+ 
+    if ref_id is None:
+        return
+ 
+    # Если память сбросилась и пригласившего в ней нет — создаём пустую запись,
+    # чтобы сообщение всё равно дошло (баланс в памяти при этом начнётся с нуля)
+    if ref_id not in user_data_db:
+        user_data_db[ref_id] = {
+            "name": f"id{ref_id}",
+            "username": f"id{ref_id}",
+            "balance": 0.00,
+            "referrals": 0,
+            "join_date": datetime.now(),
+        }
+ 
+    ref_username = user_data_db.get(user_id, {}).get("username", f"id{user_id}")
+ 
+    # ----- спонсоров не было -> награды нет -----
+    if not had_sponsors:
+        total_bal = user_data_db[ref_id]["balance"]
+        no_sponsors_msg = (
+            f"реферал: {ref_username}\n"
+            f"не подписался на спонсоров ваш доход 0.00 ⭐\n"
+            f"доход: {total_bal:.2f} ⭐"
+        )
+        try:
+            await bot.send_message(chat_id=ref_id, text=no_sponsors_msg)
+        except Exception:
+            pass
+        return
+ 
+    # ----- реферал подписался на спонсоров -> награда -----
+    ref_name = user_data_db[ref_id].get("name") or f"id{ref_id}"
+    await add_referral_to_top(ref_id, ref_name)
+ 
+    reward = global_stats["referral_reward"]
+    user_data_db[ref_id]["balance"] += reward
+    user_data_db[ref_id]["referrals"] += 1
+    total_bal = user_data_db[ref_id]["balance"]
+ 
+    success_ref_msg = (
+        f"реферал: {ref_username}\n"
+        f"подписался на спонсоров ваш доход {reward} ⭐\n"
+        f"доход: {total_bal:.1f} ⭐"
+    )
+    try:
+        await bot.send_message(chat_id=ref_id, text=success_ref_msg)
+    except Exception:
+        pass
  
  
 async def show_sponsors(message: Message, user=None):
@@ -724,11 +806,20 @@ async def show_sponsors(message: Message, user=None):
         + [s["link"] for s in collected_trafsly]
     )
  
+    # Запоминаем, сколько спонсоров показали — столько и начислим в доход
+    user_active_tasks[user_id]["total_count"] = len(all_links)
+    if all_links:
+        # NX: не перезаписываем, чтобы сохранилось исходное число спонсоров
+        await redis_cmd("SET", f"sp_total:{user_id}", len(all_links), "NX", "EX", 604800)
+ 
     if not all_links:
+        # Если процесс перезапускался, исходное число спонсоров берём из Redis
+        done_count = await pop_sponsor_total(user_id)
+        await add_income(user_id, done_count)
         if user_id not in fully_passed_users:
             global_stats["total_sponsors_completed"] += 1
         fully_passed_users.add(user_id)
-        await reward_referrer_if_needed(message.bot, user_id, had_sponsors=False)
+        await reward_referrer_if_needed(message.bot, user_id, had_sponsors=done_count > 0)
         await send_main_menu(message, user)
         return
  
@@ -1080,7 +1171,8 @@ async def admin_panel_handler(callback: CallbackQuery, state: FSMContext) -> Non
     u_30d = sum(1 for u in user_data_db.values() if now - u["join_date"] <= timedelta(days=30))
  
     sponsors_count = global_stats["total_sponsors_completed"]
-    income_rub = sponsors_count * 1.0
+    total_sponsor_subs = await get_income_sponsors()
+    income_rub = total_sponsor_subs * INCOME_PER_SPONSOR
     withdrawals = global_stats["total_withdrawals_stars"]
  
     text = (
@@ -1090,7 +1182,8 @@ async def admin_panel_handler(callback: CallbackQuery, state: FSMContext) -> Non
         f"пользователей за 7 дней: {u_7d}\n"
         f"пользователей за 30 дней: {u_30d}\n"
         f"пользователей подписавшись на спонсоров: {sponsors_count}\n"
-        f"доход: {income_rub} руб\n"
+        f"подписок на спонсоров всего: {total_sponsor_subs}\n"
+        f"доход: {income_rub:g} руб\n"
         f"выводы: {withdrawals} звезд"
     )
     markup = InlineKeyboardMarkup(
@@ -1394,6 +1487,8 @@ async def check_all_tasks_handler(callback: CallbackQuery) -> None:
  
     if not left_tgrass and not left_piarflow and not left_trafsly:
         user_active_tasks.pop(user_id, None)
+        done_count = await pop_sponsor_total(user_id, tasks_data.get("total_count", 0))
+        await add_income(user_id, done_count)
         if user_id not in fully_passed_users:
             global_stats["total_sponsors_completed"] += 1
         fully_passed_users.add(user_id)
