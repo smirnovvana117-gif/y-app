@@ -1,10 +1,11 @@
 import asyncio
+import json
 import os
 import aiohttp
 from datetime import datetime, timedelta
 from flask import Flask, request
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import CommandStart, CommandObject
+from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -27,6 +28,15 @@ TRAFSLY_API_URL = "https://api.trafsly.com"
 
 TGRASS_API_KEY = os.environ.get("TGRASS_API_KEY", "")
 TGRASS_API_URL = "https://tgrass.space"
+
+for _name, _val in (
+    ("BOT_TOKEN", BOT_TOKEN),
+    ("PIARFLOW_API_KEY", PIARFLOW_API_KEY),
+    ("TRAFSLY_API_KEY", TRAFSLY_API_KEY),
+    ("TGRASS_API_KEY", TGRASS_API_KEY),
+):
+    if not _val:
+        print(f"⚠️ ПЕРЕМЕННАЯ ОКРУЖЕНИЯ НЕ ЗАДАНА: {_name}")
 
 PHOTO_URL = "https://i.postimg.cc/XvPS1pB2/5883351235946024467.jpg"
 REFERRAL_PHOTO_URL = "https://i.postimg.cc/TYbwVvFM/6219881422739149359.jpg"
@@ -148,69 +158,83 @@ async def replace_with_photo(callback: CallbackQuery, photo: str, text: str, mar
 
 
 # ================= API СПОНСОРОВ =================
-async def fetch_tgrass(session, user_id, user_data, limit):
+async def api_post(session, name, url, payload, headers):
+    """Возвращает (http_status, json_или_None, сырое_тело). Всё логирует."""
     try:
-        payload = {
-            "tg_user_id": int(user_id),
-            "tg_login": user_data.get("username"),
-            "lang": user_data.get("language_code") or "ru",
-            "is_premium": bool(user_data.get("is_premium", False)),
-            "offers_limit": limit,
-        }
-        async with session.post(
-            f"{TGRASS_API_URL}/offers",
-            json=payload,
-            headers={"Auth": TGRASS_API_KEY, "Content-Type": "application/json", "accept": "application/json"},
-        ) as resp:
-            data = await resp.json(content_type=None)
-            if data.get("status") == "ok":
-                return []
-            offers = data.get("offers", [])
-            return [o for o in offers if not o.get("subscribed", True)][:limit]
-    except Exception:
+        async with session.post(url, json=payload, headers=headers) as resp:
+            body = await resp.text()
+            print(f"[{name}] HTTP {resp.status}: {body[:500]}")
+            try:
+                data = json.loads(body)
+            except Exception:
+                data = None
+            return resp.status, data, body
+    except Exception as e:
+        print(f"[{name}] ОШИБКА ЗАПРОСА: {e!r}")
+        return None, None, repr(e)
+
+
+def tgrass_headers():
+    return {"Auth": TGRASS_API_KEY, "Content-Type": "application/json", "accept": "application/json"}
+
+
+def piarflow_headers():
+    return {"Authorization": f"Bearer {PIARFLOW_API_KEY}", "Content-Type": "application/json"}
+
+
+def trafsly_headers():
+    return {"Auth": TRAFSLY_API_KEY, "Content-Type": "application/json"}
+
+
+async def fetch_tgrass(session, user_id, user_data, limit):
+    payload = {
+        "tg_user_id": int(user_id),
+        "tg_login": user_data.get("username"),
+        "lang": user_data.get("language_code") or "ru",
+        "is_premium": bool(user_data.get("is_premium", False)),
+        "offers_limit": limit,
+    }
+    _, data, _ = await api_post(session, "tgrass", f"{TGRASS_API_URL}/offers", payload, tgrass_headers())
+    if not isinstance(data, dict):
         return []
+    if data.get("status") == "ok":
+        return []
+    offers = data.get("offers", []) or []
+    return [o for o in offers if not o.get("subscribed", True)][:limit]
 
 
 async def fetch_piarflow(session, user_id, chat_id, limit):
-    try:
-        async with session.post(
-            f"{PIARFLOW_API_URL}/sponsors",
-            json={"user_id": user_id, "chat_id": chat_id, "max_sponsors": limit},
-            headers={"Authorization": f"Bearer {PIARFLOW_API_KEY}", "Content-Type": "application/json"},
-        ) as resp:
-            data = await resp.json(content_type=None)
-            sponsors = data.get("sponsors", [])
-            unsubscribed = [
-                {"link": s["link"], "type": "piarflow"}
-                for s in sponsors
-                if s.get("status") == "unsubscribed"
-            ]
-            return unsubscribed[:limit]
-    except Exception:
+    payload = {"user_id": user_id, "chat_id": chat_id, "max_sponsors": limit}
+    _, data, _ = await api_post(session, "piarflow", f"{PIARFLOW_API_URL}/sponsors", payload, piarflow_headers())
+    if not isinstance(data, dict):
         return []
+    sponsors = data.get("sponsors", []) or []
+    return [
+        {"link": s["link"], "type": "piarflow"}
+        for s in sponsors
+        if s.get("status") == "unsubscribed" and s.get("link")
+    ][:limit]
 
 
 async def fetch_trafsly(session, user_id, chat_id, user_data, limit):
-    try:
-        payload = {
-            "user_id": user_id,
-            "chat_id": chat_id,
-            "first_name": user_data.get("first_name", ""),
-            "username": user_data.get("username", ""),
-            "language_code": user_data.get("language_code", "ru"),
-            "is_premium": bool(user_data.get("is_premium", False)),
-            "max_sponsors": limit,
-        }
-        async with session.post(
-            f"{TRAFSLY_API_URL}/api/v1/get-sponsors",
-            json=payload,
-            headers={"Auth": TRAFSLY_API_KEY, "Content-Type": "application/json"},
-        ) as resp:
-            data = await resp.json(content_type=None)
-            sponsors = data.get("sponsors", [])
-            return [{"link": s["link"], "ads_id": s["ads_id"], "type": "trafsly"} for s in sponsors][:limit]
-    except Exception:
+    payload = {
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "first_name": user_data.get("first_name", ""),
+        "username": user_data.get("username", ""),
+        "language_code": user_data.get("language_code", "ru"),
+        "is_premium": bool(user_data.get("is_premium", False)),
+        "max_sponsors": limit,
+    }
+    _, data, _ = await api_post(session, "trafsly", f"{TRAFSLY_API_URL}/api/v1/get-sponsors", payload, trafsly_headers())
+    if not isinstance(data, dict):
         return []
+    sponsors = data.get("sponsors", []) or []
+    return [
+        {"link": s["link"], "ads_id": s.get("ads_id"), "type": "trafsly"}
+        for s in sponsors
+        if s.get("link")
+    ][:limit]
 
 
 # ================= /start =================
@@ -247,6 +271,67 @@ async def start_handler(message: Message, command: CommandObject, state: FSMCont
 
     verified_users.add(user_id)
     await show_sponsors(message)
+
+
+# ================= /debug (только админ) =================
+@router.message(Command("debug"))
+async def debug_handler(message: Message, state: FSMContext) -> None:
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+
+    user = message.from_user
+    user_id = user.id
+    chat_id = message.chat.id
+
+    lines = [
+        "🔧 ДИАГНОСТИКА",
+        f"BOT_TOKEN: {'задан' if BOT_TOKEN else 'НЕ ЗАДАН'}",
+        f"TGRASS_API_KEY: {'задан (' + str(len(TGRASS_API_KEY)) + ' симв.)' if TGRASS_API_KEY else 'НЕ ЗАДАН'}",
+        f"PIARFLOW_API_KEY: {'задан (' + str(len(PIARFLOW_API_KEY)) + ' симв.)' if PIARFLOW_API_KEY else 'НЕ ЗАДАН'}",
+        f"TRAFSLY_API_KEY: {'задан (' + str(len(TRAFSLY_API_KEY)) + ' симв.)' if TRAFSLY_API_KEY else 'НЕ ЗАДАН'}",
+        "",
+    ]
+
+    timeout = aiohttp.ClientTimeout(total=5)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        st, _, body = await api_post(
+            session, "tgrass", f"{TGRASS_API_URL}/offers",
+            {
+                "tg_user_id": int(user_id),
+                "tg_login": user.username,
+                "lang": user.language_code or "ru",
+                "is_premium": bool(user.is_premium),
+                "offers_limit": 3,
+            },
+            tgrass_headers(),
+        )
+        lines.append(f"TGRASS → HTTP {st}\n{body[:500]}\n")
+
+        st, _, body = await api_post(
+            session, "piarflow", f"{PIARFLOW_API_URL}/sponsors",
+            {"user_id": user_id, "chat_id": chat_id, "max_sponsors": 3},
+            piarflow_headers(),
+        )
+        lines.append(f"PIARFLOW → HTTP {st}\n{body[:500]}\n")
+
+        st, _, body = await api_post(
+            session, "trafsly", f"{TRAFSLY_API_URL}/api/v1/get-sponsors",
+            {
+                "user_id": user_id,
+                "chat_id": chat_id,
+                "first_name": user.first_name or "",
+                "username": user.username or "",
+                "language_code": user.language_code or "ru",
+                "is_premium": bool(user.is_premium),
+                "max_sponsors": 3,
+            },
+            trafsly_headers(),
+        )
+        lines.append(f"TRAFSLY → HTTP {st}\n{body[:500]}")
+
+    text = "\n".join(lines)
+    await message.answer(text[:4000])
 
 
 # ================= ВВОД ТЕКСТА (по состояниям) =================
@@ -491,8 +576,8 @@ async def reward_referrer_if_needed(bot: Bot, user_id: int) -> None:
                 pass
 
 
-async def show_sponsors(message: Message):
-    user = message.from_user
+async def show_sponsors(message: Message, user=None):
+    user = user or message.from_user
     user_id = user.id
     chat_id = message.chat.id
     user_data = {
@@ -519,7 +604,12 @@ async def show_sponsors(message: Message):
             if remaining > 0:
                 collected_trafsly = await fetch_trafsly(session, user_id, chat_id, user_data, remaining)
     except Exception as e:
-        print(f"show_sponsors error: {e}")
+        print(f"show_sponsors error: {e!r}")
+
+    print(
+        f"[sponsors] user={user_id} tgrass={len(collected_tgrass)} "
+        f"piarflow={len(collected_piarflow)} trafsly={len(collected_trafsly)}"
+    )
 
     user_active_tasks[user_id] = {
         "tgrass": collected_tgrass,
@@ -538,7 +628,7 @@ async def show_sponsors(message: Message):
             global_stats["total_sponsors_completed"] += 1
         fully_passed_users.add(user_id)
         await reward_referrer_if_needed(message.bot, user_id)
-        await send_main_menu(message)
+        await send_main_menu(message, user)
         return
 
     markup = build_sponsor_markup(all_links)
@@ -553,13 +643,13 @@ async def show_sponsors(message: Message):
 
 
 # ================= ГЛАВНОЕ МЕНЮ =================
-async def send_main_menu(message_or_callback):
+async def send_main_menu(message_or_callback, user=None):
     if isinstance(message_or_callback, CallbackQuery):
         message = message_or_callback.message
         user = message_or_callback.from_user
     else:
         message = message_or_callback
-        user = message.from_user
+        user = user or message.from_user
 
     ensure_user(user)
     stats = user_data_db[user.id]
@@ -1151,67 +1241,51 @@ async def check_all_tasks_handler(callback: CallbackQuery) -> None:
     if not tasks_data:
         # На Vercel память могла сброситься — просто заново запрашиваем спонсоров
         await safe_answer(callback)
-        await show_sponsors(callback.message.model_copy(update={"from_user": callback.from_user}))
+        await show_sponsors(callback.message, callback.from_user)
         return
 
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
         # 1. Tgrass
         tg_offers = tasks_data.get("tgrass", [])
         if tg_offers:
-            try:
-                payload = {
-                    "tg_user_id": int(user_id),
-                    "tg_login": callback.from_user.username,
-                    "lang": callback.from_user.language_code or "ru",
-                    "is_premium": bool(callback.from_user.is_premium),
-                }
-                async with session.post(
-                    f"{TGRASS_API_URL}/offers",
-                    json=payload,
-                    headers={"Auth": TGRASS_API_KEY, "Content-Type": "application/json", "accept": "application/json"},
-                ) as resp:
-                    res = await resp.json(content_type=None)
-                    if res.get("status") == "ok":
-                        tasks_data["tgrass"] = []
-                    else:
-                        offers = res.get("offers", [])
-                        active_links = {o["link"] for o in offers if not o.get("subscribed", True)}
-                        tasks_data["tgrass"] = [o for o in tg_offers if o["link"] in active_links]
-            except Exception:
-                pass
+            payload = {
+                "tg_user_id": int(user_id),
+                "tg_login": callback.from_user.username,
+                "lang": callback.from_user.language_code or "ru",
+                "is_premium": bool(callback.from_user.is_premium),
+            }
+            _, res, _ = await api_post(session, "tgrass-check", f"{TGRASS_API_URL}/offers", payload, tgrass_headers())
+            if isinstance(res, dict):
+                if res.get("status") == "ok":
+                    tasks_data["tgrass"] = []
+                else:
+                    offers = res.get("offers", []) or []
+                    active_links = {o["link"] for o in offers if not o.get("subscribed", True)}
+                    tasks_data["tgrass"] = [o for o in tg_offers if o["link"] in active_links]
 
         # 2. Piarflow
         pf_links = tasks_data.get("piarflow", [])
         if pf_links:
-            try:
-                links_only = [item["link"] for item in pf_links]
-                async with session.post(
-                    f"{PIARFLOW_API_URL}/sponsors/check",
-                    json={"user_id": user_id, "links": links_only},
-                    headers={"Authorization": f"Bearer {PIARFLOW_API_KEY}", "Content-Type": "application/json"},
-                ) as resp:
-                    res = await resp.json(content_type=None)
-                    sponsors = res.get("sponsors", [])
-                    subscribed_links = {s["link"] for s in sponsors if s.get("status") == "subscribed"}
-                    tasks_data["piarflow"] = [item for item in pf_links if item["link"] not in subscribed_links]
-            except Exception:
-                pass
+            links_only = [item["link"] for item in pf_links]
+            _, res, _ = await api_post(
+                session, "piarflow-check", f"{PIARFLOW_API_URL}/sponsors/check",
+                {"user_id": user_id, "links": links_only}, piarflow_headers(),
+            )
+            if isinstance(res, dict):
+                sponsors = res.get("sponsors", []) or []
+                subscribed_links = {s["link"] for s in sponsors if s.get("status") == "subscribed"}
+                tasks_data["piarflow"] = [item for item in pf_links if item["link"] not in subscribed_links]
 
         # 3. Trafsly
         tf_sponsors = tasks_data.get("trafsly", [])
         if tf_sponsors:
             remaining_trafsly = []
             for sponsor in tf_sponsors:
-                try:
-                    async with session.post(
-                        f"{TRAFSLY_API_URL}/api/v1/confirm-subscription",
-                        json={"user_id": user_id, "ads_id": sponsor.get("ads_id")},
-                        headers={"Auth": TRAFSLY_API_KEY, "Content-Type": "application/json"},
-                    ) as resp:
-                        res = await resp.json(content_type=None)
-                        if not res.get("subscribed", False):
-                            remaining_trafsly.append(sponsor)
-                except Exception:
+                _, res, _ = await api_post(
+                    session, "trafsly-check", f"{TRAFSLY_API_URL}/api/v1/confirm-subscription",
+                    {"user_id": user_id, "ads_id": sponsor.get("ads_id")}, trafsly_headers(),
+                )
+                if not (isinstance(res, dict) and res.get("subscribed", False)):
                     remaining_trafsly.append(sponsor)
             tasks_data["trafsly"] = remaining_trafsly
 
@@ -1254,7 +1328,7 @@ async def process_update(json_data: dict) -> None:
         update = Update.model_validate(json_data, context={"bot": bot})
         await dp.feed_update(bot, update)
     except Exception as e:
-        print(f"Webhook error: {e}")
+        print(f"Webhook error: {e!r}")
     finally:
         await bot.session.close()
 
