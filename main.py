@@ -1381,6 +1381,7 @@ dp.include_router(router)
 def webhook():
     if request.headers.get("content-type") == "application/json":
         json_data = request.get_json(force=True)
+        print("Получен апдейт от Telegram:", json_data)
         try:
             update = Update.model_validate(json_data, context={"bot": bot})
             asyncio.run(dp.feed_update(bot, update))
