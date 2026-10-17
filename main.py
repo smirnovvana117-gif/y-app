@@ -16,27 +16,36 @@ from aiogram.types import (
     Update,
 )
 
-# Все ключи — только из переменных окружения Vercel
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "619112100"))
+# ======================================================================
+#                         НАСТРОЙКИ — ВСТАВЬТЕ КЛЮЧИ ЗДЕСЬ
+# ======================================================================
+BOT_TOKEN = os.environ.get("BOT_TOKEN")   # токен бота (из Vercel)
+ADMIN_ID = 619112100                      # ID администратора
 
-PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "")
+TGRASS_API_KEY = "6d6e9e9701e7440a81fe099d360710d5"
+PIARFLOW_API_KEY = "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv"
+TRAFSLY_API_KEY = "at_99ddd0618296db80b905c92ff9adaa8c"
+# ======================================================================
+
 PIARFLOW_API_URL = "https://piarflow.com/v1"
-
-TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "")
 TRAFSLY_API_URL = "https://api.trafsly.com"
-
-TGRASS_API_KEY = os.environ.get("TGRASS_API_KEY", "")
 TGRASS_API_URL = "https://tgrass.space"
+
+PLACEHOLDER_MARK = "ВСТАВЬТЕ_КЛЮЧ"
+
+
+def key_filled(value: str) -> bool:
+    return bool(value) and PLACEHOLDER_MARK not in value
+
 
 for _name, _val in (
     ("BOT_TOKEN", BOT_TOKEN),
+    ("TGRASS_API_KEY", TGRASS_API_KEY),
     ("PIARFLOW_API_KEY", PIARFLOW_API_KEY),
     ("TRAFSLY_API_KEY", TRAFSLY_API_KEY),
-    ("TGRASS_API_KEY", TGRASS_API_KEY),
 ):
-    if not _val:
-        print(f"⚠️ ПЕРЕМЕННАЯ ОКРУЖЕНИЯ НЕ ЗАДАНА: {_name}")
+    if not key_filled(_val):
+        print(f"⚠️ НЕ ЗАПОЛНЕНО: {_name}")
 
 PHOTO_URL = "https://i.postimg.cc/XvPS1pB2/5883351235946024467.jpg"
 REFERRAL_PHOTO_URL = "https://i.postimg.cc/TYbwVvFM/6219881422739149359.jpg"
@@ -284,12 +293,15 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
     user_id = user.id
     chat_id = message.chat.id
 
+    def key_status(v: str) -> str:
+        return f"заполнен ({len(v)} симв.)" if key_filled(v) else "НЕ ЗАПОЛНЕН"
+
     lines = [
         "🔧 ДИАГНОСТИКА",
         f"BOT_TOKEN: {'задан' if BOT_TOKEN else 'НЕ ЗАДАН'}",
-        f"TGRASS_API_KEY: {'задан (' + str(len(TGRASS_API_KEY)) + ' симв.)' if TGRASS_API_KEY else 'НЕ ЗАДАН'}",
-        f"PIARFLOW_API_KEY: {'задан (' + str(len(PIARFLOW_API_KEY)) + ' симв.)' if PIARFLOW_API_KEY else 'НЕ ЗАДАН'}",
-        f"TRAFSLY_API_KEY: {'задан (' + str(len(TRAFSLY_API_KEY)) + ' симв.)' if TRAFSLY_API_KEY else 'НЕ ЗАДАН'}",
+        f"TGRASS_API_KEY: {key_status(TGRASS_API_KEY)}",
+        f"PIARFLOW_API_KEY: {key_status(PIARFLOW_API_KEY)}",
+        f"TRAFSLY_API_KEY: {key_status(TRAFSLY_API_KEY)}",
         "",
     ]
 
