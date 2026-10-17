@@ -35,10 +35,6 @@ TGRASS_API_URL = "https://tgrass.space"
 
 # Изображения
 PHOTO_URL = "https://i.postimg.cc/XvPS1pB2/5883351235946024467.jpg"
-REFERRAL_PHOTO_URL = "https://i.postimg.cc/TYbwVvFM/6219881422739149359.jpg"
-PROFILE_PHOTO_URL = "https://i.postimg.cc/bvcFZkbf/6219881422739149361.jpg"
-TOP_PHOTO_URL = "https://i.postimg.cc/tJfCWpFM/6219881422739149363.jpg"
-WITHDRAW_PHOTO_URL = "https://i.postimg.cc/RVdQKYYf/6219881422739149362.jpg"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -532,7 +528,10 @@ async def show_sponsors(message: Message, session: aiohttp.ClientSession = None)
         "🤖 Для использования бота подпишись на каналы ниже\n\n"
         "🔻 После подписки нажимай на кнопку \"Проверить подписку\""
     )
-    await message.answer(text, reply_markup=markup)
+    try:
+        await message.answer_photo(photo=PHOTO_URL, caption=text, reply_markup=markup)
+    except:
+        await message.answer(text, reply_markup=markup)
 
 
 async def send_main_menu(message_or_callback):
@@ -574,13 +573,13 @@ async def send_main_menu(message_or_callback):
 
     try:
         if isinstance(message_or_callback, CallbackQuery):
-            await message_or_callback.message.answer_photo(photo=PHOTO_URL, caption=text, reply_markup=main_menu_markup)
+            await message_or_callback.message.answer(text, reply_markup=main_menu_markup)
             try:
                 await message_or_callback.message.delete()
             except:
                 pass
         else:
-            await message.answer_photo(photo=PHOTO_URL, caption=text, reply_markup=main_menu_markup)
+            await message.answer(text, reply_markup=main_menu_markup)
     except Exception as ex:
         print(f"Критическая ошибка главного меню: {ex}")
 
@@ -623,7 +622,8 @@ async def task_menu_handler(callback: CallbackQuery, state: FSMContext) -> None:
         ]
     )
     try:
-        await callback.message.edit_caption(caption=text, reply_markup=markup)
+        await callback.message.answer(text, reply_markup=markup)
+        await callback.message.delete()
     except:
         await callback.message.answer(text, reply_markup=markup)
 
@@ -664,7 +664,8 @@ async def done_task_handler(callback: CallbackQuery) -> None:
         ]
     )
     try:
-        await callback.message.edit_caption(caption=text, reply_markup=markup)
+        await callback.message.answer(text, reply_markup=markup)
+        await callback.message.delete()
     except:
         await callback.message.answer(text, reply_markup=markup)
 
@@ -702,13 +703,12 @@ async def profile_handler(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     try:
-        await callback.message.answer_photo(photo=PROFILE_PHOTO_URL, caption=text, reply_markup=profile_markup)
+        await callback.message.answer(text, reply_markup=profile_markup)
         await callback.message.delete()
     except Exception as e:
-        print(f"⚠️ Ошибка отправки фото профиля: {e}")
+        print(f"⚠️ Ошибка профиля: {e}")
         try:
             await callback.message.answer(text, reply_markup=profile_markup)
-            await callback.message.delete()
         except:
             pass
 
@@ -736,12 +736,11 @@ async def referrals_handler(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     try:
-        await callback.message.answer_photo(photo=REFERRAL_PHOTO_URL, caption=text, reply_markup=referral_markup)
+        await callback.message.answer(text, reply_markup=referral_markup)
         await callback.message.delete()
     except:
         try:
             await callback.message.answer(text, reply_markup=referral_markup)
-            await callback.message.delete()
         except:
             pass
 
@@ -783,7 +782,7 @@ async def top_handler(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     try:
-        await callback.message.answer_photo(photo=TOP_PHOTO_URL, caption=text, reply_markup=top_markup)
+        await callback.message.answer(text, reply_markup=top_markup)
         await callback.message.delete()
     except Exception as e:
         print(f"Ошибка в топ меню: {e}")
@@ -817,7 +816,7 @@ async def withdraw_handler(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
     try:
-        await callback.message.answer_photo(photo=WITHDRAW_PHOTO_URL, caption=text, reply_markup=withdraw_markup)
+        await callback.message.answer(text, reply_markup=withdraw_markup)
         await callback.message.delete()
     except Exception as e:
         print(f"Ошибка в меню вывода: {e}")
@@ -982,7 +981,8 @@ async def admin_panel_handler(callback: CallbackQuery, state: FSMContext) -> Non
     )
 
     try:
-        await callback.message.edit_caption(caption=text, reply_markup=markup)
+        await callback.message.answer(text, reply_markup=markup)
+        await callback.message.delete()
     except:
         await callback.message.answer(text, reply_markup=markup)
 
@@ -1003,7 +1003,8 @@ async def admin_bc_start(callback: CallbackQuery, state: FSMContext) -> None:
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")]]
     )
     try:
-        await callback.message.edit_caption(caption=text, reply_markup=markup)
+        await callback.message.answer(text, reply_markup=markup)
+        await callback.message.delete()
     except:
         await callback.message.answer(text, reply_markup=markup)
 
@@ -1028,7 +1029,8 @@ async def admin_bc_send(callback: CallbackQuery, state: FSMContext) -> None:
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")]]
     )
     try:
-        await callback.message.edit_caption(caption=text, reply_markup=markup)
+        await callback.message.answer(text, reply_markup=markup)
+        await callback.message.delete()
     except:
         await callback.message.answer(text, reply_markup=markup)
 
@@ -1059,7 +1061,8 @@ async def admin_tasks_menu(callback: CallbackQuery, state: FSMContext) -> None:
     
     markup = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
     try:
-        await callback.message.edit_caption(caption=text, reply_markup=markup)
+        await callback.message.answer(text, reply_markup=markup)
+        await callback.message.delete()
     except:
         await callback.message.answer(text, reply_markup=markup)
 
@@ -1073,7 +1076,8 @@ async def admin_task_create(callback: CallbackQuery, state: FSMContext) -> None:
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")]]
     )
     try:
-        await callback.message.edit_caption(caption=text, reply_markup=markup)
+        await callback.message.answer(text, reply_markup=markup)
+        await callback.message.delete()
     except:
         await callback.message.answer(text, reply_markup=markup)
 
@@ -1144,7 +1148,8 @@ async def admin_promo_menu(callback: CallbackQuery, state: FSMContext) -> None:
         markup = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
 
     try:
-        await callback.message.edit_caption(caption=text, reply_markup=markup)
+        await callback.message.answer(text, reply_markup=markup)
+        await callback.message.delete()
     except:
         await callback.message.answer(text, reply_markup=markup)
 
@@ -1168,7 +1173,8 @@ async def admin_promo_create(callback: CallbackQuery, state: FSMContext) -> None
         inline_keyboard=[[InlineKeyboardButton(text="Назад", callback_data="admin_panel")]]
     )
     try:
-        await callback.message.edit_caption(caption=text, reply_markup=markup)
+        await callback.message.answer(text, reply_markup=markup)
+        await callback.message.delete()
     except:
         await callback.message.answer(text, reply_markup=markup)
 
@@ -1196,7 +1202,8 @@ async def admin_reward_menu(callback: CallbackQuery, state: FSMContext) -> None:
         ]
     )
     try:
-        await callback.message.edit_caption(caption=text, reply_markup=markup)
+        await callback.message.answer(text, reply_markup=markup)
+        await callback.message.delete()
     except:
         await callback.message.answer(text, reply_markup=markup)
 
@@ -1211,7 +1218,8 @@ async def admin_reward_change(callback: CallbackQuery, state: FSMContext) -> Non
         inline_keyboard=[[InlineKeyboardButton(text="назад", callback_data="admin_panel")]]
     )
     try:
-        await callback.message.edit_caption(caption=text, reply_markup=markup)
+        await callback.message.answer(text, reply_markup=markup)
+        await callback.message.delete()
     except:
         await callback.message.answer(text, reply_markup=markup)
 
