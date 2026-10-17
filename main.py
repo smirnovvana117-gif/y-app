@@ -11,10 +11,6 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputMediaPhoto,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     Message,
     Update,
 )
@@ -32,9 +28,6 @@ TRAFSLY_API_URL = "https://api.trafsly.com"
 
 TGRASS_API_KEY = "6d6e9e9701e7440a81fe099d360710d5"
 TGRASS_API_URL = "https://tgrass.space"
-
-# Изображения
-PHOTO_URL = "https://i.postimg.cc/XvPS1pB2/5883351235946024467.jpg"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -76,7 +69,7 @@ pending_referrals: dict[int, int] = {}
 withdraw_temp_data: dict[int, dict] = {}
 
 promocodes_db: dict[str, dict] = {}  
-admin_tasks_db: list[dict] = []     
+admin_tasks_db: list[dict] = {}     
 user_completed_tasks: dict[int, set[int]] = {} 
 
 global_stats = {
@@ -528,10 +521,7 @@ async def show_sponsors(message: Message, session: aiohttp.ClientSession = None)
         "🤖 Для использования бота подпишись на каналы ниже\n\n"
         "🔻 После подписки нажимай на кнопку \"Проверить подписку\""
     )
-    try:
-        await message.answer_photo(photo=PHOTO_URL, caption=text, reply_markup=markup)
-    except:
-        await message.answer(text, reply_markup=markup)
+    await message.answer(text, reply_markup=markup)
 
 
 async def send_main_menu(message_or_callback):
