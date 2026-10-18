@@ -9,7 +9,7 @@ from typing import Any, Optional
  
 import aiohttp
 from flask import Flask, request
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -24,7 +24,7 @@ from aiogram.types import (
 )
  
 # ======================================================================
-#                         НАСТРОЙКИш
+#                         НАСТРОЙКИ
 #  Всё задаётся через переменные окружения Vercel.
 #  Если переменной нет — используется значение-заглушка.
 # ======================================================================
@@ -37,8 +37,9 @@ TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "at_99ddd0618296db80b905c92f
  
 # Upstash Redis — ОБЯЗАТЕЛЕН: в нём хранятся все данные бота.
 # Vercel -> Storage -> Upstash Redis
-UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
-UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
+# Vercel может назвать переменные по-разному (UPSTASH_REDIS_REST_* или KV_REST_API_*) — поддерживаем оба варианта
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("KV_REST_API_URL")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("KV_REST_API_TOKEN")
 # ======================================================================
  
 PIARFLOW_API_URL = "https://piarflow.com/v1"
@@ -178,6 +179,23 @@ class UpstashStorage(BaseStorage):
  
 dp = Dispatcher(storage=UpstashStorage() if redis_enabled() else MemoryStorage())
 router = Router()
+ 
+ 
+class AlwaysAnswerCallback(BaseMiddleware):
+    """Гарантирует ответ на нажатие кнопки. Если обработчик упал с ошибкой или забыл
+    ответить, Telegram иначе держит кнопку «в загрузке» и повторно нажать её нельзя."""
+ 
+    async def __call__(self, handler, event, data):
+        try:
+            return await handler(event, data)
+        finally:
+            try:
+                await event.answer()  # если уже отвечали — Telegram вернёт ошибку, её глушим
+            except Exception:
+                pass
+ 
+ 
+router.callback_query.outer_middleware(AlwaysAnswerCallback())
  
  
 # ================= FSM =================
@@ -1197,8 +1215,8 @@ async def show_task(callback: CallbackQuery) -> None:
  
 @router.callback_query(F.data == "menu_task")
 async def task_menu_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
     await safe_answer(callback)
+    await state.clear()
     await ensure_user(callback.from_user)
     await show_task(callback)
  
@@ -1276,8 +1294,8 @@ async def skip_task_handler(callback: CallbackQuery) -> None:
 # ================= ПРОФИЛЬ =================
 @router.callback_query(F.data == "menu_profile")
 async def profile_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
     await safe_answer(callback)
+    await state.clear()
  
     user = callback.from_user
     stats = await ensure_user(user)
@@ -1300,8 +1318,8 @@ async def profile_handler(callback: CallbackQuery, state: FSMContext) -> None:
 # ================= РЕФЕРАЛЫ =================
 @router.callback_query(F.data == "menu_referrals")
 async def referrals_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
     await safe_answer(callback)
+    await state.clear()
  
     bot_info = await callback.bot.get_me()
     user_id = callback.from_user.id
@@ -1320,8 +1338,8 @@ async def referrals_handler(callback: CallbackQuery, state: FSMContext) -> None:
 # ================= ТОП =================
 @router.callback_query(F.data == "menu_top")
 async def top_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
     await safe_answer(callback)
+    await state.clear()
  
     user_id = callback.from_user.id
     await ensure_user(callback.from_user)
@@ -1352,8 +1370,8 @@ async def top_handler(callback: CallbackQuery, state: FSMContext) -> None:
 # ================= ВЫВОД =================
 @router.callback_query(F.data == "menu_withdraw")
 async def withdraw_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
     await safe_answer(callback)
+    await state.clear()
  
     text = "Выбери количество звёзд, которое хочешь вывести:"
     markup = InlineKeyboardMarkup(
@@ -1469,8 +1487,8 @@ async def admin_panel_handler(callback: CallbackQuery, state: FSMContext) -> Non
     if callback.from_user.id != ADMIN_ID:
         await safe_answer(callback, "Доступ запрещен", show_alert=True)
         return
-    await state.clear()
     await safe_answer(callback)
+    await state.clear()
  
     now = time.time()
     total_users = to_int(await redis_cmd("SCARD", "users"))
@@ -1534,8 +1552,8 @@ async def admin_bc_send(callback: CallbackQuery, state: FSMContext) -> None:
         return
     data = await state.get_data()
     bc_text = data.get("broadcast_text", "")
-    await state.clear()
     await safe_answer(callback)
+    await state.clear()
  
     user_ids = await redis_cmd("SMEMBERS", "users") or []
     sent_count = 0
@@ -1610,8 +1628,8 @@ async def admin_task_pub(callback: CallbackQuery, state: FSMContext) -> None:
         await safe_answer(callback, "Доступ запрещен", show_alert=True)
         return
     data = await state.get_data()
-    await state.clear()
     await safe_answer(callback)
+    await state.clear()
  
     # Счётчик id: номера заданий не повторяются, даже если старые удалены
     next_id = to_int(await redis_cmd("INCR", "task_seq"))
@@ -1633,8 +1651,8 @@ async def admin_promo_menu(callback: CallbackQuery, state: FSMContext) -> None:
     if callback.from_user.id != ADMIN_ID:
         await safe_answer(callback, "Доступ запрещен", show_alert=True)
         return
-    await state.clear()
     await safe_answer(callback)
+    await state.clear()
  
     codes = await redis_cmd("ZRANGE", "promos", 0, -1) or []
     promos = []
@@ -1746,8 +1764,8 @@ async def admin_reward_apply(callback: CallbackQuery, state: FSMContext) -> None
  
 @router.callback_query(F.data == "back_to_main")
 async def back_to_main_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
     await safe_answer(callback)
+    await state.clear()
     await send_main_menu(callback)
  
  
