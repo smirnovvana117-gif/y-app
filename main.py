@@ -2,8 +2,10 @@
 import asyncio
 import json
 import os
-from datetime import datetime, timedelta
-from typing import Optional
+import re
+import time
+from contextvars import ContextVar
+from typing import Any, Optional
  
 import aiohttp
 from flask import Flask, request
@@ -11,6 +13,8 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.base import BaseStorage, StorageKey, StateType
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -21,7 +25,7 @@ from aiogram.types import (
  
 # ======================================================================
 #                         НАСТРОЙКИ
-#  Лучше задать всё через переменные окружения Vercel.
+#  Всё задаётся через переменные окружения Vercel.
 #  Если переменной нет — используется значение-заглушка.
 # ======================================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")   # токен бота (из Vercel)
@@ -31,7 +35,8 @@ TGRASS_API_KEY = os.environ.get("TGRASS_API_KEY", "6d6e9e9701e7440a81fe099d36071
 PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv")
 TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "at_99ddd0618296db80b905c92ff9adaa8c")
  
-# Upstash Redis (для топа рефералов): Vercel -> Storage -> Upstash Redis
+# Upstash Redis — ОБЯЗАТЕЛЕН: в нём хранятся все данные бота.
+# Vercel -> Storage -> Upstash Redis
 UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN")
 # ======================================================================
@@ -43,7 +48,7 @@ TGRASS_API_URL = "https://tgrass.space"
 PLACEHOLDER_MARK = "ВСТАВЬТЕ_КЛЮЧ"
  
  
-def key_filled(value: str) -> bool:
+def key_filled(value: Optional[str]) -> bool:
     return bool(value) and PLACEHOLDER_MARK not in value
  
  
@@ -64,7 +69,114 @@ PROFILE_PHOTO_URL = "https://i.postimg.cc/bvcFZkbf/6219881422739149361.jpg"
 TOP_PHOTO_URL = "https://i.postimg.cc/tJfCWpFM/6219881422739149363.jpg"
 WITHDRAW_PHOTO_URL = "https://i.postimg.cc/RVdQKYYf/6219881422739149362.jpg"
  
-dp = Dispatcher()
+TARGET_COUNT = 10
+INCOME_PER_SPONSOR = 1.0          # доход (руб) за одну подписку на спонсора
+DEFAULT_REFERRAL_REWARD = 4.5     # награда за реферала по умолчанию
+FSM_TTL = 7 * 24 * 3600           # сколько хранить состояние диалога
+ 
+ 
+# ================= REDIS (Upstash REST) =================
+# Сессия aiohttp на время одного апдейта — чтобы не открывать соединение на каждую команду.
+_redis_session: ContextVar = ContextVar("redis_session", default=None)
+ 
+ 
+def redis_enabled() -> bool:
+    return bool(UPSTASH_URL and UPSTASH_TOKEN)
+ 
+ 
+async def redis_cmd(*args):
+    """Выполняет команду Redis через Upstash REST. При ошибке или без Redis — None."""
+    if not redis_enabled():
+        return None
+    payload = [str(a) for a in args]
+    session = _redis_session.get()
+    own = session is None or session.closed
+    if own:
+        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))
+    try:
+        async with session.post(
+            UPSTASH_URL,
+            json=payload,
+            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+        ) as resp:
+            data = await resp.json(content_type=None)
+            if isinstance(data, dict) and data.get("error"):
+                print(f"redis error [{payload[0]}]: {data['error']}")
+                return None
+            return data.get("result") if isinstance(data, dict) else None
+    except Exception as e:
+        print(f"redis exception [{payload[0] if payload else ''}]: {e!r}")
+        return None
+    finally:
+        if own:
+            await session.close()
+ 
+ 
+async def redis_get_json(key: str, default=None):
+    raw = await redis_cmd("GET", key)
+    if raw is None:
+        return default
+    try:
+        return json.loads(raw)
+    except Exception:
+        return default
+ 
+ 
+async def redis_set_json(key: str, value, ex: Optional[int] = None) -> None:
+    args = ["SET", key, json.dumps(value, ensure_ascii=False, default=str)]
+    if ex:
+        args += ["EX", ex]
+    await redis_cmd(*args)
+ 
+ 
+def to_int(value, default: int = 0) -> int:
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+ 
+ 
+def to_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+ 
+ 
+# ================= FSM-ХРАНИЛИЩЕ В REDIS =================
+class UpstashStorage(BaseStorage):
+    """Состояния диалогов (ввод суммы, username, промокода и т.д.) хранятся в Redis,
+    поэтому не теряются при перезапуске Vercel."""
+ 
+    @staticmethod
+    def _k(key: StorageKey, part: str) -> str:
+        return f"fsm:{key.chat_id}:{key.user_id}:{part}"
+ 
+    async def set_state(self, key: StorageKey, state: StateType = None) -> None:
+        value = state.state if isinstance(state, State) else state
+        if value is None:
+            await redis_cmd("DEL", self._k(key, "state"))
+        else:
+            await redis_cmd("SET", self._k(key, "state"), value, "EX", FSM_TTL)
+ 
+    async def get_state(self, key: StorageKey) -> Optional[str]:
+        return await redis_cmd("GET", self._k(key, "state"))
+ 
+    async def set_data(self, key: StorageKey, data: dict[str, Any]) -> None:
+        if not data:
+            await redis_cmd("DEL", self._k(key, "data"))
+        else:
+            await redis_set_json(self._k(key, "data"), dict(data), ex=FSM_TTL)
+ 
+    async def get_data(self, key: StorageKey) -> dict[str, Any]:
+        data = await redis_get_json(self._k(key, "data"), {})
+        return data if isinstance(data, dict) else {}
+ 
+    async def close(self) -> None:
+        pass
+ 
+ 
+dp = Dispatcher(storage=UpstashStorage() if redis_enabled() else MemoryStorage())
 router = Router()
  
  
@@ -90,6 +202,7 @@ class AdminBroadcastStates(StatesGroup):
 class AdminTaskStates(StatesGroup):
     text = State()
     link = State()
+    chat_id = State()
     reward = State()
     max_completions = State()
     preview = State()
@@ -100,52 +213,13 @@ class AdminRewardStates(StatesGroup):
     confirm = State()
  
  
-# ================= ХРАНИЛИЩА (в памяти!) =================
-# ВНИМАНИЕ: на Vercel память не постоянная. Для боевого бота нужна внешняя БД.
-# Топ рефералов хранится в Redis (см. блок REDIS ниже).
-user_active_tasks: dict[int, dict] = {}
-verified_users: set[int] = set()
-fully_passed_users: set[int] = set()
-user_data_db: dict[int, dict] = {}
-pending_referrals: dict[int, int] = {}
-withdraw_temp_data: dict[int, dict] = {}
- 
-promocodes_db: dict[str, dict] = {}
-admin_tasks_db: list[dict] = []
-user_completed_tasks: dict[int, set[int]] = {}
- 
-global_stats = {
-    "total_sponsors_completed": 0,
-    "total_withdrawals_stars": 0.0,
-    "referral_reward": 4.5,
-    "income_sponsors": 0,   # сколько всего подписок на спонсоров сделали пользователи
-}
- 
-TARGET_COUNT = 10
-INCOME_PER_SPONSOR = 1.0   # доход (руб) за одну подписку на спонсора
- 
- 
-# ================= ХЕЛПЕРЫ =================
+# ================= ХЕЛПЕРЫ ИНТЕРФЕЙСА =================
 async def safe_answer(callback: CallbackQuery, *args, **kwargs) -> None:
     """Повторный callback.answer() вызывает ошибку, поэтому глушим её."""
     try:
         await callback.answer(*args, **kwargs)
     except Exception:
         pass
- 
- 
-def ensure_user(user) -> dict:
-    user_id = user.id
-    username_str = f"@{user.username}" if user.username else f"id{user_id}"
-    if user_id not in user_data_db:
-        user_data_db[user_id] = {
-            "name": user.first_name,
-            "username": username_str,
-            "balance": 0.00,
-            "referrals": 0,
-            "join_date": datetime.now(),
-        }
-    return user_data_db[user_id]
  
  
 def back_markup(cb: str = "back_to_main", text: str = "⬅️ Назад") -> InlineKeyboardMarkup:
@@ -180,100 +254,276 @@ async def replace_with_photo(callback: CallbackQuery, photo: str, text: str, mar
         pass
  
  
-# ================= REDIS (ТОП РЕФЕРАЛОВ) =================
-async def redis_cmd(*args):
-    """Выполняет команду Redis через Upstash REST. Если не настроен — None."""
-    if not UPSTASH_URL or not UPSTASH_TOKEN:
+# ================= ПОЛЬЗОВАТЕЛИ (Redis) =================
+def user_key(uid: int) -> str:
+    return f"user:{uid}"
+ 
+ 
+def _parse_user(res) -> Optional[dict]:
+    if not res:
         return None
-    try:
-        timeout = aiohttp.ClientTimeout(total=4)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                UPSTASH_URL,
-                json=list(args),
-                headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
-            ) as resp:
-                data = await resp.json()
-                return data.get("result")
-    except Exception as e:
-        print(f"redis error: {e!r}")
+    if isinstance(res, list):
+        d = dict(zip(res[0::2], res[1::2]))
+    elif isinstance(res, dict):
+        d = res
+    else:
         return None
+    return {
+        "name": d.get("name") or "",
+        "username": d.get("username") or "",
+        "balance": to_float(d.get("balance")),
+        "referrals": to_int(d.get("referrals")),
+        "join_ts": to_float(d.get("join_ts")),
+    }
+ 
+ 
+async def get_user(uid: int) -> Optional[dict]:
+    return _parse_user(await redis_cmd("HGETALL", user_key(uid)))
+ 
+ 
+async def _create_user(uid: int, name: str, username: str) -> dict:
+    now = time.time()
+    await redis_cmd(
+        "HSET", user_key(uid),
+        "name", name, "username", username,
+        "balance", "0", "referrals", "0", "join_ts", str(now),
+    )
+    await redis_cmd("SADD", "users", uid)
+    await redis_cmd("ZADD", "users_joined", now, uid)
+    return {"name": name, "username": username, "balance": 0.0, "referrals": 0, "join_ts": now}
+ 
+ 
+async def ensure_user(user) -> dict:
+    """Возвращает данные пользователя; при первом обращении создаёт запись.
+    В результате есть ключ is_new (True, если пользователь создан только что)."""
+    uid = user.id
+    username_str = f"@{user.username}" if user.username else f"id{uid}"
+    data = await get_user(uid)
+    if data is None:
+        data = await _create_user(uid, user.first_name or "", username_str)
+        data["is_new"] = True
+    else:
+        data["is_new"] = False
+    return data
+ 
+ 
+async def ensure_user_by_id(uid: int) -> dict:
+    data = await get_user(uid)
+    if data is None:
+        data = await _create_user(uid, f"id{uid}", f"id{uid}")
+    return data
+ 
+ 
+async def add_balance(uid: int, amount: float) -> Optional[float]:
+    """Атомарно меняет баланс. Возвращает новый баланс."""
+    res = await redis_cmd("HINCRBYFLOAT", user_key(uid), "balance", amount)
+    return to_float(res) if res is not None else None
+ 
+ 
+# ================= НАСТРОЙКИ И СТАТИСТИКА (Redis) =================
+async def get_referral_reward() -> float:
+    val = await redis_cmd("GET", "cfg:referral_reward")
+    return to_float(val, DEFAULT_REFERRAL_REWARD) if val is not None else DEFAULT_REFERRAL_REWARD
  
  
 async def add_referral_to_top(ref_id: int, name: str) -> None:
-    """+1 реферал пригласившему и сохранение его имени."""
-    await redis_cmd("ZINCRBY", "top_refs", 1, str(ref_id))
-    await redis_cmd("HSET", "top_names", str(ref_id), name or f"id{ref_id}")
+    await redis_cmd("ZINCRBY", "top_refs", 1, ref_id)
+    await redis_cmd("HSET", "top_names", ref_id, name or f"id{ref_id}")
  
  
 async def get_top(limit: int = 5) -> list[tuple[int, str, int]]:
     """Возвращает [(user_id, имя, рефералов), ...] от большего к меньшему."""
     res = await redis_cmd("ZREVRANGE", "top_refs", 0, limit - 1, "WITHSCORES")
- 
-    if res is None:
-        # Redis не настроен — запасной вариант из памяти
-        items = sorted(user_data_db.items(), key=lambda i: i[1]["referrals"], reverse=True)
-        return [(uid, d["name"], d["referrals"]) for uid, d in items[:limit] if d["referrals"] > 0]
- 
+    if not res:
+        return []
     ids = res[0::2]
     scores = res[1::2]
     names = await redis_cmd("HMGET", "top_names", *ids) if ids else []
     names = names or [None] * len(ids)
- 
     return [
-        (int(uid), name or f"id{uid}", int(float(score)))
+        (int(uid), name or f"id{uid}", to_int(score))
         for uid, name, score in zip(ids, names, scores)
     ]
  
  
 async def get_user_refs_and_rank(user_id: int) -> tuple[int, Optional[int]]:
-    """Возвращает (кол-во рефералов, место в рейтинге или None)."""
-    score = await redis_cmd("ZSCORE", "top_refs", str(user_id))
+    score = await redis_cmd("ZSCORE", "top_refs", user_id)
     if score is None:
-        return user_data_db.get(user_id, {}).get("referrals", 0), None
-    rank = await redis_cmd("ZREVRANK", "top_refs", str(user_id))
-    return int(float(score)), (rank + 1 if rank is not None else None)
+        u = await get_user(user_id)
+        return (u["referrals"] if u else 0), None
+    rank = await redis_cmd("ZREVRANK", "top_refs", user_id)
+    return to_int(score), (int(rank) + 1 if rank is not None else None)
  
  
-# ================= ДОХОД ОТ СПОНСОРОВ =================
+async def mark_passed(uid: int) -> None:
+    """Пользователь прошёл спонсоров — учитываем один раз."""
+    added = await redis_cmd("SADD", "passed_users", uid)
+    if to_int(added) == 1:
+        await redis_cmd("INCR", "stat:sponsors_completed")
+ 
+ 
 async def add_income(user_id: int, count: int) -> None:
-    """Добавляет к доходу количество спонсоров, на которых подписался пользователь.
-    Каждый пользователь учитывается только один раз."""
+    """Добавляет к доходу число спонсоров, на которых подписался пользователь.
+    Каждый пользователь учитывается один раз."""
     if count <= 0:
         return
- 
-    added = await redis_cmd("SADD", "income_users", str(user_id))
-    if added is None:
-        # Redis не настроен — защита от повторов только в памяти
-        if user_id in fully_passed_users:
-            return
-    elif int(added) == 0:
-        return  # этот пользователь уже был учтён
- 
-    global_stats["income_sponsors"] += count
+    added = await redis_cmd("SADD", "income_users", user_id)
+    if added is None or to_int(added) == 0:
+        return
     await redis_cmd("INCRBY", "income_sponsors", count)
+ 
+ 
+async def get_income_sponsors() -> int:
+    return to_int(await redis_cmd("GET", "income_sponsors"))
  
  
 async def pop_sponsor_total(user_id: int, fallback: int = 0) -> int:
     """Достаёт из Redis исходное число показанных спонсоров и удаляет ключ."""
     val = await redis_cmd("GET", f"sp_total:{user_id}")
     await redis_cmd("DEL", f"sp_total:{user_id}")
-    try:
-        n = int(val)
-    except (TypeError, ValueError):
-        n = 0
-    return max(n, fallback)
+    return max(to_int(val), fallback)
  
  
-async def get_income_sponsors() -> int:
-    """Всего подписок на спонсоров (из Redis, иначе из памяти)."""
-    val = await redis_cmd("GET", "income_sponsors")
-    if val is None:
-        return global_stats["income_sponsors"]
+# ================= АКТИВНЫЕ СПОНСОРЫ / ВЫВОД (Redis) =================
+async def get_active(uid: int) -> Optional[dict]:
+    return await redis_get_json(f"sp_active:{uid}")
+ 
+ 
+async def set_active(uid: int, data: dict) -> None:
+    await redis_set_json(f"sp_active:{uid}", data, ex=86400)
+ 
+ 
+async def del_active(uid: int) -> None:
+    await redis_cmd("DEL", f"sp_active:{uid}")
+ 
+ 
+async def get_wd(uid: int) -> dict:
+    return await redis_get_json(f"wd:{uid}", {}) or {}
+ 
+ 
+async def set_wd(uid: int, data: dict) -> None:
+    await redis_set_json(f"wd:{uid}", data, ex=3600)
+ 
+ 
+async def del_wd(uid: int) -> None:
+    await redis_cmd("DEL", f"wd:{uid}")
+ 
+ 
+# ================= ЗАДАНИЯ (Redis) =================
+TASKS_KEY = "admin_tasks"
+ 
+ 
+async def load_tasks() -> list[dict]:
+    tasks = await redis_get_json(TASKS_KEY, [])
+    return tasks if isinstance(tasks, list) else []
+ 
+ 
+async def save_tasks(tasks: list[dict]) -> None:
+    await redis_set_json(TASKS_KEY, tasks)
+ 
+ 
+async def pick_task(uid: int) -> Optional[dict]:
+    """Первое задание, которое пользователь ещё не выполнял и не пропускал."""
+    tasks = await load_tasks()
+    if not tasks:
+        return None
+    done = {to_int(x) for x in (await redis_cmd("SMEMBERS", f"user_done:{uid}") or [])}
+    candidates = [t for t in tasks if t["id"] not in done]
+    if not candidates:
+        return None
+    skipped = {to_int(x) for x in (await redis_cmd("SMEMBERS", f"user_skip:{uid}") or [])}
+    fresh = [t for t in candidates if t["id"] not in skipped]
+    if not fresh:
+        await redis_cmd("DEL", f"user_skip:{uid}")
+        fresh = candidates
+    return fresh[0]
+ 
+ 
+# ================= ПРОВЕРКА ПОДПИСКИ НА КАНАЛ ЗАДАНИЯ =================
+def normalize_task_link(text: str) -> Optional[str]:
+    """Приводит ввод админа к ссылке https://t.me/... Возвращает None, если формат не подходит."""
+    t = (text or "").strip()
+    if re.fullmatch(r"@\w{4,}", t):
+        return f"https://t.me/{t[1:]}"
+    m = re.match(r"^(?:https?://)?(?:t|telegram)\.me/(\S+)$", t, re.I)
+    if m:
+        return f"https://t.me/{m.group(1)}"
+    return None
+ 
+ 
+def chat_ref_from_link(link: str) -> Optional[str]:
+    """@username канала из публичной ссылки. Для закрытых ссылок (t.me/+...) возвращает None."""
+    m = re.match(r"^(?:https?://)?(?:t|telegram)\.me/(\S+)$", (link or "").strip(), re.I)
+    if not m:
+        return None
+    first = m.group(1).split("?")[0].strip("/").split("/")[0]
+    if not first or first.startswith("+") or first.lower() in ("joinchat", "c", "addlist"):
+        return None
+    return f"@{first}" if re.fullmatch(r"\w{4,}", first) else None
+ 
+ 
+def _status_str(member) -> str:
+    return str(getattr(member.status, "value", member.status))
+ 
+ 
+async def validate_task_chat(bot: Bot, chat_ref) -> tuple[Optional[int], str, str]:
+    """Проверяет, что канал существует и бот в нём администратор (иначе подписки не проверить).
+    Возвращает (chat_id, название, текст_ошибки)."""
     try:
-        return int(val)
-    except (TypeError, ValueError):
-        return global_stats["income_sponsors"]
+        chat = await bot.get_chat(chat_ref)
+    except Exception:
+        return None, "", "❌ Канал не найден. Проверьте ссылку или ID и попробуйте снова."
+    try:
+        me = await bot.me()
+        member = await bot.get_chat_member(chat.id, me.id)
+    except Exception:
+        member = None
+    if member is None or _status_str(member) not in ("administrator", "creator"):
+        return None, "", (
+            "❌ Бот не администратор в этом канале, поэтому не сможет проверять подписки.\n"
+            "Добавьте бота админом и отправьте ссылку снова."
+        )
+    return chat.id, (chat.title or chat.username or str(chat.id)), ""
+ 
+ 
+async def check_subscription(bot: Bot, chat_ref, user_id: int) -> Optional[bool]:
+    """True — подписан, False — нет, None — не удалось проверить."""
+    try:
+        member = await bot.get_chat_member(chat_id=chat_ref, user_id=user_id)
+    except Exception as e:
+        print(f"check_subscription error: {e!r}")
+        return None
+    status = _status_str(member)
+    if status in ("creator", "administrator", "member"):
+        return True
+    if status == "restricted":
+        return bool(getattr(member, "is_member", False))
+    return False
+ 
+ 
+# ================= ПРОМОКОДЫ (Redis) =================
+async def get_promo(code: str) -> Optional[dict]:
+    res = await redis_cmd("HGETALL", f"promo:{code}")
+    if not res:
+        return None
+    d = dict(zip(res[0::2], res[1::2])) if isinstance(res, list) else dict(res)
+    return {
+        "name": d.get("name") or code,
+        "price": to_float(d.get("price")),
+        "activations": to_int(d.get("activations")),
+    }
+ 
+ 
+async def create_promo(name: str, activations: int, price: float) -> None:
+    await redis_cmd("DEL", f"promo_used:{name}")
+    await redis_cmd("HSET", f"promo:{name}", "name", name, "price", price, "activations", activations)
+    await redis_cmd("ZADD", "promos", time.time(), name)
+ 
+ 
+async def delete_promo(code: str) -> None:
+    await redis_cmd("DEL", f"promo:{code}")
+    await redis_cmd("DEL", f"promo_used:{code}")
+    await redis_cmd("ZREM", "promos", code)
  
  
 # ================= API СПОНСОРОВ =================
@@ -363,24 +613,26 @@ async def start_handler(message: Message, command: CommandObject, state: FSMCont
     user_id = message.from_user.id
     username_str = f"@{message.from_user.username}" if message.from_user.username else f"id{user_id}"
  
-    is_new = user_id not in user_data_db
-    ensure_user(message.from_user)
-    user_data_db[user_id]["name"] = message.from_user.first_name
-    user_data_db[user_id]["username"] = username_str
+    data = await ensure_user(message.from_user)
+    is_new = data["is_new"]
+    await redis_cmd(
+        "HSET", user_key(user_id),
+        "name", message.from_user.first_name or "", "username", username_str,
+    )
  
     args = command.args
     if args and args.startswith("ref_") and is_new:
         try:
             referrer_id = int(args.split("_")[1])
-            if referrer_id != user_id and user_id not in pending_referrals:
-                pending_referrals[user_id] = referrer_id
-                await redis_cmd("SET", f"pending_ref:{user_id}", referrer_id, "EX", 2592000)
-                if referrer_id in user_data_db:
+            if referrer_id != user_id:
+                saved = await redis_cmd("SET", f"pending_ref:{user_id}", referrer_id, "NX", "EX", 2592000)
+                if saved and await get_user(referrer_id):
+                    reward = await get_referral_reward()
                     ref_msg = (
                         f"реферал: {username_str}\n"
                         f"доход: 0.00 ⭐\n"
                         f"как только реферал подпишется на спонсоров, вы получите "
-                        f"{global_stats['referral_reward']}⭐"
+                        f"{reward}⭐"
                     )
                     try:
                         await message.bot.send_message(chat_id=referrer_id, text=ref_msg)
@@ -389,7 +641,6 @@ async def start_handler(message: Message, command: CommandObject, state: FSMCont
         except ValueError:
             pass
  
-    verified_users.add(user_id)
     await show_sponsors(message)
  
  
@@ -404,8 +655,16 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
     user_id = user.id
     chat_id = message.chat.id
  
-    def key_status(v: str) -> str:
+    def key_status(v: Optional[str]) -> str:
         return f"заполнен ({len(v)} симв.)" if key_filled(v) else "НЕ ЗАПОЛНЕН"
+ 
+    ping = await redis_cmd("PING") if redis_enabled() else None
+    if not redis_enabled():
+        redis_line = "НЕ НАСТРОЕН — данные НЕ сохраняются!"
+    elif ping == "PONG":
+        redis_line = "работает ✅"
+    else:
+        redis_line = "настроен, но НЕ отвечает ❌ (проверьте URL и токен)"
  
     lines = [
         "🔧 ДИАГНОСТИКА",
@@ -413,7 +672,7 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
         f"TGRASS_API_KEY: {key_status(TGRASS_API_KEY)}",
         f"PIARFLOW_API_KEY: {key_status(PIARFLOW_API_KEY)}",
         f"TRAFSLY_API_KEY: {key_status(TRAFSLY_API_KEY)}",
-        f"REDIS (топ): {'настроен' if UPSTASH_URL and UPSTASH_TOKEN else 'НЕ НАСТРОЕН'}",
+        f"REDIS: {redis_line}",
         "",
     ]
  
@@ -465,10 +724,11 @@ async def resetme_handler(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     uid = message.from_user.id
-    await redis_cmd("SREM", "income_users", str(uid))
+    await redis_cmd("SREM", "income_users", uid)
+    await redis_cmd("SREM", "passed_users", uid)
     await redis_cmd("DEL", f"sp_total:{uid}")
-    fully_passed_users.discard(uid)
-    user_active_tasks.pop(uid, None)
+    await redis_cmd("DEL", f"sp_active:{uid}")
+    await redis_cmd("DEL", f"pending_ref:{uid}")
     await message.answer("✅ Ваш аккаунт сброшен для теста. Нажмите /start — доход снова будет засчитан.")
  
  
@@ -478,7 +738,7 @@ async def any_message_handler(message: Message, state: FSMContext) -> None:
     current_state = await state.get_state()
     user_id = message.from_user.id
     text_msg = message.text.strip() if message.text else ""
-    ensure_user(message.from_user)
+    await ensure_user(message.from_user)
  
     # ----- вывод: своя сумма -----
     if current_state == WithdrawStates.waiting_for_custom_amount.state:
@@ -490,7 +750,7 @@ async def any_message_handler(message: Message, state: FSMContext) -> None:
             await message.answer("❌ Минимальная сумма для вывода: 50 ⭐. Введите число от 50:")
             return
  
-        withdraw_temp_data[user_id] = {"amount": amount}
+        await set_wd(user_id, {"amount": amount})
         await state.set_state(WithdrawStates.waiting_for_username)
         await message.answer("Введите @username получателя:", reply_markup=back_markup("menu_withdraw"))
         return
@@ -501,11 +761,11 @@ async def any_message_handler(message: Message, state: FSMContext) -> None:
         if not username.startswith("@"):
             username = "@" + username
  
-        if user_id not in withdraw_temp_data:
-            withdraw_temp_data[user_id] = {}
-        withdraw_temp_data[user_id]["username"] = username
+        wd = await get_wd(user_id)
+        wd["username"] = username
+        await set_wd(user_id, wd)
  
-        amount = withdraw_temp_data[user_id].get("amount", 0)
+        amount = wd.get("amount", 0)
         await state.set_state(WithdrawStates.waiting_for_confirmation)
  
         text = (
@@ -528,25 +788,33 @@ async def any_message_handler(message: Message, state: FSMContext) -> None:
     if current_state == PromocodeStates.waiting_for_activation_input.state:
         code = text_msg
         markup = back_markup("back_to_main")
+        invalid_text = "промокод использован или недействителен"
  
-        if code in promocodes_db:
-            p_data = promocodes_db[code]
-            if user_id in p_data["used_by"]:
-                await message.answer("промокод уже был вами использован ❗", reply_markup=markup)
-            elif p_data["activations"] <= 0:
-                await message.answer("промокод использован или недействителен", reply_markup=markup)
-            else:
-                p_data["activations"] -= 1
-                p_data["used_by"].add(user_id)
-                user_data_db[user_id]["balance"] += p_data["price"]
+        promo = await get_promo(code) if code else None
+        if not promo:
+            await message.answer(invalid_text, reply_markup=markup)
+            return
  
-                if p_data["activations"] <= 0:
-                    del promocodes_db[code]
+        # SADD вернёт 0, если этот пользователь уже активировал промокод
+        first_use = await redis_cmd("SADD", f"promo_used:{code}", user_id)
+        if to_int(first_use) == 0:
+            await message.answer("промокод уже был вами использован ❗", reply_markup=markup)
+            return
  
-                await state.clear()
-                await message.answer(f"на ваш баланс зачислено {p_data['price']} ⭐", reply_markup=markup)
-        else:
-            await message.answer("промокод использован или недействителен", reply_markup=markup)
+        left = await redis_cmd("HINCRBY", f"promo:{code}", "activations", -1)
+        if left is None or to_int(left) < 0:
+            # активации закончились — откатываем
+            await redis_cmd("HINCRBY", f"promo:{code}", "activations", 1)
+            await redis_cmd("SREM", f"promo_used:{code}", user_id)
+            await message.answer(invalid_text, reply_markup=markup)
+            return
+ 
+        await add_balance(user_id, promo["price"])
+        if to_int(left) <= 0:
+            await delete_promo(code)
+ 
+        await state.clear()
+        await message.answer(f"на ваш баланс зачислено {promo['price']} ⭐", reply_markup=markup)
         return
  
     # ===== ниже только для админа =====
@@ -558,7 +826,7 @@ async def any_message_handler(message: Message, state: FSMContext) -> None:
         await state.update_data(broadcast_text=text_msg)
         await state.set_state(AdminBroadcastStates.confirm)
  
-        count_users = len(user_data_db)
+        count_users = to_int(await redis_cmd("SCARD", "users"))
         text_out = f"пользователей увидят рассылку: {count_users}\n\nтекст рассылки:\n\n{text_msg}"
         markup = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -580,7 +848,50 @@ async def any_message_handler(message: Message, state: FSMContext) -> None:
         return
  
     if current_state == AdminTaskStates.link.state:
-        await state.update_data(task_link=text_msg)
+        link = normalize_task_link(text_msg)
+        if not link:
+            await message.answer(
+                "❌ Введите ссылку вида https://t.me/channel или @channel",
+                reply_markup=back_markup("admin_panel"),
+            )
+            return
+ 
+        chat_ref = chat_ref_from_link(link)
+        if chat_ref is None:
+            # закрытая ссылка-приглашение: по ней канал не определить, нужен его ID
+            await state.update_data(task_link=link)
+            await state.set_state(AdminTaskStates.chat_id)
+            await message.answer(
+                "🔒 Это закрытая ссылка. Чтобы проверять подписки, пришлите ID канала "
+                "(выглядит как -1001234567890).\n\n"
+                "ID можно узнать, переслав любой пост из канала боту @getidsbot. "
+                "Бот должен быть администратором канала.",
+                reply_markup=back_markup("admin_panel"),
+            )
+            return
+ 
+        chat_id, title, err = await validate_task_chat(message.bot, chat_ref)
+        if err:
+            await message.answer(err, reply_markup=back_markup("admin_panel"))
+            return
+ 
+        await state.update_data(task_link=link, task_chat=chat_id, task_chat_title=title)
+        await state.set_state(AdminTaskStates.reward)
+        await message.answer("введите награду (⭐) за задание:", reply_markup=back_markup("admin_panel"))
+        return
+ 
+    if current_state == AdminTaskStates.chat_id.state:
+        if not re.fullmatch(r"-100\d{5,}", text_msg):
+            await message.answer(
+                "❌ ID должен выглядеть как -1001234567890. Попробуйте ещё раз.",
+                reply_markup=back_markup("admin_panel"),
+            )
+            return
+        chat_id, title, err = await validate_task_chat(message.bot, int(text_msg))
+        if err:
+            await message.answer(err, reply_markup=back_markup("admin_panel"))
+            return
+        await state.update_data(task_chat=chat_id, task_chat_title=title)
         await state.set_state(AdminTaskStates.reward)
         await message.answer("введите награду (⭐) за задание:", reply_markup=back_markup("admin_panel"))
         return
@@ -608,6 +919,7 @@ async def any_message_handler(message: Message, state: FSMContext) -> None:
             "предпросмотр задания:\n\n"
             f"текст: {data.get('task_text')}\n"
             f"ссылка: {data.get('task_link')}\n"
+            f"канал: {data.get('task_chat_title')}\n"
             f"награда: {data.get('task_reward')}⭐\n"
             f"макс. выполнений: {data.get('task_max_completions')}"
         )
@@ -644,12 +956,7 @@ async def any_message_handler(message: Message, state: FSMContext) -> None:
             return
         data = await state.get_data()
         name = data.get("promo_name")
-        promocodes_db[name] = {
-            "name": name,
-            "activations": data.get("promo_activations", 1),
-            "price": price,
-            "used_by": set(),
-        }
+        await create_promo(name, data.get("promo_activations", 1), price)
         await state.clear()
         await message.answer(
             f"✅ Промокод {name} создан",
@@ -696,42 +1003,26 @@ def build_sponsor_markup(all_links: list[str]) -> InlineKeyboardMarkup:
 async def reward_referrer_if_needed(bot: Bot, user_id: int, had_sponsors: bool = True) -> None:
     """Сообщает пригласившему о результате.
     had_sponsors=True  -> реферал подписался на спонсоров: награда + сообщение «подписался»
-    had_sponsors=False -> спонсоров не было: награды нет + сообщение «не подписался»
-    Пригласивший берётся из памяти, а если память сбросилась — из Redis."""
-    ref_id = pending_referrals.pop(user_id, None)
- 
-    redis_ref = await redis_cmd("GET", f"pending_ref:{user_id}")
-    if redis_ref is not None:
-        await redis_cmd("DEL", f"pending_ref:{user_id}")
-        if ref_id is None:
-            try:
-                ref_id = int(redis_ref)
-            except (TypeError, ValueError):
-                ref_id = None
- 
-    if ref_id is None:
+    had_sponsors=False -> спонсоров не было: награды нет + сообщение «не подписался»"""
+    # GETDEL: забираем и удаляем за одну операцию — награда выдаётся только один раз
+    raw = await redis_cmd("GETDEL", f"pending_ref:{user_id}")
+    if raw is None:
+        return
+    try:
+        ref_id = int(raw)
+    except (TypeError, ValueError):
         return
  
-    # Если память сбросилась и пригласившего в ней нет — создаём пустую запись,
-    # чтобы сообщение всё равно дошло (баланс в памяти при этом начнётся с нуля)
-    if ref_id not in user_data_db:
-        user_data_db[ref_id] = {
-            "name": f"id{ref_id}",
-            "username": f"id{ref_id}",
-            "balance": 0.00,
-            "referrals": 0,
-            "join_date": datetime.now(),
-        }
- 
-    ref_username = user_data_db.get(user_id, {}).get("username", f"id{user_id}")
+    ref = await ensure_user_by_id(ref_id)
+    me = await get_user(user_id)
+    ref_username = me["username"] if me and me["username"] else f"id{user_id}"
  
     # ----- спонсоров не было -> награды нет -----
     if not had_sponsors:
-        total_bal = user_data_db[ref_id]["balance"]
         no_sponsors_msg = (
             f"реферал: {ref_username}\n"
             f"не подписался на спонсоров ваш доход 0.00 ⭐\n"
-            f"доход: {total_bal:.2f} ⭐"
+            f"доход: {ref['balance']:.2f} ⭐"
         )
         try:
             await bot.send_message(chat_id=ref_id, text=no_sponsors_msg)
@@ -740,13 +1031,12 @@ async def reward_referrer_if_needed(bot: Bot, user_id: int, had_sponsors: bool =
         return
  
     # ----- реферал подписался на спонсоров -> награда -----
-    ref_name = user_data_db[ref_id].get("name") or f"id{ref_id}"
-    await add_referral_to_top(ref_id, ref_name)
- 
-    reward = global_stats["referral_reward"]
-    user_data_db[ref_id]["balance"] += reward
-    user_data_db[ref_id]["referrals"] += 1
-    total_bal = user_data_db[ref_id]["balance"]
+    reward = await get_referral_reward()
+    await add_referral_to_top(ref_id, ref["name"] or f"id{ref_id}")
+    await redis_cmd("HINCRBY", user_key(ref_id), "referrals", 1)
+    total_bal = await add_balance(ref_id, reward)
+    if total_bal is None:
+        total_bal = ref["balance"] + reward
  
     success_ref_msg = (
         f"реферал: {ref_username}\n"
@@ -794,31 +1084,28 @@ async def show_sponsors(message: Message, user=None):
         f"piarflow={len(collected_piarflow)} trafsly={len(collected_trafsly)}"
     )
  
-    user_active_tasks[user_id] = {
-        "tgrass": collected_tgrass,
-        "piarflow": collected_piarflow,
-        "trafsly": collected_trafsly,
-    }
- 
     all_links = (
         [o["link"] for o in collected_tgrass]
         + [i["link"] for i in collected_piarflow]
         + [s["link"] for s in collected_trafsly]
     )
  
-    # Запоминаем, сколько спонсоров показали — столько и начислим в доход
-    user_active_tasks[user_id]["total_count"] = len(all_links)
     if all_links:
+        await set_active(user_id, {
+            "tgrass": collected_tgrass,
+            "piarflow": collected_piarflow,
+            "trafsly": collected_trafsly,
+            "total_count": len(all_links),
+        })
         # NX: не перезаписываем, чтобы сохранилось исходное число спонсоров
         await redis_cmd("SET", f"sp_total:{user_id}", len(all_links), "NX", "EX", 604800)
- 
-    if not all_links:
-        # Если процесс перезапускался, исходное число спонсоров берём из Redis
+    else:
+        await del_active(user_id)
+        # Спонсоров сейчас нет. Если раньше они были показаны (число хранится в Redis) —
+        # значит, пользователь на них уже подписался.
         done_count = await pop_sponsor_total(user_id)
         await add_income(user_id, done_count)
-        if user_id not in fully_passed_users:
-            global_stats["total_sponsors_completed"] += 1
-        fully_passed_users.add(user_id)
+        await mark_passed(user_id)
         await reward_referrer_if_needed(message.bot, user_id, had_sponsors=done_count > 0)
         await send_main_menu(message, user)
         return
@@ -841,8 +1128,7 @@ async def send_main_menu(message_or_callback, user=None):
         message = message_or_callback
         user = user or message.from_user
  
-    ensure_user(user)
-    stats = user_data_db[user.id]
+    stats = await ensure_user(user)
  
     text = (
         f"🥑 Добро пожаловать в AvoStars!\n\n"
@@ -887,14 +1173,12 @@ async def send_main_menu(message_or_callback, user=None):
  
 # ================= ЗАДАНИЯ =================
 async def show_task(callback: CallbackQuery) -> None:
-    if not admin_tasks_db:
+    task = await pick_task(callback.from_user.id)
+    if not task:
         await replace_message(callback, "нет активных заданий для выполнения", back_markup("back_to_main"))
         return
  
-    task = admin_tasks_db[0]
     task_id = task["id"]
-    user_completed_tasks.setdefault(task_id, set())
- 
     text = (
         f"🎯 Доступно задание №{task_id}!\n\n"
         f"- Подпишитесь на канал —>\n {task['link']}\n-\n"
@@ -915,7 +1199,7 @@ async def show_task(callback: CallbackQuery) -> None:
 async def task_menu_handler(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await safe_answer(callback)
-    ensure_user(callback.from_user)
+    await ensure_user(callback.from_user)
     await show_task(callback)
  
  
@@ -923,30 +1207,48 @@ async def task_menu_handler(callback: CallbackQuery, state: FSMContext) -> None:
 async def done_task_handler(callback: CallbackQuery) -> None:
     task_id = int(callback.data.split("_")[2])
     user_id = callback.from_user.id
-    ensure_user(callback.from_user)
+    await ensure_user(callback.from_user)
  
-    task = next((t for t in admin_tasks_db if t["id"] == task_id), None)
+    tasks = await load_tasks()
+    task = next((t for t in tasks if t["id"] == task_id), None)
     if not task:
         await safe_answer(callback, "Задание не найдено.")
         return
  
-    # TODO: реальная проверка подписки через bot.get_chat_member
-    is_subscribed = True
-    if not is_subscribed:
+    # Реальная проверка подписки через get_chat_member
+    chat_ref = task.get("chat_id") or chat_ref_from_link(task.get("link", ""))
+    if chat_ref is None:
+        await safe_answer(
+            callback,
+            "⚠️ Это задание настроено неверно, проверить подписку нельзя. Сообщите администратору.",
+            show_alert=True,
+        )
+        return
+ 
+    subscribed = await check_subscription(callback.bot, chat_ref, user_id)
+    if subscribed is None:
+        await safe_answer(
+            callback,
+            "⚠️ Не удалось проверить подписку. Попробуйте чуть позже.",
+            show_alert=True,
+        )
+        return
+    if not subscribed:
         await safe_answer(callback, "вы не подписались на канал ❗", show_alert=True)
         return
  
-    completed = user_completed_tasks.setdefault(task_id, set())
-    if user_id in completed:
+    added = await redis_cmd("SADD", f"user_done:{user_id}", task_id)
+    if to_int(added) == 0:
         await safe_answer(callback, "Вы уже выполнили это задание!")
         return
  
-    completed.add(user_id)
-    user_data_db[user_id]["balance"] += task["reward"]
-    task["completions_count"] += 1
+    await add_balance(user_id, to_float(task["reward"]))
  
-    if task["completions_count"] >= task["max_completions"]:
-        admin_tasks_db.remove(task)
+    count = to_int(await redis_cmd("INCR", f"task_cnt:{task_id}"))
+    if count >= to_int(task.get("max_completions"), 1):
+        fresh = await load_tasks()
+        await save_tasks([t for t in fresh if t["id"] != task_id])
+        await redis_cmd("DEL", f"task_cnt:{task_id}")
  
     await safe_answer(callback)
  
@@ -963,9 +1265,11 @@ async def done_task_handler(callback: CallbackQuery) -> None:
 @router.callback_query(F.data.startswith("skip_task_"))
 async def skip_task_handler(callback: CallbackQuery) -> None:
     await safe_answer(callback)
-    if admin_tasks_db:
-        # переносим текущее задание в конец очереди, а не удаляем
-        admin_tasks_db.append(admin_tasks_db.pop(0))
+    task_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    # пропуск действует только для этого пользователя
+    await redis_cmd("SADD", f"user_skip:{user_id}", task_id)
+    await redis_cmd("EXPIRE", f"user_skip:{user_id}", 86400)
     await show_task(callback)
  
  
@@ -976,8 +1280,7 @@ async def profile_handler(callback: CallbackQuery, state: FSMContext) -> None:
     await safe_answer(callback)
  
     user = callback.from_user
-    ensure_user(user)
-    stats = user_data_db[user.id]
+    stats = await ensure_user(user)
  
     text = (
         f"👤 Имя: {user.first_name}\n"
@@ -1003,9 +1306,10 @@ async def referrals_handler(callback: CallbackQuery, state: FSMContext) -> None:
     bot_info = await callback.bot.get_me()
     user_id = callback.from_user.id
     referral_link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
+    reward = await get_referral_reward()
  
     text = (
-        f"За каждого друга, который перейдет по твоей ссылке, ты получаешь +{global_stats['referral_reward']}⭐️!\n\n"
+        f"За каждого друга, который перейдет по твоей ссылке, ты получаешь +{reward}⭐️!\n\n"
         f"🔗 Твоя реферальная ссылка:\n"
         f"{referral_link}\n\n"
         f"🎉 Приглашай по этой ссылке своих друзей, отправляй её во все чаты и зарабатывай Звёзды!"
@@ -1020,7 +1324,7 @@ async def top_handler(callback: CallbackQuery, state: FSMContext) -> None:
     await safe_answer(callback)
  
     user_id = callback.from_user.id
-    ensure_user(callback.from_user)
+    await ensure_user(callback.from_user)
  
     top = await get_top(5)
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
@@ -1075,7 +1379,7 @@ async def withdraw_handler(callback: CallbackQuery, state: FSMContext) -> None:
 async def withdraw_preset_handler(callback: CallbackQuery, state: FSMContext) -> None:
     amount = int(callback.data.split("_")[1])
     user_id = callback.from_user.id
-    withdraw_temp_data[user_id] = {"amount": amount}
+    await set_wd(user_id, {"amount": amount})
  
     await state.set_state(WithdrawStates.waiting_for_username)
     await safe_answer(callback)
@@ -1092,25 +1396,29 @@ async def withdraw_custom_handler(callback: CallbackQuery, state: FSMContext) ->
 @router.callback_query(F.data == "confirm_withdraw")
 async def confirm_withdraw_handler(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
-    ensure_user(callback.from_user)
-    user_data = user_data_db[user_id]
-    temp_data = withdraw_temp_data.get(user_id, {})
+    await ensure_user(callback.from_user)
+    temp_data = await get_wd(user_id)
  
-    amount = temp_data.get("amount", 0)
+    amount = to_int(temp_data.get("amount"))
     username = temp_data.get("username", "@unknown")
  
     if amount <= 0:
         await safe_answer(callback, "❌ Данные заявки потеряны, начните заново.", show_alert=True)
         return
  
-    if user_data["balance"] < amount:
+    # Сначала списываем, затем проверяем остаток — так нельзя вывести дважды одни и те же звёзды
+    new_balance = await add_balance(user_id, -amount)
+    if new_balance is None:
+        await safe_answer(callback, "❌ Ошибка сервера, попробуйте позже.", show_alert=True)
+        return
+    if new_balance < 0:
+        await add_balance(user_id, amount)  # возвращаем
         await safe_answer(callback, "❌ У вас недостаточно средств на балансе!", show_alert=True)
         return
  
-    user_data_db[user_id]["balance"] -= amount
-    global_stats["total_withdrawals_stars"] += amount
+    await redis_cmd("INCRBYFLOAT", "stat:withdrawals", amount)
     await state.clear()
-    withdraw_temp_data.pop(user_id, None)
+    await del_wd(user_id)
     await safe_answer(callback)
  
     await replace_message(callback, f"Заявка на вывод {amount} ⭐ успешно выполнена", back_markup("back_to_main"))
@@ -1164,16 +1472,20 @@ async def admin_panel_handler(callback: CallbackQuery, state: FSMContext) -> Non
     await state.clear()
     await safe_answer(callback)
  
-    now = datetime.now()
-    total_users = len(user_data_db)
-    u_24h = sum(1 for u in user_data_db.values() if now - u["join_date"] <= timedelta(hours=24))
-    u_7d = sum(1 for u in user_data_db.values() if now - u["join_date"] <= timedelta(days=7))
-    u_30d = sum(1 for u in user_data_db.values() if now - u["join_date"] <= timedelta(days=30))
+    now = time.time()
+    total_users = to_int(await redis_cmd("SCARD", "users"))
  
-    sponsors_count = global_stats["total_sponsors_completed"]
+    async def joined_since(seconds: int) -> int:
+        return to_int(await redis_cmd("ZCOUNT", "users_joined", now - seconds, "+inf"))
+ 
+    u_24h = await joined_since(24 * 3600)
+    u_7d = await joined_since(7 * 24 * 3600)
+    u_30d = await joined_since(30 * 24 * 3600)
+ 
+    sponsors_count = to_int(await redis_cmd("GET", "stat:sponsors_completed"))
     total_sponsor_subs = await get_income_sponsors()
     income_rub = total_sponsor_subs * INCOME_PER_SPONSOR
-    withdrawals = global_stats["total_withdrawals_stars"]
+    withdrawals = to_float(await redis_cmd("GET", "stat:withdrawals"))
  
     text = (
         "панель админа:\n"
@@ -1184,7 +1496,7 @@ async def admin_panel_handler(callback: CallbackQuery, state: FSMContext) -> Non
         f"пользователей подписавшись на спонсоров: {sponsors_count}\n"
         f"подписок на спонсоров всего: {total_sponsor_subs}\n"
         f"доход: {income_rub:g} руб\n"
-        f"выводы: {withdrawals} звезд"
+        f"выводы: {withdrawals:g} звезд"
     )
     markup = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1210,7 +1522,8 @@ async def admin_bc_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminBroadcastStates.waiting_for_text)
     await safe_answer(callback)
  
-    text = f"пользователей увидят рассылку: {len(user_data_db)}\n\nвведите текст рассылки"
+    count_users = to_int(await redis_cmd("SCARD", "users"))
+    text = f"пользователей увидят рассылку: {count_users}\n\nвведите текст рассылки"
     await replace_message(callback, text, back_markup("admin_panel"))
  
  
@@ -1224,10 +1537,11 @@ async def admin_bc_send(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await safe_answer(callback)
  
+    user_ids = await redis_cmd("SMEMBERS", "users") or []
     sent_count = 0
-    for uid in list(user_data_db.keys()):
+    for uid in user_ids:
         try:
-            await callback.bot.send_message(chat_id=uid, text=bc_text)
+            await callback.bot.send_message(chat_id=int(uid), text=bc_text)
             sent_count += 1
             await asyncio.sleep(0.05)
         except Exception:
@@ -1248,12 +1562,13 @@ async def admin_tasks_menu(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await safe_answer(callback)
  
+    tasks = await load_tasks()
     keyboard_rows = []
-    if not admin_tasks_db:
+    if not tasks:
         text = "У вас нет активных заданий."
     else:
         text = "Активные задания (нажмите, чтобы удалить):"
-        for t in admin_tasks_db:
+        for t in tasks:
             keyboard_rows.append([
                 InlineKeyboardButton(
                     text=f"❌ Удалить №{t['id']} ({t['link']})",
@@ -1282,8 +1597,9 @@ async def admin_del_task(callback: CallbackQuery, state: FSMContext) -> None:
         await safe_answer(callback, "Доступ запрещен", show_alert=True)
         return
     task_id = int(callback.data.split("_")[3])
-    global admin_tasks_db
-    admin_tasks_db = [t for t in admin_tasks_db if t["id"] != task_id]
+    tasks = await load_tasks()
+    await save_tasks([t for t in tasks if t["id"] != task_id])
+    await redis_cmd("DEL", f"task_cnt:{task_id}")
     await safe_answer(callback, "Задание удалено!")
     await admin_tasks_menu(callback, state)
  
@@ -1297,15 +1613,18 @@ async def admin_task_pub(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await safe_answer(callback)
  
-    next_id = (max((t["id"] for t in admin_tasks_db), default=0)) + 1
-    admin_tasks_db.append({
+    # Счётчик id: номера заданий не повторяются, даже если старые удалены
+    next_id = to_int(await redis_cmd("INCR", "task_seq"))
+    tasks = await load_tasks()
+    tasks.append({
         "id": next_id,
         "text": data.get("task_text"),
         "link": data.get("task_link"),
+        "chat_id": data.get("task_chat"),
         "reward": data.get("task_reward"),
         "max_completions": data.get("task_max_completions"),
-        "completions_count": 0,
     })
+    await save_tasks(tasks)
     await admin_panel_handler(callback, state)
  
  
@@ -1317,7 +1636,16 @@ async def admin_promo_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await safe_answer(callback)
  
-    if not promocodes_db:
+    codes = await redis_cmd("ZRANGE", "promos", 0, -1) or []
+    promos = []
+    for code in codes:
+        p = await get_promo(code)
+        if p:
+            promos.append((code, p))
+        else:
+            await redis_cmd("ZREM", "promos", code)  # чистим «мёртвые» записи
+ 
+    if not promos:
         text = "у вас нету активных промокодов 🎁"
         markup = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -1327,15 +1655,14 @@ async def admin_promo_menu(callback: CallbackQuery, state: FSMContext) -> None:
         )
     else:
         keyboard_rows = []
-        for code in promocodes_db:
+        for code, _ in promos:
             keyboard_rows.append([
                 InlineKeyboardButton(text=f"🗑 Удалить: {code}", callback_data=f"admin_del_promo_{code}")
             ])
  
-        active_count = len(promocodes_db)
-        _, p = list(promocodes_db.items())[-1]
+        _, p = promos[-1]
         text = (
-            f"{active_count} активный промокод ⭐\n"
+            f"{len(promos)} активный промокод ⭐\n"
             f"название: {p['name']}\n"
             f"Цена: {p['price']} звезд\n"
             f"кол во активаций: {p['activations']}"
@@ -1353,8 +1680,8 @@ async def admin_del_promo(callback: CallbackQuery, state: FSMContext) -> None:
         await safe_answer(callback, "Доступ запрещен", show_alert=True)
         return
     code = callback.data.replace("admin_del_promo_", "")
-    if code in promocodes_db:
-        del promocodes_db[code]
+    if await get_promo(code):
+        await delete_promo(code)
         await safe_answer(callback, "Промокод удален!")
     await admin_promo_menu(callback, state)
  
@@ -1381,7 +1708,8 @@ async def admin_reward_menu(callback: CallbackQuery, state: FSMContext) -> None:
         return
     await safe_answer(callback)
  
-    text = f"цена за реферала {global_stats['referral_reward']} ⭐"
+    reward = await get_referral_reward()
+    text = f"цена за реферала {reward} ⭐"
     markup = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -1411,7 +1739,7 @@ async def admin_reward_apply(callback: CallbackQuery, state: FSMContext) -> None
     data = await state.get_data()
     new_val = data.get("new_reward")
     if new_val is not None:
-        global_stats["referral_reward"] = new_val
+        await redis_cmd("SET", "cfg:referral_reward", new_val)
     await state.clear()
     await admin_reward_menu(callback, state)
  
@@ -1427,11 +1755,11 @@ async def back_to_main_handler(callback: CallbackQuery, state: FSMContext) -> No
 @router.callback_query(F.data == "check_all_tasks")
 async def check_all_tasks_handler(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
-    ensure_user(callback.from_user)
-    tasks_data = user_active_tasks.get(user_id)
+    await ensure_user(callback.from_user)
+    tasks_data = await get_active(user_id)
  
     if not tasks_data:
-        # На Vercel память могла сброситься — просто заново запрашиваем спонсоров
+        # Данных о спонсорах нет — просто заново запрашиваем
         await safe_answer(callback)
         await show_sponsors(callback.message, callback.from_user)
         return
@@ -1486,17 +1814,16 @@ async def check_all_tasks_handler(callback: CallbackQuery) -> None:
     left_trafsly = tasks_data.get("trafsly", [])
  
     if not left_tgrass and not left_piarflow and not left_trafsly:
-        user_active_tasks.pop(user_id, None)
+        await del_active(user_id)
         done_count = await pop_sponsor_total(user_id, tasks_data.get("total_count", 0))
         await add_income(user_id, done_count)
-        if user_id not in fully_passed_users:
-            global_stats["total_sponsors_completed"] += 1
-        fully_passed_users.add(user_id)
+        await mark_passed(user_id)
  
         await reward_referrer_if_needed(callback.bot, user_id)
         await safe_answer(callback)
         await send_main_menu(callback)  # удалит старое сообщение сам
     else:
+        await set_active(user_id, tasks_data)
         all_links = (
             [o["link"] for o in left_tgrass]
             + [i["link"] for i in left_piarflow]
@@ -1518,12 +1845,17 @@ async def process_update(json_data: dict) -> None:
     # Новый Bot на каждый апдейт: aiohttp-сессия привязана к event loop,
     # а asyncio.run() каждый раз создаёт и закрывает новый loop.
     bot = Bot(token=BOT_TOKEN)
+    # Одна сессия для всех запросов к Redis в рамках этого апдейта
+    redis_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))
+    token = _redis_session.set(redis_session)
     try:
         update = Update.model_validate(json_data, context={"bot": bot})
         await dp.feed_update(bot, update)
     except Exception as e:
         print(f"Webhook error: {e!r}")
     finally:
+        _redis_session.reset(token)
+        await redis_session.close()
         await bot.session.close()
  
  
