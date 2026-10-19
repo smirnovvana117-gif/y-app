@@ -1,5 +1,6 @@
 
 import asyncio
+import html
 import json
 import os
 import re
@@ -36,8 +37,8 @@ PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "FNDvblihCM-RXnMX1U_UrErt_
 TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "at_99ddd0618296db80b905c92ff9adaa8c")
 TRAFFY_API_KEY = os.environ.get("TRAFFY_API_KEY", "pk_live_NR4I3mmnaSXRJLor5j6O1XQHIHm5ZoFz")
 FLYER_API_KEY = os.environ.get("FLYER_API_KEY", "FL-XCelim-WHmkUj-vBuGgN-bbMxPy")
-FLOWLY_API_KEY = os.environ.get("FLOWLY_API_KEY", "9f0c8ea7e9a664b4a6326ce95
-
+FLOWLY_API_KEY = os.environ.get("FLOWLY_API_KEY", "9f0c8ea7e9a664b4a6326ce95f62b222")
+ 
 # Upstash Redis — ОБЯЗАТЕЛЕН: в нём хранятся все данные бота.
 # Vercel -> Storage -> Upstash Redis
 # Vercel может назвать переменные по-разному (UPSTASH_REDIS_REST_* или KV_REST_API_*) — поддерживаем оба варианта
@@ -427,7 +428,7 @@ async def pop_sponsor_total(user_id: int, fallback: int = 0) -> int:
     """Достаёт из Redis исходное число показанных спонсоров и удаляет ключ."""
     val = await redis_cmd("GET", f"sp_total:{user_id}")
     await redis_cmd("DEL", f"sp_total:{user_id}")
-    return max(to_int(val), fallback)
+    return min(max(to_int(val), fallback), TARGET_COUNT)  # доход за одного пользователя — не больше 10
  
  
 # ================= АКТИВНЫЕ СПОНСОРЫ / ВЫВОД (Redis) =================
@@ -660,6 +661,16 @@ SERVICES = ("tgrass", "piarflow", "trafsly", "traffy", "flyer", "flowly")
 def links_of(data: dict) -> list[str]:
     """Все ссылки спонсоров в порядке приоритета сервисов."""
     return [item["link"] for name in SERVICES for item in (data.get(name) or [])]
+ 
+ 
+def limit_sponsors(data: dict, limit: int = TARGET_COUNT) -> dict:
+    """Жёстко обрезает общий список спонсоров до limit (по приоритету сервисов)."""
+    left = limit
+    for name in SERVICES:
+        items = (data.get(name) or [])[:max(left, 0)]
+        data[name] = items
+        left -= len(items)
+    return data
  
  
 def pick_sponsors(results) -> dict[str, list]:
@@ -1269,7 +1280,7 @@ async def any_message_handler(message: Message, state: FSMContext) -> None:
 def build_sponsor_markup(all_links: list[str]) -> InlineKeyboardMarkup:
     buttons = []
     temp_row = []
-    for link in all_links:
+    for link in all_links[:TARGET_COUNT]:
         temp_row.append(InlineKeyboardButton(text="✉️ Подписаться", url=link))
         if len(temp_row) == 2:
             buttons.append(temp_row)
@@ -1356,7 +1367,7 @@ async def show_sponsors(message: Message, user=None):
                 fetch_flowly(session, user_id, user_data, TARGET_COUNT),
                 return_exceptions=True,
             )
-        collected = pick_sponsors(results)
+        collected = limit_sponsors(pick_sponsors(results))
     except Exception as e:
         print(f"show_sponsors error: {e!r}")
  
@@ -2048,6 +2059,7 @@ async def check_all_tasks_handler(callback: CallbackQuery) -> None:
             continue
         tasks_data[name] = res
  
+    limit_sponsors(tasks_data)
     all_links = links_of(tasks_data)
  
     if not all_links:
