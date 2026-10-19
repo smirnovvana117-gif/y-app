@@ -34,6 +34,10 @@ ADMIN_ID = 619112100                      # ID администратора
 TGRASS_API_KEY = os.environ.get("TGRASS_API_KEY", "6d6e9e9701e7440a81fe099d360710d5")
 PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv")
 TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "at_99ddd0618296db80b905c92ff9adaa8c")
+BOTOHUB_API_KEY = os.environ.get("BOTOHUB_API_KEY", "22b0bc7e-33b9-4eca-aa87-b43730c23ea2")
+TRAFFY_API_KEY = os.environ.get("TRAFFY_API_KEY", "pk_live_NR4I3mmnaSXRJLor5j6O1XQHIHm5ZoFz")
+FLYER_API_KEY = os.environ.get("FLYER_API_KEY", "FL-XCelim-WHmkUj-vBuGgN-bbMxPy")
+FLOWLY_API_KEY = os.environ.get("FLOWLY_API_KEY", "9f0c8ea7e9a664b4a6326ce95f62b222")
  
 # Upstash Redis — ОБЯЗАТЕЛЕН: в нём хранятся все данные бота.
 # Vercel -> Storage -> Upstash Redis
@@ -45,6 +49,10 @@ UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("KV
 PIARFLOW_API_URL = "https://piarflow.com/v1"
 TRAFSLY_API_URL = "https://api.trafsly.com"
 TGRASS_API_URL = "https://tgrass.space"
+BOTOHUB_API_URL = "https://botohub.me"
+TRAFFY_API_URL = "https://api.traffy.ai/publisher"
+FLYER_API_URL = "https://api.flyerhubs.com"
+FLOWLY_API_URL = "https://flowly.guru/api/v1"
  
 PLACEHOLDER_MARK = "ВСТАВЬТЕ_КЛЮЧ"
  
@@ -58,6 +66,10 @@ for _name, _val in (
     ("TGRASS_API_KEY", TGRASS_API_KEY),
     ("PIARFLOW_API_KEY", PIARFLOW_API_KEY),
     ("TRAFSLY_API_KEY", TRAFSLY_API_KEY),
+    ("BOTOHUB_API_KEY", BOTOHUB_API_KEY),
+    ("TRAFFY_API_KEY", TRAFFY_API_KEY),
+    ("FLYER_API_KEY", FLYER_API_KEY),
+    ("FLOWLY_API_KEY", FLOWLY_API_KEY),
     ("UPSTASH_REDIS_REST_URL", UPSTASH_URL),
     ("UPSTASH_REDIS_REST_TOKEN", UPSTASH_TOKEN),
 ):
@@ -624,6 +636,231 @@ async def fetch_trafsly(session, user_id, chat_id, user_data, limit):
     ][:limit]
  
  
+# ================= ДОПОЛНИТЕЛЬНЫЕ СПОНСОРЫ: BotoHub, Traffy, Flyer, Flowly =================
+# Порядок = приоритет при наборе TARGET_COUNT спонсоров
+SERVICES = ("tgrass", "piarflow", "trafsly", "botohub", "traffy", "flyer", "flowly")
+ 
+ 
+def links_of(data: dict) -> list[str]:
+    """Все ссылки спонсоров в порядке приоритета сервисов."""
+    return [item["link"] for name in SERVICES for item in (data.get(name) or [])]
+ 
+ 
+def pick_sponsors(results) -> dict[str, list]:
+    """Из ответов всех сервисов набирает ровно TARGET_COUNT спонсоров (без повторов ссылок)."""
+    collected: dict[str, list] = {name: [] for name in SERVICES}
+    seen: set[str] = set()
+    remaining = TARGET_COUNT
+    for name, res in zip(SERVICES, results):
+        if remaining <= 0:
+            break
+        if isinstance(res, Exception):
+            print(f"[{name}] ошибка получения спонсоров: {res!r}")
+            continue
+        for item in res or []:
+            link = item.get("link")
+            if not link or link in seen:
+                continue
+            seen.add(link)
+            collected[name].append(item)
+            remaining -= 1
+            if remaining <= 0:
+                break
+    return collected
+ 
+ 
+def botohub_headers():
+    return {"Auth": BOTOHUB_API_KEY, "Content-Type": "application/json"}
+ 
+ 
+def traffy_headers():
+    return {"x-publisher-api-key": TRAFFY_API_KEY, "Content-Type": "application/json"}
+ 
+ 
+def flyer_headers():
+    return {"Content-Type": "application/json"}
+ 
+ 
+def flowly_headers():
+    return {"Auth": FLOWLY_API_KEY, "Content-Type": "application/json"}
+ 
+ 
+async def fetch_botohub(session, user_id, limit):
+    if not key_filled(BOTOHUB_API_KEY):
+        return []
+    _, data, _ = await api_post(session, "botohub", f"{BOTOHUB_API_URL}/get-tasks", {"chat_id": user_id}, botohub_headers())
+    if not isinstance(data, dict):
+        return []
+    if data.get("completed") or data.get("skip"):
+        return []
+    tasks = data.get("tasks") or []
+    return [{"link": t} for t in tasks if isinstance(t, str) and t][:limit]
+ 
+ 
+async def fetch_traffy(session, user_id, user_data, limit):
+    if not key_filled(TRAFFY_API_KEY):
+        return []
+    payload = {"telegram_id": user_id, "limit": limit}
+    if user_data.get("first_name"):
+        payload["first_name"] = user_data["first_name"]
+    if user_data.get("username"):
+        payload["username"] = user_data["username"]
+    if user_data.get("language_code"):
+        payload["language_code"] = user_data["language_code"]
+    _, data, _ = await api_post(session, "traffy", f"{TRAFFY_API_URL}/tasks", payload, traffy_headers())
+    if not isinstance(data, dict):
+        return []
+    tasks = data.get("tasks") or []
+    return [
+        {"link": t["target_link"], "assignment_id": t["assignment_id"]}
+        for t in tasks
+        if t.get("target_link") and t.get("assignment_id")
+    ][:limit]
+ 
+ 
+async def fetch_flyer(session, user_id, user_data, limit):
+    if not key_filled(FLYER_API_KEY):
+        return []
+    payload = {"key": FLYER_API_KEY, "user_id": user_id, "limit": min(limit, 10)}
+    if user_data.get("language_code"):
+        payload["language_code"] = user_data["language_code"]
+    _, data, _ = await api_post(session, "flyer", f"{FLYER_API_URL}/get_tasks", payload, flyer_headers())
+    if not isinstance(data, dict):
+        return []
+    if data.get("error"):
+        # Например «Prohibited method for a bot type» — ключ не типа «Задания»
+        print(f"[flyer] error: {data['error']}")
+        return []
+    items = []
+    for t in data.get("result") or []:
+        if t.get("status") in ("complete", "waiting", "unavailable"):
+            continue
+        links = t.get("links") or []
+        if links and t.get("signature"):
+            items.append({"link": links[0], "signature": t["signature"]})
+    return items[:limit]
+ 
+ 
+async def fetch_flowly(session, user_id, user_data, limit):
+    if not key_filled(FLOWLY_API_KEY):
+        return []
+    payload = {
+        "tg_user_id": int(user_id),
+        "lang": user_data.get("language_code") or "ru",
+        "is_premium": bool(user_data.get("is_premium", False)),
+        "offers_limit": limit,
+    }
+    _, data, _ = await api_post(session, "flowly", f"{FLOWLY_API_URL}/offers", payload, flowly_headers())
+    if not isinstance(data, dict) or data.get("status") != "not_ok":
+        return []
+    offers = data.get("offers") or []
+    return [
+        {"link": o["link"], "offer_id": o["offer_id"]}
+        for o in offers
+        if o.get("link") and o.get("offer_id") is not None and not o.get("subscribed", False)
+    ][:limit]
+ 
+ 
+# ----- проверка выполнения (каждая функция возвращает, что осталось невыполненным) -----
+async def check_tgrass(session, user, items):
+    payload = {
+        "tg_user_id": int(user.id),
+        "tg_login": user.username,
+        "lang": user.language_code or "ru",
+        "is_premium": bool(user.is_premium),
+    }
+    _, res, _ = await api_post(session, "tgrass-check", f"{TGRASS_API_URL}/offers", payload, tgrass_headers())
+    if not isinstance(res, dict):
+        return items
+    if res.get("status") == "ok":
+        return []
+    offers = res.get("offers", []) or []
+    active_links = {o["link"] for o in offers if not o.get("subscribed", True)}
+    return [o for o in items if o["link"] in active_links]
+ 
+ 
+async def check_piarflow(session, user, items):
+    _, res, _ = await api_post(
+        session, "piarflow-check", f"{PIARFLOW_API_URL}/sponsors/check",
+        {"user_id": user.id, "links": [i["link"] for i in items]}, piarflow_headers(),
+    )
+    if not isinstance(res, dict):
+        return items
+    sponsors = res.get("sponsors", []) or []
+    subscribed = {s["link"] for s in sponsors if s.get("status") == "subscribed"}
+    return [i for i in items if i["link"] not in subscribed]
+ 
+ 
+async def check_trafsly(session, user, items):
+    async def one(sponsor):
+        _, res, _ = await api_post(
+            session, "trafsly-check", f"{TRAFSLY_API_URL}/api/v1/confirm-subscription",
+            {"user_id": user.id, "ads_id": sponsor.get("ads_id")}, trafsly_headers(),
+        )
+        return sponsor, bool(isinstance(res, dict) and res.get("subscribed", False))
+ 
+    results = await asyncio.gather(*(one(s) for s in items))
+    return [s for s, done in results if not done]
+ 
+ 
+async def check_botohub(session, user, items):
+    _, res, _ = await api_post(session, "botohub-check", f"{BOTOHUB_API_URL}/get-tasks", {"chat_id": user.id}, botohub_headers())
+    if not isinstance(res, dict):
+        return items
+    if res.get("completed") or res.get("skip"):
+        return []
+    tasks = [t for t in (res.get("tasks") or []) if isinstance(t, str) and t]
+    # BotoHub сам знает, что ещё не выполнено — не больше, чем мы показывали
+    return [{"link": t} for t in tasks][:len(items)]
+ 
+ 
+async def check_traffy(session, user, items):
+    _, res, _ = await api_post(
+        session, "traffy-check", f"{TRAFFY_API_URL}/tasks/check",
+        {"telegram_id": user.id, "assignment_ids": [i["assignment_id"] for i in items]}, traffy_headers(),
+    )
+    if not isinstance(res, dict):
+        return items
+    status_by_id = {r.get("assignment_id"): r.get("status") for r in (res.get("results") or [])}
+    # completed — выполнено; rejected/expired — выполнить уже нельзя, не держим пользователя
+    return [i for i in items if status_by_id.get(i["assignment_id"], "pending") in ("pending", "error")]
+ 
+ 
+async def check_flyer(session, user, items):
+    async def one(item):
+        _, res, _ = await api_post(
+            session, "flyer-check", f"{FLYER_API_URL}/check_task",
+            {"key": FLYER_API_KEY, "signature": item["signature"]}, flyer_headers(),
+        )
+        return item, (res.get("result") if isinstance(res, dict) else None)
+ 
+    results = await asyncio.gather(*(one(i) for i in items))
+    return [i for i, status in results if status not in ("complete", "waiting", "unavailable")]
+ 
+ 
+async def check_flowly(session, user, items):
+    async def one(item):
+        _, res, _ = await api_post(
+            session, "flowly-check", f"{FLOWLY_API_URL}/check",
+            {"tg_user_id": int(user.id), "offer_id": item["offer_id"]}, flowly_headers(),
+        )
+        return item, (res.get("status") if isinstance(res, dict) else None)
+ 
+    results = await asyncio.gather(*(one(i) for i in items))
+    return [i for i, status in results if status not in ("subscribed", "offer_unavailable")]
+ 
+ 
+CHECKERS = {
+    "tgrass": check_tgrass,
+    "piarflow": check_piarflow,
+    "trafsly": check_trafsly,
+    "botohub": check_botohub,
+    "traffy": check_traffy,
+    "flyer": check_flyer,
+    "flowly": check_flowly,
+}
+ 
+ 
 # ================= /start =================
 @router.message(CommandStart())
 async def start_handler(message: Message, command: CommandObject, state: FSMContext) -> None:
@@ -690,6 +927,10 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
         f"TGRASS_API_KEY: {key_status(TGRASS_API_KEY)}",
         f"PIARFLOW_API_KEY: {key_status(PIARFLOW_API_KEY)}",
         f"TRAFSLY_API_KEY: {key_status(TRAFSLY_API_KEY)}",
+        f"BOTOHUB_API_KEY: {key_status(BOTOHUB_API_KEY)}",
+        f"TRAFFY_API_KEY: {key_status(TRAFFY_API_KEY)}",
+        f"FLYER_API_KEY: {key_status(FLYER_API_KEY)}",
+        f"FLOWLY_API_KEY: {key_status(FLOWLY_API_KEY)}",
         f"REDIS: {redis_line}",
         "",
     ]
@@ -729,10 +970,50 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
             },
             trafsly_headers(),
         )
-        lines.append(f"TRAFSLY → HTTP {st}\n{body[:500]}")
+        lines.append(f"TRAFSLY → HTTP {st}\n{body[:500]}\n")
+ 
+        st, _, body = await api_post(
+            session, "botohub", f"{BOTOHUB_API_URL}/get-tasks",
+            {"chat_id": user_id}, botohub_headers(),
+        )
+        lines.append(f"BOTOHUB → HTTP {st}\n{body[:500]}\n")
+ 
+        traffy_payload = {"telegram_id": user_id, "limit": 3}
+        if user.language_code:
+            traffy_payload["language_code"] = user.language_code
+        st, _, body = await api_post(
+            session, "traffy", f"{TRAFFY_API_URL}/tasks", traffy_payload, traffy_headers(),
+        )
+        lines.append(f"TRAFFY → HTTP {st}\n{body[:500]}\n")
+ 
+        st, _, body = await api_post(
+            session, "flyer-me", f"{FLYER_API_URL}/get_me", {"key": FLYER_API_KEY}, flyer_headers(),
+        )
+        lines.append(f"FLYER get_me → HTTP {st}\n{body[:300]}\n")
+ 
+        flyer_payload = {"key": FLYER_API_KEY, "user_id": user_id, "limit": 3}
+        if user.language_code:
+            flyer_payload["language_code"] = user.language_code
+        st, _, body = await api_post(
+            session, "flyer", f"{FLYER_API_URL}/get_tasks", flyer_payload, flyer_headers(),
+        )
+        lines.append(f"FLYER get_tasks → HTTP {st}\n{body[:500]}\n")
+ 
+        st, _, body = await api_post(
+            session, "flowly", f"{FLOWLY_API_URL}/offers",
+            {
+                "tg_user_id": int(user_id),
+                "lang": user.language_code or "ru",
+                "is_premium": bool(user.is_premium),
+                "offers_limit": 3,
+            },
+            flowly_headers(),
+        )
+        lines.append(f"FLOWLY → HTTP {st}\n{body[:500]}")
  
     text = "\n".join(lines)
-    await message.answer(text[:4000])
+    for i in range(0, len(text), 3900):
+        await message.answer(text[i:i + 3900])
  
  
 # ================= /resetme (только админ, для тестов) =================
@@ -1078,43 +1359,33 @@ async def show_sponsors(message: Message, user=None):
         "is_premium": user.is_premium,
     }
  
-    collected_tgrass, collected_piarflow, collected_trafsly = [], [], []
+    collected: dict[str, list] = {name: [] for name in SERVICES}
  
     try:
-        timeout = aiohttp.ClientTimeout(total=4)
+        timeout = aiohttp.ClientTimeout(total=5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            remaining = TARGET_COUNT
- 
-            collected_tgrass = await fetch_tgrass(session, user_id, user_data, remaining)
-            remaining -= len(collected_tgrass)
- 
-            if remaining > 0:
-                collected_piarflow = await fetch_piarflow(session, user_id, chat_id, remaining)
-                remaining -= len(collected_piarflow)
- 
-            if remaining > 0:
-                collected_trafsly = await fetch_trafsly(session, user_id, chat_id, user_data, remaining)
+            # Все сервисы опрашиваются одновременно (быстрее для Vercel),
+            # затем из ответов набирается ровно TARGET_COUNT спонсоров по приоритету
+            results = await asyncio.gather(
+                fetch_tgrass(session, user_id, user_data, TARGET_COUNT),
+                fetch_piarflow(session, user_id, chat_id, TARGET_COUNT),
+                fetch_trafsly(session, user_id, chat_id, user_data, TARGET_COUNT),
+                fetch_botohub(session, user_id, TARGET_COUNT),
+                fetch_traffy(session, user_id, user_data, TARGET_COUNT),
+                fetch_flyer(session, user_id, user_data, TARGET_COUNT),
+                fetch_flowly(session, user_id, user_data, TARGET_COUNT),
+                return_exceptions=True,
+            )
+        collected = pick_sponsors(results)
     except Exception as e:
         print(f"show_sponsors error: {e!r}")
  
-    print(
-        f"[sponsors] user={user_id} tgrass={len(collected_tgrass)} "
-        f"piarflow={len(collected_piarflow)} trafsly={len(collected_trafsly)}"
-    )
+    print(f"[sponsors] user={user_id} " + " ".join(f"{n}={len(collected[n])}" for n in SERVICES))
  
-    all_links = (
-        [o["link"] for o in collected_tgrass]
-        + [i["link"] for i in collected_piarflow]
-        + [s["link"] for s in collected_trafsly]
-    )
+    all_links = links_of(collected)
  
     if all_links:
-        await set_active(user_id, {
-            "tgrass": collected_tgrass,
-            "piarflow": collected_piarflow,
-            "trafsly": collected_trafsly,
-            "total_count": len(all_links),
-        })
+        await set_active(user_id, {**collected, "total_count": len(all_links)})
         # NX: не перезаписываем, чтобы сохранилось исходное число спонсоров
         await redis_cmd("SET", f"sp_total:{user_id}", len(all_links), "NX", "EX", 604800)
     else:
@@ -1782,56 +2053,22 @@ async def check_all_tasks_handler(callback: CallbackQuery) -> None:
         await show_sponsors(callback.message, callback.from_user)
         return
  
+    user = callback.from_user
+    names = [n for n in SERVICES if tasks_data.get(n)]
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
-        # 1. Tgrass
-        tg_offers = tasks_data.get("tgrass", [])
-        if tg_offers:
-            payload = {
-                "tg_user_id": int(user_id),
-                "tg_login": callback.from_user.username,
-                "lang": callback.from_user.language_code or "ru",
-                "is_premium": bool(callback.from_user.is_premium),
-            }
-            _, res, _ = await api_post(session, "tgrass-check", f"{TGRASS_API_URL}/offers", payload, tgrass_headers())
-            if isinstance(res, dict):
-                if res.get("status") == "ok":
-                    tasks_data["tgrass"] = []
-                else:
-                    offers = res.get("offers", []) or []
-                    active_links = {o["link"] for o in offers if not o.get("subscribed", True)}
-                    tasks_data["tgrass"] = [o for o in tg_offers if o["link"] in active_links]
+        results = await asyncio.gather(
+            *(CHECKERS[n](session, user, tasks_data[n]) for n in names),
+            return_exceptions=True,
+        )
+    for name, res in zip(names, results):
+        if isinstance(res, Exception):
+            print(f"[{name}] ошибка проверки: {res!r}")  # список этого сервиса оставляем как был
+            continue
+        tasks_data[name] = res
  
-        # 2. Piarflow
-        pf_links = tasks_data.get("piarflow", [])
-        if pf_links:
-            links_only = [item["link"] for item in pf_links]
-            _, res, _ = await api_post(
-                session, "piarflow-check", f"{PIARFLOW_API_URL}/sponsors/check",
-                {"user_id": user_id, "links": links_only}, piarflow_headers(),
-            )
-            if isinstance(res, dict):
-                sponsors = res.get("sponsors", []) or []
-                subscribed_links = {s["link"] for s in sponsors if s.get("status") == "subscribed"}
-                tasks_data["piarflow"] = [item for item in pf_links if item["link"] not in subscribed_links]
+    all_links = links_of(tasks_data)
  
-        # 3. Trafsly
-        tf_sponsors = tasks_data.get("trafsly", [])
-        if tf_sponsors:
-            remaining_trafsly = []
-            for sponsor in tf_sponsors:
-                _, res, _ = await api_post(
-                    session, "trafsly-check", f"{TRAFSLY_API_URL}/api/v1/confirm-subscription",
-                    {"user_id": user_id, "ads_id": sponsor.get("ads_id")}, trafsly_headers(),
-                )
-                if not (isinstance(res, dict) and res.get("subscribed", False)):
-                    remaining_trafsly.append(sponsor)
-            tasks_data["trafsly"] = remaining_trafsly
- 
-    left_tgrass = tasks_data.get("tgrass", [])
-    left_piarflow = tasks_data.get("piarflow", [])
-    left_trafsly = tasks_data.get("trafsly", [])
- 
-    if not left_tgrass and not left_piarflow and not left_trafsly:
+    if not all_links:
         await del_active(user_id)
         done_count = await pop_sponsor_total(user_id, tasks_data.get("total_count", 0))
         await add_income(user_id, done_count)
@@ -1842,11 +2079,6 @@ async def check_all_tasks_handler(callback: CallbackQuery) -> None:
         await send_main_menu(callback)  # удалит старое сообщение сам
     else:
         await set_active(user_id, tasks_data)
-        all_links = (
-            [o["link"] for o in left_tgrass]
-            + [i["link"] for i in left_piarflow]
-            + [s["link"] for s in left_trafsly]
-        )
         try:
             await callback.message.edit_reply_markup(reply_markup=build_sponsor_markup(all_links))
         except Exception:
