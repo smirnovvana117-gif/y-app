@@ -36,7 +36,7 @@ PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "FNDvblihCM-RXnMX1U_UrErt_
 TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "at_99ddd0618296db80b905c92ff9adaa8c")
 TRAFFY_API_KEY = os.environ.get("TRAFFY_API_KEY", "pk_live_NR4I3mmnaSXRJLor5j6O1XQHIHm5ZoFz")
 FLYER_API_KEY = os.environ.get("FLYER_API_KEY", "FL-XCelim-WHmkUj-vBuGgN-bbMxPy")
-FLOWLY_API_KEY = os.environ.get("FLOWLY_API_KEY", "9f0c8ea7e9a664b4a6326ce95f62b222")
+FLOWLY_API_KEY = os.environ.get("FLOWLY_API_KEY", "9f0c8ea7e9a664b4a6326ce95
 
 # Upstash Redis — ОБЯЗАТЕЛЕН: в нём хранятся все данные бота.
 # Vercel -> Storage -> Upstash Redis
@@ -241,6 +241,19 @@ class AdminRewardStates(StatesGroup):
  
  
 # ================= ХЕЛПЕРЫ ИНТЕРФЕЙСА =================
+try:  # aiogram 3.7+
+    from aiogram.types import LinkPreviewOptions
+except ImportError:  # более старые версии
+    LinkPreviewOptions = None
+ 
+ 
+def no_preview() -> dict:
+    """Параметры отправки сообщения без предпросмотра ссылок."""
+    if LinkPreviewOptions is not None:
+        return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
+    return {"disable_web_page_preview": True}
+ 
+ 
 async def safe_answer(callback: CallbackQuery, *args, **kwargs) -> None:
     """Повторный callback.answer() вызывает ошибку, поэтому глушим её."""
     try:
@@ -253,10 +266,16 @@ def back_markup(cb: str = "back_to_main", text: str = "⬅️ Назад") -> In
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=text, callback_data=cb)]])
  
  
-async def replace_message(callback: CallbackQuery, text: str, markup=None) -> None:
+async def replace_message(
+    callback: CallbackQuery, text: str, markup=None,
+    parse_mode: Optional[str] = None, disable_preview: bool = False,
+) -> None:
     """Отправляет новое сообщение и удаляет старое."""
     try:
-        await callback.message.answer(text, reply_markup=markup)
+        kwargs = {"parse_mode": parse_mode} if parse_mode else {}
+        if disable_preview:
+            kwargs.update(no_preview())
+        await callback.message.answer(text, reply_markup=markup, **kwargs)
     except Exception as e:
         print(f"replace_message error: {e}")
         return
@@ -1190,7 +1209,7 @@ async def any_message_handler(message: Message, state: FSMContext) -> None:
                 [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")],
             ]
         )
-        await message.answer(text, reply_markup=markup)
+        await message.answer(text, reply_markup=markup, **no_preview())
         return
  
     # ----- создание промокода -----
@@ -1429,10 +1448,12 @@ async def show_task(callback: CallbackQuery) -> None:
         return
  
     task_id = task["id"]
+    link = html.escape(str(task["link"]))
+    reward = html.escape(str(task["reward"]))
     text = (
-        f"🎯 Доступно задание №{task_id}!\n\n"
-        f"- Подпишитесь на канал —>\n {task['link']}\n-\n"
-        f"Награда: {task['reward']}⭐"
+        f"<b>🎯 Доступно задание №{task_id}!</b>\n\n"
+        f"<b>• Подпишитесь на канал —> {link}</b>\n"
+        f"<b>• Награда: {reward}⭐️</b>"
     )
     markup = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1442,7 +1463,7 @@ async def show_task(callback: CallbackQuery) -> None:
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
         ]
     )
-    await replace_message(callback, text, markup)
+    await replace_message(callback, text, markup, parse_mode="HTML", disable_preview=True)
  
  
 @router.callback_query(F.data == "menu_task")
@@ -2082,6 +2103,4 @@ def webhook():
 @app.route("/", methods=["GET"])
 def index():
     return "Bot is running on Vercel!", 200
- 
- 
  
