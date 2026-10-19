@@ -34,11 +34,10 @@ ADMIN_ID = 619112100                      # ID администратора
 TGRASS_API_KEY = os.environ.get("TGRASS_API_KEY", "6d6e9e9701e7440a81fe099d360710d5")
 PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv")
 TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "at_99ddd0618296db80b905c92ff9adaa8c")
-BOTOHUB_API_KEY = os.environ.get("BOTOHUB_API_KEY", "22b0bc7e-33b9-4eca-aa87-b43730c23ea2")
 TRAFFY_API_KEY = os.environ.get("TRAFFY_API_KEY", "pk_live_NR4I3mmnaSXRJLor5j6O1XQHIHm5ZoFz")
 FLYER_API_KEY = os.environ.get("FLYER_API_KEY", "FL-XCelim-WHmkUj-vBuGgN-bbMxPy")
 FLOWLY_API_KEY = os.environ.get("FLOWLY_API_KEY", "9f0c8ea7e9a664b4a6326ce95f62b222")
- 
+
 # Upstash Redis — ОБЯЗАТЕЛЕН: в нём хранятся все данные бота.
 # Vercel -> Storage -> Upstash Redis
 # Vercel может назвать переменные по-разному (UPSTASH_REDIS_REST_* или KV_REST_API_*) — поддерживаем оба варианта
@@ -49,7 +48,6 @@ UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("KV
 PIARFLOW_API_URL = "https://piarflow.com/v1"
 TRAFSLY_API_URL = "https://api.trafsly.com"
 TGRASS_API_URL = "https://tgrass.space"
-BOTOHUB_API_URL = "https://botohub.me"
 TRAFFY_API_URL = "https://api.traffy.ai/publisher"
 FLYER_API_URL = "https://api.flyerhubs.com"
 FLOWLY_API_URL = "https://flowly.guru/api/v1"
@@ -66,7 +64,6 @@ for _name, _val in (
     ("TGRASS_API_KEY", TGRASS_API_KEY),
     ("PIARFLOW_API_KEY", PIARFLOW_API_KEY),
     ("TRAFSLY_API_KEY", TRAFSLY_API_KEY),
-    ("BOTOHUB_API_KEY", BOTOHUB_API_KEY),
     ("TRAFFY_API_KEY", TRAFFY_API_KEY),
     ("FLYER_API_KEY", FLYER_API_KEY),
     ("FLOWLY_API_KEY", FLOWLY_API_KEY),
@@ -636,9 +633,9 @@ async def fetch_trafsly(session, user_id, chat_id, user_data, limit):
     ][:limit]
  
  
-# ================= ДОПОЛНИТЕЛЬНЫЕ СПОНСОРЫ: BotoHub, Traffy, Flyer, Flowly =================
+# ================= ДОПОЛНИТЕЛЬНЫЕ СПОНСОРЫ: Traffy, Flyer, Flowly =================
 # Порядок = приоритет при наборе TARGET_COUNT спонсоров
-SERVICES = ("tgrass", "piarflow", "trafsly", "botohub", "traffy", "flyer", "flowly")
+SERVICES = ("tgrass", "piarflow", "trafsly", "traffy", "flyer", "flowly")
  
  
 def links_of(data: dict) -> list[str]:
@@ -669,10 +666,6 @@ def pick_sponsors(results) -> dict[str, list]:
     return collected
  
  
-def botohub_headers():
-    return {"Auth": BOTOHUB_API_KEY, "Content-Type": "application/json"}
- 
- 
 def traffy_headers():
     return {"x-publisher-api-key": TRAFFY_API_KEY, "Content-Type": "application/json"}
  
@@ -683,18 +676,6 @@ def flyer_headers():
  
 def flowly_headers():
     return {"Auth": FLOWLY_API_KEY, "Content-Type": "application/json"}
- 
- 
-async def fetch_botohub(session, user_id, limit):
-    if not key_filled(BOTOHUB_API_KEY):
-        return []
-    _, data, _ = await api_post(session, "botohub", f"{BOTOHUB_API_URL}/get-tasks", {"chat_id": user_id}, botohub_headers())
-    if not isinstance(data, dict):
-        return []
-    if data.get("completed") or data.get("skip"):
-        return []
-    tasks = data.get("tasks") or []
-    return [{"link": t} for t in tasks if isinstance(t, str) and t][:limit]
  
  
 async def fetch_traffy(session, user_id, user_data, limit):
@@ -803,17 +784,6 @@ async def check_trafsly(session, user, items):
     return [s for s, done in results if not done]
  
  
-async def check_botohub(session, user, items):
-    _, res, _ = await api_post(session, "botohub-check", f"{BOTOHUB_API_URL}/get-tasks", {"chat_id": user.id}, botohub_headers())
-    if not isinstance(res, dict):
-        return items
-    if res.get("completed") or res.get("skip"):
-        return []
-    tasks = [t for t in (res.get("tasks") or []) if isinstance(t, str) and t]
-    # BotoHub сам знает, что ещё не выполнено — не больше, чем мы показывали
-    return [{"link": t} for t in tasks][:len(items)]
- 
- 
 async def check_traffy(session, user, items):
     _, res, _ = await api_post(
         session, "traffy-check", f"{TRAFFY_API_URL}/tasks/check",
@@ -854,7 +824,6 @@ CHECKERS = {
     "tgrass": check_tgrass,
     "piarflow": check_piarflow,
     "trafsly": check_trafsly,
-    "botohub": check_botohub,
     "traffy": check_traffy,
     "flyer": check_flyer,
     "flowly": check_flowly,
@@ -927,7 +896,6 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
         f"TGRASS_API_KEY: {key_status(TGRASS_API_KEY)}",
         f"PIARFLOW_API_KEY: {key_status(PIARFLOW_API_KEY)}",
         f"TRAFSLY_API_KEY: {key_status(TRAFSLY_API_KEY)}",
-        f"BOTOHUB_API_KEY: {key_status(BOTOHUB_API_KEY)}",
         f"TRAFFY_API_KEY: {key_status(TRAFFY_API_KEY)}",
         f"FLYER_API_KEY: {key_status(FLYER_API_KEY)}",
         f"FLOWLY_API_KEY: {key_status(FLOWLY_API_KEY)}",
@@ -971,12 +939,6 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
             trafsly_headers(),
         )
         lines.append(f"TRAFSLY → HTTP {st}\n{body[:500]}\n")
- 
-        st, _, body = await api_post(
-            session, "botohub", f"{BOTOHUB_API_URL}/get-tasks",
-            {"chat_id": user_id}, botohub_headers(),
-        )
-        lines.append(f"BOTOHUB → HTTP {st}\n{body[:500]}\n")
  
         traffy_payload = {"telegram_id": user_id, "limit": 3}
         if user.language_code:
@@ -1370,7 +1332,6 @@ async def show_sponsors(message: Message, user=None):
                 fetch_tgrass(session, user_id, user_data, TARGET_COUNT),
                 fetch_piarflow(session, user_id, chat_id, TARGET_COUNT),
                 fetch_trafsly(session, user_id, chat_id, user_data, TARGET_COUNT),
-                fetch_botohub(session, user_id, TARGET_COUNT),
                 fetch_traffy(session, user_id, user_data, TARGET_COUNT),
                 fetch_flyer(session, user_id, user_data, TARGET_COUNT),
                 fetch_flowly(session, user_id, user_data, TARGET_COUNT),
@@ -2121,4 +2082,6 @@ def webhook():
 @app.route("/", methods=["GET"])
 def index():
     return "Bot is running on Vercel!", 200
+ 
+ 
  
