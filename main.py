@@ -49,21 +49,21 @@ FLOWLY_API_KEY = os.environ.get("FLOWLY_API_KEY", "9f0c8ea7e9a664b4a6326ce95f62b
 UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("KV_REST_API_URL")
 UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("KV_REST_API_TOKEN")
 # ======================================================================
-
+ 
 PIARFLOW_API_URL = "https://piarflow.com/v1"
 TRAFSLY_API_URL = "https://api.trafsly.com"
 TGRASS_API_URL = "https://tgrass.space"
 TRAFFY_API_URL = "https://api.traffy.ai/publisher"
 FLYER_API_URL = "https://api.flyerhubs.com"
 FLOWLY_API_URL = "https://flowly.guru/api/v1"
-
+ 
 PLACEHOLDER_MARK = "ВСТАВЬТЕ_КЛЮЧ"
-
-
+ 
+ 
 def key_filled(value: Optional[str]) -> bool:
     return bool(value) and PLACEHOLDER_MARK not in value
-
-
+ 
+ 
 for _name, _val in (
     ("BOT_TOKEN", BOT_TOKEN),
     ("TGRASS_API_KEY", TGRASS_API_KEY),
@@ -77,13 +77,13 @@ for _name, _val in (
 ):
     if not key_filled(_val):
         print(f"⚠️ НЕ ЗАПОЛНЕНО: {_name}")
-
+ 
 PHOTO_URL = "https://i.postimg.cc/XvPS1pB2/5883351235946024467.jpg"
 REFERRAL_PHOTO_URL = "https://i.postimg.cc/TYbwVvFM/6219881422739149359.jpg"
 PROFILE_PHOTO_URL = "https://i.postimg.cc/bvcFZkbf/6219881422739149361.jpg"
 TOP_PHOTO_URL = "https://i.postimg.cc/tJfCWpFM/6219881422739149363.jpg"
 WITHDRAW_PHOTO_URL = "https://i.postimg.cc/RVdQKYYf/6219881422739149362.jpg"
-
+ 
 TARGET_COUNT = 10
 INCOME_PER_SPONSOR = 1.0          # доход (руб) за одну подписку на спонсора
 DEFAULT_REFERRAL_REWARD = 4.5     # награда за реферала по умолчанию
@@ -1518,24 +1518,11 @@ def build_sponsor_markup(all_links: list[str]) -> InlineKeyboardMarkup:
  
  
 async def reward_referrer_if_needed(bot: Bot, user_id: int, had_sponsors: bool = True) -> None:
-    """Начисляет награду пригласившему, только если реферал получил 6+ спонсоров.
-    При 5 и менее спонсорах оба пользователя получают уведомления, выплаты нет."""
-    count = to_int(await redis_cmd("GETDEL", f"completed_sponsor_count:{user_id}"))
-    if count <= 0:
-        count = to_int(await redis_cmd("GETDEL", f"sp_total:{user_id}"))
- 
+    """Сообщает пригласившему о результате.
+    had_sponsors=True  -> реферал подписался на спонсоров: награда + сообщение «подписался»
+    had_sponsors=False -> спонсоров не было: награды нет + сообщение «не подписался»"""
+    # GETDEL: забираем и удаляем за одну операцию — награда выдаётся только один раз
     raw = await redis_cmd("GETDEL", f"pending_ref:{user_id}")
-    if had_sponsors and count < 6:
-        referral_notice = (
-            "<b>🚫 Спонсоры заподозрили, что у вас ненастоящий аккаунт (твинк, или бот). "
-            "Использование бота запрещено, выплата вашему рефералу также не начислена.</b>\n\n"
-            "<b>Ботом можно пользоваться — это на случай, если наша система безопасности ошиблась.</b>"
-        )
-        try:
-            await bot.send_message(chat_id=user_id, text=referral_notice, parse_mode="HTML")
-        except Exception as e:
-            print(f"low sponsor count notice error (user {user_id}): {e!r}")
- 
     if raw is None:
         return
     try:
@@ -1547,34 +1534,20 @@ async def reward_referrer_if_needed(bot: Bot, user_id: int, had_sponsors: bool =
     me = await get_user(user_id)
     ref_username = me["username"] if me and me["username"] else f"id{user_id}"
  
+    # ----- спонсоров не было -> награды нет -----
     if not had_sponsors:
         no_sponsors_msg = (
-            f"реферал: {html.escape(ref_username)}\n"
-            f"не подписался на спонсоров, ваш доход 0.00 ⭐\n"
+            f"реферал: {ref_username}\n"
+            f"не подписался на спонсоров ваш доход 0.00 ⭐\n"
             f"доход: {ref['balance']:.2f} ⭐"
         )
         try:
-            await bot.send_message(chat_id=ref_id, text=no_sponsors_msg, parse_mode="HTML")
+            await bot.send_message(chat_id=ref_id, text=no_sponsors_msg)
         except Exception:
             pass
         return
  
-    if count < 6:
-        ref_notice = (
-            "<b>🚫 Спонсоры заподозрили, что у реферала ненастоящий аккаунт (твинк, или бот). "
-            "Выплата не начислена.</b>"
-        )
-        try:
-            await bot.send_message(
-                chat_id=ref_id,
-                text=f"<b>реферал: @{html.escape(ref_username.lstrip('@'))}</b>\n\n{ref_notice}\n\n"
-                     f"<b>ваш доход: {ref['balance']:.1f} ⭐</b>",
-                parse_mode="HTML",
-            )
-        except Exception as e:
-            print(f"low sponsor count notice error (referrer {ref_id}): {e!r}")
-        return
- 
+    # ----- реферал подписался на спонсоров -> награда -----
     reward = await get_referral_reward()
     await add_referral_to_top(ref_id, ref["name"] or f"id{ref_id}")
     await redis_cmd("SADD", f"refs:{ref_id}", user_id)
@@ -1585,12 +1558,12 @@ async def reward_referrer_if_needed(bot: Bot, user_id: int, had_sponsors: bool =
         total_bal = ref["balance"] + reward
  
     success_ref_msg = (
-        f"реферал: {html.escape(ref_username)}\n"
-        f"подписался на спонсоров ({count} шт.), ваш доход {reward} ⭐\n"
+        f"реферал: {ref_username}\n"
+        f"подписался на спонсоров ваш доход {reward} ⭐\n"
         f"доход: {total_bal:.1f} ⭐"
     )
     try:
-        await bot.send_message(chat_id=ref_id, text=success_ref_msg, parse_mode="HTML")
+        await bot.send_message(chat_id=ref_id, text=success_ref_msg)
     except Exception:
         pass
  
@@ -1643,7 +1616,6 @@ async def show_sponsors(message: Message, user=None):
         # Спонсоров сейчас нет. Если раньше они были показаны (число хранится в Redis) —
         # значит, пользователь на них уже подписался.
         done_count = await pop_sponsor_total(user_id)
-        await redis_cmd("SET", f"completed_sponsor_count:{user_id}", done_count, "EX", 2592000)
         await add_income(user_id, done_count)
         await record_sponsors(user_id, done_count)
         await mark_passed(user_id)
@@ -2045,7 +2017,7 @@ def penalty_user_text(balance: float) -> str:
     return (
         "<b>⚠️ Вы отписались от канала\n\n"
         f"Отписка зафиксирована раньше, чем через {days_text(WATCH_DAYS)} после выполнения задания.\n\n"
-        f"💸 Штраф: -{UNSUBSCRIBE_PENALTY:g} ⭐\n"
+        f"💸 Штраф: -{UNSUBSCRIBE_PENALTY:g}⭐\n"
         f"💳 Баланс: {fmt_stars(balance)}⭐\n\n"
         f"Сохраняйте подписки минимум {days_text(WATCH_DAYS)} — таковы условия начисления звёзд.</b>"
     )
@@ -2053,11 +2025,11 @@ def penalty_user_text(balance: float) -> str:
  
 def penalty_referrer_text(username: str, reward: float, balance: float) -> str:
     return (
-        f"<b>реферал: {html.escape(username)} отписался раньше, чем через {days_text(WATCH_DAYS)}\n\n"
+        f"<b>реферал: {html.escape(username)} отписался раньше, чем {days_text(WATCH_DAYS)}\n\n"
         f"💸 Штраф: -{reward:g} ⭐\n"
         f"доход: {fmt_stars(balance)} ⭐\n\n"
-        f"Рефералы должны сохранять подписки минимум {days_text(WATCH_DAYS)} — "
-        "таковы условия начисления звёзд.</b>"
+        f"Рефералы должны сохранять подписки минимум {days_text(WATCH_DAYS)} "
+        "таковы условия начисления звёзд</b>"
     )
  
  
@@ -2746,7 +2718,6 @@ async def check_all_tasks_handler(callback: CallbackQuery) -> None:
     if not all_links:
         await del_active(user_id)
         done_count = await pop_sponsor_total(user_id, tasks_data.get("total_count", 0))
-        await redis_cmd("SET", f"completed_sponsor_count:{user_id}", done_count, "EX", 2592000)
         await add_income(user_id, done_count)
         await record_sponsors(user_id, done_count)
         await start_watch(user_id, tasks_data.get("all") or {})
@@ -2765,7 +2736,6 @@ async def check_all_tasks_handler(callback: CallbackQuery) -> None:
  
 # ================= FLASK WEBHOOK (ДЛЯ VERCEL) =================
 app = Flask(__name__)
-application = app  # дополнительный экспорт для Vercel
 dp.include_router(router)
  
  
