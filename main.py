@@ -6,6 +6,7 @@ import os
 import re
 import time
 from contextvars import ContextVar
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
  
 import aiohttp
@@ -20,7 +21,10 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     Update,
 )
  
@@ -35,7 +39,7 @@ ADMIN_ID = 619112100                      # ID администратора
 TGRASS_API_KEY = os.environ.get("TGRASS_API_KEY", "6d6e9e9701e7440a81fe099d360710d5")
 PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv")
 TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "at_99ddd0618296db80b905c92ff9adaa8c")
-TRAFFY_API_KEY = os.environ.get("TRAFFY_API_KEY", "pk_live_NR4I3mmnaSXRJLor5j6O1XQHIHm5ZoFz")
+TRAFFY_API_KEY = os.environ.get("TRAFFY_API_KEY", "pk_live_38u8oOUn6p7OLmAnmKGrpsTsvwUfneBu")
 FLYER_API_KEY = os.environ.get("FLYER_API_KEY", "FL-XCelim-WHmkUj-vBuGgN-bbMxPy")
 FLOWLY_API_KEY = os.environ.get("FLOWLY_API_KEY", "9f0c8ea7e9a664b4a6326ce95f62b222")
  
@@ -121,6 +125,34 @@ async def redis_cmd(*args):
     finally:
         if own:
             await session.close()
+ 
+ 
+async def redis_pipeline(commands: list) -> list:
+    """Несколько команд Redis одним запросом (Upstash /pipeline). При сбое — по одной."""
+    if not commands:
+        return []
+    if not redis_enabled():
+        return [None] * len(commands)
+    payload = [[str(a) for a in cmd] for cmd in commands]
+    session = _redis_session.get()
+    own = session is None or session.closed
+    if own:
+        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))
+    try:
+        async with session.post(
+            UPSTASH_URL.rstrip("/") + "/pipeline",
+            json=payload,
+            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
+        ) as resp:
+            data = await resp.json(content_type=None)
+        if isinstance(data, list) and len(data) == len(commands):
+            return [d.get("result") if isinstance(d, dict) else None for d in data]
+    except Exception as e:
+        print(f"redis pipeline exception: {e!r}")
+    finally:
+        if own:
+            await session.close()
+    return list(await asyncio.gather(*(redis_cmd(*cmd) for cmd in commands)))
  
  
 async def redis_get_json(key: str, default=None):
@@ -1020,7 +1052,198 @@ async def resetme_handler(message: Message, state: FSMContext) -> None:
     await redis_cmd("DEL", f"sp_total:{uid}")
     await redis_cmd("DEL", f"sp_active:{uid}")
     await redis_cmd("DEL", f"pending_ref:{uid}")
-    await message.answer("✅ Ваш аккаунт сброшен для теста. Нажмите /start — доход снова будет засчитан.")
+    await redis_cmd("DEL", f"verify:{uid}")
+    await redis_cmd("DEL", f"verify_pending:{uid}")
+    await message.answer(
+        "✅ Ваш аккаунт сброшен для теста. Нажмите /start — снова пройдёте спонсоров и проверку номера."
+    )
+ 
+ 
+# ================= ПРОВЕРКА НОМЕРА ТЕЛЕФОНА (только СНГ) =================
+# Коды стран, которым разрешён доступ. Чтобы добавить страну, допишите её код
+# (например "995" — Грузия).
+CIS_PHONE_PREFIXES = ("7", "380", "375", "998", "996", "992", "993", "994", "374", "373")
+#                      РФ/КЗ  UA    BY    UZ    KG    TJ    TM    AZ    AM    MD
+ 
+VERIFY_TEXT = (
+    "Пройдите проверку на бота 👇🏻\n\n"
+    "Чтобы избежать массовой накрутки со стороны нечестных пользователей, "
+    "мы вынуждены установить данную проверку. 🤝\n\n"
+    "Спасибо за понимание! 🫂"
+)
+BAN_TEXT = (
+    "🚫 Спонсоры заподозрили, что у вас ненастоящий аккаунт (твинк, или бот). "
+    "Использование бота запрещено, выплата вашему рефералу также не начислена."
+)
+BAN_TEXT_HTML = f"<b>{BAN_TEXT}</b>"
+REF_BAN_QUOTE = (
+    "🚫 Спонсоры заподозрили, что у реферала ненастоящий аккаунт (твинк, или бот). "
+    "выплаты не начислена."
+)
+ 
+ 
+def is_cis_phone(phone) -> bool:
+    digits = re.sub(r"\D", "", str(phone or ""))
+    return any(digits.startswith(p) for p in CIS_PHONE_PREFIXES)
+ 
+ 
+async def get_verify_status(uid: int) -> Optional[str]:
+    """None — не проходил проверку, 'ok' — прошёл, 'banned' — заблокирован."""
+    return await redis_cmd("GET", f"verify:{uid}")
+ 
+ 
+async def is_legacy_user(uid: int) -> bool:
+    """Был в боте до включения проверки номера — проверку не проходит."""
+    start = await redis_cmd("GET", "cfg:verify_start")
+    if start is None:
+        # первый запуск версии с проверкой: все, кто зарегистрирован раньше, освобождены
+        await redis_cmd("SET", "cfg:verify_start", str(time.time()), "NX")
+        start = await redis_cmd("GET", "cfg:verify_start")
+    u = await get_user(uid)
+    return bool(u) and u["join_ts"] < to_float(start, 0.0)
+ 
+ 
+async def ask_phone(target) -> None:
+    """Просит отправить номер кнопкой. target — Message или CallbackQuery."""
+    is_callback = isinstance(target, CallbackQuery)
+    message = target.message if is_callback else target
+    markup = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Отправить номер телефона", request_contact=True)]],
+        resize_keyboard=True,
+    )
+    try:
+        await message.answer(VERIFY_TEXT, reply_markup=markup)
+    except Exception as e:
+        print(f"ask_phone error: {e!r}")
+        return
+    if is_callback:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+ 
+ 
+async def after_sponsors(bot: Bot, target, user, had_sponsors: bool) -> None:
+    """Этап спонсоров пройден. Если номер ещё не подтверждён — просим его,
+    иначе сразу в меню. Награда рефералу выдаётся только после проверки номера."""
+    uid = user.id
+    if await get_verify_status(uid) == "ok":
+        await reward_referrer_if_needed(bot, uid, had_sponsors)
+        await send_main_menu(target, user)
+        return
+    # NX: при повторном /start сохраняем исходное значение «были ли спонсоры»
+    await redis_cmd("SET", f"verify_pending:{uid}", "1" if had_sponsors else "0", "NX", "EX", 2592000)
+    await ask_phone(target)
+ 
+ 
+async def notify_referrer_banned(bot: Bot, user_id: int) -> None:
+    """Реферал забанен: награды нет, реферал не засчитывается."""
+    raw = await redis_cmd("GETDEL", f"pending_ref:{user_id}")
+    if raw is None:
+        return
+    try:
+        ref_id = int(raw)
+    except (TypeError, ValueError):
+        return
+    me = await get_user(user_id)
+    username = html.escape(me["username"] if me and me["username"] else f"id{user_id}")
+    text = (
+        f"<b>реферал: {username}</b>\n\n"
+        f"<blockquote>{REF_BAN_QUOTE}</blockquote>\n\n"
+        f"<b>ваш доход 0.00 ⭐</b>"
+    )
+    try:
+        await bot.send_message(chat_id=ref_id, text=text, parse_mode="HTML")
+    except Exception:
+        pass
+ 
+ 
+async def ban_user(bot: Bot, message: Message, user) -> None:
+    uid = user.id
+    await redis_cmd("SET", f"verify:{uid}", "banned")
+    await redis_cmd("DEL", f"verify_pending:{uid}")
+    try:
+        await message.answer(BAN_TEXT_HTML, parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
+    except Exception as e:
+        print(f"ban message error: {e!r}")
+    await notify_referrer_banned(bot, uid)
+ 
+ 
+async def send_ban_text(event) -> None:
+    try:
+        if isinstance(event, CallbackQuery):
+            await event.answer()
+            target = event.message
+        else:
+            target = event
+        await target.answer(BAN_TEXT_HTML, parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
+    except Exception as e:
+        print(f"send_ban_text error: {e!r}")
+ 
+ 
+class AccessMiddleware(BaseMiddleware):
+    """Забаненным — только текст блокировки. Тем, кто не прошёл проверку номера, доступен
+    только /start, этап спонсоров и отправка контакта; остальное игнорируется."""
+ 
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user is None or user.id == ADMIN_ID:
+            return await handler(event, data)
+ 
+        status = await get_verify_status(user.id)
+        if status == "ok":
+            return await handler(event, data)
+        if status == "banned":
+            await send_ban_text(event)
+            return
+ 
+        # проверку ещё не прошёл: «старожилы» освобождаются автоматически
+        if await is_legacy_user(user.id):
+            await redis_cmd("SET", f"verify:{user.id}", "ok")
+            return await handler(event, data)
+ 
+        if isinstance(event, Message):
+            if event.contact or (event.text or "").startswith("/start"):
+                return await handler(event, data)
+            return  # обычные сообщения (в том числе номер текстом) — ничего не происходит
+        if isinstance(event, CallbackQuery):
+            if event.data == "check_all_tasks":
+                return await handler(event, data)
+            try:
+                await event.answer("Сначала пройдите проверку — нажмите /start", show_alert=True)
+            except Exception:
+                pass
+            return
+        return await handler(event, data)
+ 
+ 
+router.message.outer_middleware(AccessMiddleware())
+router.callback_query.outer_middleware(AccessMiddleware())
+ 
+ 
+@router.message(F.contact)
+async def contact_handler(message: Message, state: FSMContext) -> None:
+    user = message.from_user
+    uid = user.id
+    contact = message.contact
+ 
+    # Контакт должен быть именно своим (отправлен кнопкой), иначе — как обычное сообщение
+    if contact.user_id != uid:
+        return
+    pending = await redis_cmd("GET", f"verify_pending:{uid}")
+    if pending is None:
+        return  # этап спонсоров ещё не пройден
+    if await get_verify_status(uid) == "ok":
+        return
+ 
+    if is_cis_phone(contact.phone_number):
+        await redis_cmd("SET", f"verify:{uid}", "ok")
+        await redis_cmd("DEL", f"verify_pending:{uid}")
+        await message.answer("✅ Проверка пройдена!", reply_markup=ReplyKeyboardRemove())
+        await reward_referrer_if_needed(message.bot, uid, pending == "1")
+        await send_main_menu(message, user)
+    else:
+        await ban_user(message.bot, message, user)
  
  
 # ================= ВВОД ТЕКСТА (по состояниям) =================
@@ -1324,6 +1547,7 @@ async def reward_referrer_if_needed(bot: Bot, user_id: int, had_sponsors: bool =
     # ----- реферал подписался на спонсоров -> награда -----
     reward = await get_referral_reward()
     await add_referral_to_top(ref_id, ref["name"] or f"id{ref_id}")
+    await redis_cmd("SADD", f"refs:{ref_id}", user_id)
     await redis_cmd("HINCRBY", user_key(ref_id), "referrals", 1)
     total_bal = await add_balance(ref_id, reward)
     if total_bal is None:
@@ -1385,9 +1609,9 @@ async def show_sponsors(message: Message, user=None):
         # значит, пользователь на них уже подписался.
         done_count = await pop_sponsor_total(user_id)
         await add_income(user_id, done_count)
+        await record_sponsors(user_id, done_count)
         await mark_passed(user_id)
-        await reward_referrer_if_needed(message.bot, user_id, had_sponsors=done_count > 0)
-        await send_main_menu(message, user)
+        await after_sponsors(message.bot, message, user, had_sponsors=done_count > 0)
         return
  
     markup = build_sponsor_markup(all_links)
@@ -1705,16 +1929,25 @@ async def confirm_withdraw_handler(callback: CallbackQuery, state: FSMContext) -
  
     await replace_message(callback, f"Заявка на вывод {amount} ⭐ успешно выполнена", back_markup("back_to_main"))
  
+    user = callback.from_user
+    req_id = await create_withdraw_request(user, username, amount)
+    refs = await get_referrals_info(user_id)
+    subs = sum(r["sponsors"] or 0 for r in refs)
+    user_tag = f"@{user.username}" if user.username else f"id{user_id}"
+    title = f"📥 Заявка на вывод #{req_id}" if req_id else "📥 Заявка на вывод"
+    suffix = f"_{req_id}" if req_id else ""
     admin_text = (
-        "📥 Заявка на вывод\n"
+        f"{title}\n"
+        f"Пользователь: {user.first_name or '—'} ({user_tag})\n"
         f"Получатель: {username}\n"
-        f"Количество: {amount}⭐"
+        f"Количество: {amount}⭐\n"
+        f"Приглашено: {len(refs)} · подписок на спонсоров: {subs}"
     )
     admin_markup = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="Выплатил ✅", callback_data="admin_pay_yes"),
-                InlineKeyboardButton(text="Не одобрена ❌", callback_data="admin_pay_no"),
+                InlineKeyboardButton(text="Выплатил ✅", callback_data=f"admin_pay_yes{suffix}"),
+                InlineKeyboardButton(text="Не одобрена ❌", callback_data=f"admin_pay_no{suffix}"),
             ]
         ]
     )
@@ -1724,17 +1957,214 @@ async def confirm_withdraw_handler(callback: CallbackQuery, state: FSMContext) -
         pass
  
  
-@router.callback_query(F.data.in_({"admin_pay_yes", "admin_pay_no"}))
+@router.callback_query(F.data.startswith("admin_pay_"))
 async def admin_action_handler(callback: CallbackQuery) -> None:
     if callback.from_user.id != ADMIN_ID:
         await safe_answer(callback, "Доступ запрещен", show_alert=True)
         return
     await safe_answer(callback)
-    action_text = "✅ Выплата отмечена как выполненная." if callback.data == "admin_pay_yes" else "❌ Заявка отклонена."
+    parts = callback.data.split("_")  # admin, pay, yes|no[, id]
+    is_yes = parts[2] == "yes"
+    if len(parts) > 3:
+        await set_wd_status(to_int(parts[3]), "paid" if is_yes else "rejected")
+    action_text = "✅ Выплата отмечена как выполненная." if is_yes else "❌ Заявка отклонена."
     try:
         await callback.message.edit_text(f"{callback.message.text}\n\nСтатус: {action_text}")
     except Exception:
         pass
+ 
+ 
+# ================= ЗАЯВКИ НА ВЫВОД (админ-панель) =================
+MSK = timezone(timedelta(hours=3))
+WD_PAGE_SIZE = 5
+WD_STATUS = {"new": "⏳ новая", "paid": "✅ выплачена", "rejected": "❌ не одобрена"}
+ 
+ 
+def fmt_ts(ts) -> str:
+    try:
+        return datetime.fromtimestamp(float(ts), MSK).strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return "—"
+ 
+ 
+async def record_sponsors(uid: int, count: int) -> None:
+    """Запоминает, на скольких спонсоров подписался пользователь (только первый раз)."""
+    await redis_cmd("HSETNX", user_key(uid), "sponsors", count)
+ 
+ 
+async def get_referrals_info(uid: int) -> list[dict]:
+    """Кого пригласил пользователь и сколько спонсоров выполнил каждый реферал."""
+    ids = await redis_cmd("SMEMBERS", f"refs:{uid}") or []
+    if not ids:
+        return []
+    rows = await redis_pipeline([["HMGET", user_key(to_int(i)), "username", "sponsors"] for i in ids])
+    out = []
+    for rid, row in zip(ids, rows):
+        username, sponsors = None, None
+        if isinstance(row, list) and len(row) == 2:
+            username, sponsors = row
+        out.append({
+            "id": to_int(rid),
+            "username": username or f"id{rid}",
+            "sponsors": to_int(sponsors) if sponsors is not None else None,
+        })
+    out.sort(key=lambda r: r["id"])
+    return out
+ 
+ 
+async def create_withdraw_request(user, recipient: str, amount: int) -> int:
+    """Сохраняет заявку на вывод. Возвращает её номер (0 — если Redis недоступен)."""
+    req_id = to_int(await redis_cmd("INCR", "wd_seq"))
+    if req_id <= 0:
+        return 0
+    now = time.time()
+    req = {
+        "id": req_id,
+        "user_id": user.id,
+        "name": user.first_name or "",
+        "username": f"@{user.username}" if user.username else f"id{user.id}",
+        "recipient": recipient,
+        "amount": amount,
+        "ts": now,
+        "status": "new",
+    }
+    await redis_set_json(f"wdreq:{req_id}", req)
+    await redis_cmd("ZADD", "wd_list", now, req_id)
+    return req_id
+ 
+ 
+async def get_wd_request(req_id: int) -> Optional[dict]:
+    req = await redis_get_json(f"wdreq:{req_id}")
+    return req if isinstance(req, dict) else None
+ 
+ 
+async def set_wd_status(req_id: int, status: str) -> Optional[dict]:
+    req = await get_wd_request(req_id)
+    if not req:
+        return None
+    req["status"] = status
+    await redis_set_json(f"wdreq:{req_id}", req)
+    return req
+ 
+ 
+async def render_wd_details(req: dict, page: int):
+    refs = await get_referrals_info(req["user_id"])
+    total_sponsors = sum(r["sponsors"] or 0 for r in refs)
+    lines = [
+        f"💸 Заявка #{req['id']}",
+        f"Статус: {WD_STATUS.get(req.get('status'), req.get('status'))}",
+        f"Пользователь: {req.get('name') or '—'} ({req.get('username')}, id {req['user_id']})",
+        f"Получатель: {req.get('recipient')}",
+        f"Сумма: {req.get('amount')} ⭐",
+        f"Дата: {fmt_ts(req.get('ts'))} (МСК)",
+        "",
+        f"👥 Приглашено: {len(refs)} · подписок на спонсоров: {total_sponsors}",
+    ]
+    if refs:
+        lines.append("")
+        for i, r in enumerate(refs[:60], 1):
+            sp = str(r["sponsors"]) if r["sponsors"] is not None else "нет данных"
+            lines.append(f"{i}. {r['username']} — спонсоров: {sp}")
+        if len(refs) > 60:
+            lines.append(f"… и ещё {len(refs) - 60}")
+    else:
+        lines.append("Рефералов пока нет.")
+ 
+    rows = []
+    if req.get("status") == "new":
+        rows.append([
+            InlineKeyboardButton(text="Выплатил ✅", callback_data=f"admin_wdpay_yes_{req['id']}_{page}"),
+            InlineKeyboardButton(text="Не одобрена ❌", callback_data=f"admin_wdpay_no_{req['id']}_{page}"),
+        ])
+    rows.append([InlineKeyboardButton(text="⬅️ К списку", callback_data=f"admin_wdlist_{page}")])
+    return "\n".join(lines)[:4000], InlineKeyboardMarkup(inline_keyboard=rows)
+ 
+ 
+@router.callback_query(F.data.startswith("admin_wdlist_"))
+async def admin_wd_list(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await safe_answer(callback, "Доступ запрещен", show_alert=True)
+        return
+    await safe_answer(callback)
+ 
+    page = max(to_int(callback.data.split("_")[2]), 0)
+    total = to_int(await redis_cmd("ZCARD", "wd_list"))
+    pages = max(1, -(-total // WD_PAGE_SIZE))
+    page = min(page, pages - 1)
+ 
+    ids = await redis_cmd("ZREVRANGE", "wd_list", page * WD_PAGE_SIZE, (page + 1) * WD_PAGE_SIZE - 1) or []
+    raws = await redis_pipeline([["GET", f"wdreq:{i}"] for i in ids])
+    reqs = []
+    for raw in raws:
+        try:
+            req = json.loads(raw) if raw else None
+        except Exception:
+            req = None
+        if isinstance(req, dict):
+            reqs.append(req)
+    infos = await asyncio.gather(*(get_referrals_info(r["user_id"]) for r in reqs))
+ 
+    rows = []
+    if not reqs:
+        text = "💸 Заявок на вывод пока нет."
+    else:
+        lines = [f"💸 Заявки на вывод — всего {total} (стр. {page + 1}/{pages})", ""]
+        for req, refs in zip(reqs, infos):
+            subs = sum(r["sponsors"] or 0 for r in refs)
+            status = WD_STATUS.get(req.get("status"), req.get("status"))
+            lines += [
+                f"#{req['id']} · {req['username']} · {req['amount']} ⭐ · {status}",
+                f"получатель: {req['recipient']} · {fmt_ts(req.get('ts'))}",
+                f"приглашено: {len(refs)} · подписок на спонсоров: {subs}",
+                "",
+            ]
+            rows.append([InlineKeyboardButton(
+                text=f"#{req['id']} · {req['amount']}⭐ · подробнее",
+                callback_data=f"admin_wdview_{req['id']}_{page}",
+            )])
+        lines.append("Нажмите на заявку, чтобы увидеть всех рефералов и их подписки.")
+        text = "\n".join(lines)[:4000]
+ 
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"admin_wdlist_{page - 1}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"admin_wdlist_{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")])
+    await replace_message(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))
+ 
+ 
+@router.callback_query(F.data.startswith("admin_wdview_"))
+async def admin_wd_view(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await safe_answer(callback, "Доступ запрещен", show_alert=True)
+        return
+    parts = callback.data.split("_")  # admin, wdview, id, page
+    req = await get_wd_request(to_int(parts[2]))
+    if not req:
+        await safe_answer(callback, "Заявка не найдена", show_alert=True)
+        return
+    await safe_answer(callback)
+    text, markup = await render_wd_details(req, to_int(parts[3]))
+    await replace_message(callback, text, markup)
+ 
+ 
+@router.callback_query(F.data.startswith("admin_wdpay_"))
+async def admin_wd_pay(callback: CallbackQuery, state: FSMContext) -> None:
+    if callback.from_user.id != ADMIN_ID:
+        await safe_answer(callback, "Доступ запрещен", show_alert=True)
+        return
+    parts = callback.data.split("_")  # admin, wdpay, yes|no, id, page
+    status = "paid" if parts[2] == "yes" else "rejected"
+    req = await set_wd_status(to_int(parts[3]), status)
+    if not req:
+        await safe_answer(callback, "Заявка не найдена", show_alert=True)
+        return
+    await safe_answer(callback, "Отмечено")
+    text, markup = await render_wd_details(req, to_int(parts[4]))
+    await replace_message(callback, text, markup)
  
  
 # ================= ПРОМОКОД (пользователь) =================
@@ -1790,6 +2220,7 @@ async def admin_panel_handler(callback: CallbackQuery, state: FSMContext) -> Non
                 InlineKeyboardButton(text="🎁 Промокоды", callback_data="admin_promo_menu"),
                 InlineKeyboardButton(text="✨ Вознаграждение", callback_data="admin_reward_menu"),
             ],
+            [InlineKeyboardButton(text="💸 Выводы", callback_data="admin_wdlist_0")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
         ]
     )
@@ -2066,11 +2497,11 @@ async def check_all_tasks_handler(callback: CallbackQuery) -> None:
         await del_active(user_id)
         done_count = await pop_sponsor_total(user_id, tasks_data.get("total_count", 0))
         await add_income(user_id, done_count)
+        await record_sponsors(user_id, done_count)
         await mark_passed(user_id)
  
-        await reward_referrer_if_needed(callback.bot, user_id)
         await safe_answer(callback)
-        await send_main_menu(callback)  # удалит старое сообщение сам
+        await after_sponsors(callback.bot, callback, callback.from_user, had_sponsors=True)
     else:
         await set_active(user_id, tasks_data)
         try:
@@ -2115,4 +2546,3 @@ def webhook():
 @app.route("/", methods=["GET"])
 def index():
     return "Bot is running on Vercel!", 200
- 
