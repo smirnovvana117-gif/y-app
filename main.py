@@ -19,12 +19,10 @@ from aiogram.fsm.storage.base import BaseStorage, StorageKey, StateType
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
+    ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
     Message,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     Update,
 )
 
@@ -440,11 +438,13 @@ async def get_user_refs_and_rank(user_id: int) -> tuple[int, Optional[int]]:
     return to_int(score), (int(rank) + 1 if rank is not None else None)
 
 
-async def mark_passed(uid: int) -> None:
+async def mark_passed(uid: int) -> bool:
     """Пользователь прошёл спонсоров — учитываем один раз."""
     added = await redis_cmd("SADD", "passed_users", uid)
     if to_int(added) == 1:
         await redis_cmd("INCR", "stat:sponsors_completed")
+        return True
+    return False
 
 
 async def add_income(user_id: int, count: int) -> None:
@@ -1079,8 +1079,7 @@ async def woot_handler(message: Message, state: FSMContext) -> None:
         ["ZREM", "watch_list", uid],
     ]
     await redis_pipeline(cmds)
-    if await get_verify_status(uid) == "banned":
-        await redis_cmd("DEL", f"verify:{uid}")
+    await redis_cmd("DEL", f"verify:{uid}")
 
     await message.answer(
         "✅ Аккаунт полностью сброшен: баланс, рефералы, спонсоры, штрафы.\n\n"
@@ -1089,70 +1088,7 @@ async def woot_handler(message: Message, state: FSMContext) -> None:
     )
 
 
-# ================= ПРОВЕРКА НОМЕРА ТЕЛЕФОНА (только СНГ) =================
-# Коды стран, которым разрешён доступ. Чтобы добавить страну, допишите её код
-# (например "995" — Грузия).
-CIS_PHONE_PREFIXES = ("7", "380", "375", "998", "996", "992", "993", "994", "374", "373")
-#                      РФ/КЗ  UA    BY    UZ    KG    TJ    TM    AZ    AM    MD
-
-VERIFY_TEXT = (
-    "Пройдите проверку на бота 👇🏻\n\n"
-    "Чтобы избежать массовой накрутки со стороны нечестных пользователей, "
-    "мы вынуждены установить данную проверку. 🤝\n\n"
-    "Спасибо за понимание! 🫂"
-)
-BAN_TEXT = (
-    "🚫 Спонсоры заподозрили, что у вас ненастоящий аккаунт (твинк, или бот). "
-    "Использование бота запрещено, выплата вашему рефералу также не начислена."
-)
-BAN_TEXT_HTML = f"<b>{BAN_TEXT}</b>"
-REF_BAN_QUOTE = (
-    "🚫 Спонсоры заподозрили, что у реферала ненастоящий аккаунт (твинк, или бот). "
-    "выплаты не начислена."
-)
-
-
-def is_cis_phone(phone) -> bool:
-    digits = re.sub(r"\D", "", str(phone or ""))
-    return any(digits.startswith(p) for p in CIS_PHONE_PREFIXES)
-
-
-async def get_verify_status(uid: int) -> Optional[str]:
-    """None — не проходил проверку, 'ok' — прошёл, 'banned' — заблокирован."""
-    return await redis_cmd("GET", f"verify:{uid}")
-
-
-async def is_legacy_user(uid: int) -> bool:
-    """Был в боте до включения проверки номера — проверку не проходит."""
-    start = await redis_cmd("GET", "cfg:verify_start")
-    if start is None:
-        # первый запуск версии с проверкой: все, кто зарегистрирован раньше, освобождены
-        await redis_cmd("SET", "cfg:verify_start", str(time.time()), "NX")
-        start = await redis_cmd("GET", "cfg:verify_start")
-    u = await get_user(uid)
-    return bool(u) and u["join_ts"] < to_float(start, 0.0)
-
-
-async def ask_phone(target) -> None:
-    """Просит отправить номер кнопкой. target — Message или CallbackQuery."""
-    is_callback = isinstance(target, CallbackQuery)
-    message = target.message if is_callback else target
-    markup = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="📱 Отправить номер телефона", request_contact=True)]],
-        resize_keyboard=True,
-    )
-    try:
-        await message.answer(VERIFY_TEXT, reply_markup=markup)
-    except Exception as e:
-        print(f"ask_phone error: {e!r}")
-        return
-    if is_callback:
-        try:
-            await message.delete()
-        except Exception:
-            pass
-
-
+# ================= ЭТАП СПОНСОРОВ ЗАВЕРШЁН =================
 async def after_sponsors(bot: Bot, target, user, had_sponsors: bool) -> None:
     """Этап спонсоров пройден (проверки номера больше нет): награда рефералу и меню."""
     uid = user.id
@@ -1166,57 +1102,12 @@ async def after_sponsors(bot: Bot, target, user, had_sponsors: bool) -> None:
     await send_main_menu(target, user)
 
 
-async def notify_referrer_banned(bot: Bot, user_id: int) -> None:
-    """Реферал забанен: награды нет, реферал не засчитывается."""
-    raw = await redis_cmd("GETDEL", f"pending_ref:{user_id}")
-    if raw is None:
-        return
-    try:
-        ref_id = int(raw)
-    except (TypeError, ValueError):
-        return
-    me = await get_user(user_id)
-    username = html.escape(me["username"] if me and me["username"] else f"id{user_id}")
-    text = (
-        f"<b>реферал: {username}</b>\n\n"
-        f"<blockquote>{REF_BAN_QUOTE}</blockquote>\n\n"
-        f"<b>ваш доход 0.00 ⭐</b>"
-    )
-    try:
-        await bot.send_message(chat_id=ref_id, text=text, parse_mode="HTML")
-    except Exception:
-        pass
-
-
-async def ban_user(bot: Bot, message: Message, user) -> None:
-    uid = user.id
-    await redis_cmd("SET", f"verify:{uid}", "banned")
-    await redis_cmd("DEL", f"verify_pending:{uid}")
-    try:
-        await message.answer(BAN_TEXT_HTML, parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
-    except Exception as e:
-        print(f"ban message error: {e!r}")
-    await notify_referrer_banned(bot, uid)
-
-
-async def send_ban_text(event) -> None:
-    try:
-        if isinstance(event, CallbackQuery):
-            await event.answer()
-            target = event.message
-        else:
-            target = event
-        await target.answer(BAN_TEXT_HTML, parse_mode="HTML", reply_markup=ReplyKeyboardRemove())
-    except Exception as e:
-        print(f"send_ban_text error: {e!r}")
-
-
 class AccessMiddleware(BaseMiddleware):
     """Проверки номера больше нет: только перепроверка подписки (штрафы) при заходе в бота."""
 
     async def __call__(self, handler, event, data):
         user = getattr(event, "from_user", None)
-        if user is not None and user.id != ADMIN_ID:
+        if user is not None:
             await maybe_check_watch(event)
         return await handler(event, data)
 
@@ -1596,7 +1487,8 @@ async def show_sponsors(message: Message, user=None):
         done_count = await pop_sponsor_total(user_id)
         await add_income(user_id, done_count)
         await record_sponsors(user_id, done_count)
-        await mark_passed(user_id)
+        if await mark_passed(user_id):
+            await start_watch(user_id, {})
         await after_sponsors(message.bot, message, user, had_sponsors=done_count > 0)
         return
 
@@ -1964,7 +1856,7 @@ async def admin_action_handler(callback: CallbackQuery) -> None:
 UNSUBSCRIBE_PENALTY = 3.0     # штраф пользователю, ⭐
 REFERRER_PENALTY = 3.0        # штраф пригласившему, ⭐
 WATCH_DAYS = 3                # сколько дней нельзя отписываться
-RECHECK_INTERVAL = 3600       # как часто перепроверять одного пользователя при его заходах (сек)
+RECHECK_INTERVAL = 60         # как часто перепроверять одного пользователя при его заходах (сек)
 CRON_RECHECK = 6 * 3600       # как часто перепроверять по расписанию (сек)
 CRON_BATCH = 20               # сколько пользователей проверять за один вызов /cron
 
@@ -2063,8 +1955,8 @@ RETENTION = {"own": retention_own, "piarflow": retention_piarflow, "flowly": ret
 async def start_watch(uid: int, shown: dict) -> None:
     """Пользователь выполнил спонсоров — следим за подпиской WATCH_DAYS дней."""
     items = {n: list(shown.get(n) or []) for n in RETENTION if shown.get(n)}
-    if not items:
-        return
+    # наш канал под наблюдением всегда, даже если человек был подписан ещё до бота
+    items["own"] = [{"link": OWN_CHANNEL_LINK, "chat_id": OWN_CHANNEL_ID}]
     now = time.time()
     watch = {
         "started": now,
@@ -2160,6 +2052,21 @@ async def maybe_check_watch(event) -> None:
         await run_watch_check(event.bot, uid)
     except Exception as e:
         print(f"maybe_check_watch error: {e!r}")
+
+
+@router.chat_member(F.chat.id == OWN_CHANNEL_ID)
+async def own_channel_member_handler(event: ChatMemberUpdated) -> None:
+    """Человек вышел из нашего канала — штраф сразу, если он ещё в 3-дневном окне."""
+    if _status_str(event.new_chat_member) not in ("left", "kicked"):
+        return
+    uid = event.new_chat_member.user.id
+    watch = await redis_get_json(f"watch:{uid}")
+    if not isinstance(watch, dict) or time.time() >= to_float(watch.get("expires")):
+        return
+    if not (watch.get("items") or {}).get("own"):
+        return
+    bot = _current_bot.get() or event.bot
+    await apply_unsubscribe_penalty(bot, uid)
 
 
 async def process_cron() -> int:
@@ -2763,6 +2670,28 @@ def webhook():
 @app.route("/", methods=["GET"])
 def index():
     return "Bot is running on Vercel!", 200
+
+
+@app.route("/setwebhook", methods=["GET"])
+def set_webhook_route():
+    """Один раз открыть: https://ВАШ-ДОМЕН/setwebhook?key=<CRON_SECRET>
+    Включает получение событий выхода из канала (chat_member) для мгновенных штрафов."""
+    secret = os.environ.get("CRON_SECRET")
+    given = request.args.get("key", "")
+    if not secret or not hmac.compare_digest(given.encode(), secret.encode()):
+        return "Forbidden", 403
+
+    async def _go():
+        bot = Bot(token=BOT_TOKEN)
+        try:
+            return await bot.set_webhook(
+                url=f"https://{request.host}/",
+                allowed_updates=["message", "callback_query", "chat_member"],
+            )
+        finally:
+            await bot.session.close()
+
+    return f"webhook set: {asyncio.run(_go())}", 200
 
 
 @app.route("/cron", methods=["GET", "POST"])
