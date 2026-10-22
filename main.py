@@ -20,6 +20,7 @@ from aiogram.fsm.storage.base import BaseStorage, StorageKey, StateType
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
+    ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -41,9 +42,8 @@ TGRASS_API_KEY = os.environ.get("TGRASS_API_KEY", "6d6e9e9701e7440a81fe099d36071
 PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv")
 TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "at_99ddd0618296db80b905c92ff9adaa8c")
 TRAFFY_API_KEY = os.environ.get("TRAFFY_API_KEY", "pk_live_DJZaxY7dRIECCycKvEL5ALT0wW7UhEKb")
-FLYER_API_KEY = os.environ.get("FLYER_API_KEY", "FL-XCelim-WHmkUj-vBuGgN-bbMxPy")
 FLOWLY_API_KEY = os.environ.get("FLOWLY_API_KEY", "9f0c8ea7e9a664b4a6326ce95f62b222")
- 
+
 # Upstash Redis — ОБЯЗАТЕЛЕН: в нём хранятся все данные бота.
 # Vercel -> Storage -> Upstash Redis
 # Vercel может назвать переменные по-разному (UPSTASH_REDIS_REST_* или KV_REST_API_*) — поддерживаем оба варианта
@@ -55,7 +55,6 @@ PIARFLOW_API_URL = "https://piarflow.com/v1"
 TRAFSLY_API_URL = "https://api.trafsly.com"
 TGRASS_API_URL = "https://tgrass.space"
 TRAFFY_API_URL = "https://api.traffy.ai/publisher"
-FLYER_API_URL = "https://api.flyerhubs.com"
 FLOWLY_API_URL = "https://flowly.guru/api/v1"
  
 PLACEHOLDER_MARK = "ВСТАВЬТЕ_КЛЮЧ"
@@ -71,7 +70,6 @@ for _name, _val in (
     ("PIARFLOW_API_KEY", PIARFLOW_API_KEY),
     ("TRAFSLY_API_KEY", TRAFSLY_API_KEY),
     ("TRAFFY_API_KEY", TRAFFY_API_KEY),
-    ("FLYER_API_KEY", FLYER_API_KEY),
     ("FLOWLY_API_KEY", FLOWLY_API_KEY),
     ("UPSTASH_REDIS_REST_URL", UPSTASH_URL),
     ("UPSTASH_REDIS_REST_TOKEN", UPSTASH_TOKEN),
@@ -85,7 +83,13 @@ PROFILE_PHOTO_URL = "https://i.postimg.cc/bvcFZkbf/6219881422739149361.jpg"
 TOP_PHOTO_URL = "https://i.postimg.cc/tJfCWpFM/6219881422739149363.jpg"
 WITHDRAW_PHOTO_URL = "https://i.postimg.cc/RVdQKYYf/6219881422739149362.jpg"
  
-TARGET_COUNT = 10
+TARGET_COUNT = 5                 # спонсоров из сервисов
+MAX_SPONSORS = TARGET_COUNT + 1  # + ваш канал = 6
+ 
+# Ваш канал — всегда один из спонсоров. Бот должен быть АДМИНИСТРАТОРОМ канала
+# (иначе Telegram не даёт проверять подписки и сообщать об отписках).
+OWN_CHANNEL_ID = -1003994773865
+OWN_CHANNEL_LINK = "https://t.me/+y_i_ivGFpDMyZGE1"
 INCOME_PER_SPONSOR = 1.0          # доход (руб) за одну подписку на спонсора
 DEFAULT_REFERRAL_REWARD = 4.5     # награда за реферала по умолчанию
 FSM_TTL = 7 * 24 * 3600           # сколько хранить состояние диалога
@@ -457,11 +461,19 @@ async def get_income_sponsors() -> int:
     return to_int(await redis_cmd("GET", "income_sponsors"))
  
  
-async def pop_sponsor_total(user_id: int, fallback: int = 0) -> int:
-    """Достаёт из Redis исходное число показанных спонсоров и удаляет ключ."""
-    val = await redis_cmd("GET", f"sp_total:{user_id}")
-    await redis_cmd("DEL", f"sp_total:{user_id}")
-    return min(max(to_int(val), fallback), TARGET_COUNT)  # доход за одного пользователя — не больше 10
+async def pop_sponsor_counts(
+    user_id: int, fallback_total: int = 0, fallback_paid: int = 0, fallback_own: bool = False,
+) -> tuple[int, int, bool]:
+    """Достаёт из Redis и удаляет данные о показанных спонсорах:
+    (всего спонсоров, из них от сервисов — идут в доход, был ли ваш канал)."""
+    res = await redis_pipeline([
+        ["GET", f"sp_total:{user_id}"], ["GET", f"sp_paid:{user_id}"], ["GET", f"sp_own:{user_id}"],
+        ["DEL", f"sp_total:{user_id}"], ["DEL", f"sp_paid:{user_id}"], ["DEL", f"sp_own:{user_id}"],
+    ])
+    total = min(max(to_int(res[0]), fallback_total), MAX_SPONSORS)
+    paid = min(max(to_int(res[1]), fallback_paid), TARGET_COUNT)  # доход — только за спонсоров сервисов
+    own = res[2] == "1" or fallback_own
+    return total, paid, own
  
  
 # ================= АКТИВНЫЕ СПОНСОРЫ / ВЫВОД (Redis) =================
@@ -686,34 +698,38 @@ async def fetch_trafsly(session, user_id, chat_id, user_data, limit):
     ][:limit]
  
  
-# ================= ДОПОЛНИТЕЛЬНЫЕ СПОНСОРЫ: Traffy, Flyer, Flowly =================
-# Порядок = приоритет при наборе TARGET_COUNT спонсоров
-SERVICES = ("tgrass", "piarflow", "trafsly", "traffy", "flyer", "flowly")
+# ================= СПОНСОРЫ: ваш канал, Flowly, Tgrass, Traffy, PiarFlow, Trafsly =================
+# Порядок = приоритет: сначала ваш канал, затем сервисы
+# (flowly → tgrass → traffy → piarflow → trafsly)
+SERVICES = ("own", "flowly", "tgrass", "traffy", "piarflow", "trafsly")
  
  
 def links_of(data: dict) -> list[str]:
-    """Все ссылки спонсоров в порядке приоритета сервисов."""
+    """Все ссылки спонсоров в порядке приоритета."""
     return [item["link"] for name in SERVICES for item in (data.get(name) or [])]
  
  
 def limit_sponsors(data: dict, limit: int = TARGET_COUNT) -> dict:
-    """Жёстко обрезает общий список спонсоров до limit (по приоритету сервисов)."""
+    """Жёстко обрезает список: не больше `limit` спонсоров из сервисов + ваш канал (1)."""
     left = limit
     for name in SERVICES:
-        items = (data.get(name) or [])[:max(left, 0)]
+        items = data.get(name) or []
+        if name == "own":
+            data[name] = items[:1]
+            continue
+        items = items[:max(left, 0)]
         data[name] = items
         left -= len(items)
     return data
  
  
 def pick_sponsors(results) -> dict[str, list]:
-    """Из ответов всех сервисов набирает ровно TARGET_COUNT спонсоров (без повторов ссылок)."""
+    """Из ответов набирает до TARGET_COUNT спонсоров из сервисов (по приоритету, без повторов)
+    и добавляет ваш канал — он в счёт лимита не идёт."""
     collected: dict[str, list] = {name: [] for name in SERVICES}
     seen: set[str] = set()
     remaining = TARGET_COUNT
     for name, res in zip(SERVICES, results):
-        if remaining <= 0:
-            break
         if isinstance(res, Exception):
             print(f"[{name}] ошибка получения спонсоров: {res!r}")
             continue
@@ -721,20 +737,24 @@ def pick_sponsors(results) -> dict[str, list]:
             link = item.get("link")
             if not link or link in seen:
                 continue
+            if name != "own":
+                if remaining <= 0:
+                    break
+                remaining -= 1
             seen.add(link)
             collected[name].append(item)
-            remaining -= 1
-            if remaining <= 0:
-                break
     return collected
+ 
+ 
+async def fetch_own(bot, user_id):
+    """Ваш канал показывается только тем, кто на него ещё не подписан.
+    Если проверить нельзя (бот не админ в канале) — канал пропускаем, чтобы не блокировать людей."""
+    sub = await check_subscription(bot, OWN_CHANNEL_ID, user_id)
+    return [{"link": OWN_CHANNEL_LINK}] if sub is False else []
  
  
 def traffy_headers():
     return {"x-publisher-api-key": TRAFFY_API_KEY, "Content-Type": "application/json"}
- 
- 
-def flyer_headers():
-    return {"Content-Type": "application/json"}
  
  
 def flowly_headers():
@@ -760,29 +780,6 @@ async def fetch_traffy(session, user_id, user_data, limit):
         for t in tasks
         if t.get("target_link") and t.get("assignment_id")
     ][:limit]
- 
- 
-async def fetch_flyer(session, user_id, user_data, limit):
-    if not key_filled(FLYER_API_KEY):
-        return []
-    payload = {"key": FLYER_API_KEY, "user_id": user_id, "limit": min(limit, 10)}
-    if user_data.get("language_code"):
-        payload["language_code"] = user_data["language_code"]
-    _, data, _ = await api_post(session, "flyer", f"{FLYER_API_URL}/get_tasks", payload, flyer_headers())
-    if not isinstance(data, dict):
-        return []
-    if data.get("error"):
-        # Например «Prohibited method for a bot type» — ключ не типа «Задания»
-        print(f"[flyer] error: {data['error']}")
-        return []
-    items = []
-    for t in data.get("result") or []:
-        if t.get("status") in ("complete", "waiting", "unavailable"):
-            continue
-        links = t.get("links") or []
-        if links and t.get("signature"):
-            items.append({"link": links[0], "signature": t["signature"]})
-    return items[:limit]
  
  
 async def fetch_flowly(session, user_id, user_data, limit):
@@ -859,18 +856,6 @@ async def check_traffy(session, user, items):
     return [i for i in items if status_by_id.get(i["assignment_id"], "pending") in ("pending", "error")]
  
  
-async def check_flyer(session, user, items):
-    async def one(item):
-        _, res, _ = await api_post(
-            session, "flyer-check", f"{FLYER_API_URL}/check_task",
-            {"key": FLYER_API_KEY, "signature": item["signature"]}, flyer_headers(),
-        )
-        return item, (res.get("result") if isinstance(res, dict) else None)
- 
-    results = await asyncio.gather(*(one(i) for i in items))
-    return [i for i, status in results if status not in ("complete", "waiting", "unavailable")]
- 
- 
 async def check_flowly(session, user, items):
     async def one(item):
         _, res, _ = await api_post(
@@ -888,7 +873,6 @@ CHECKERS = {
     "piarflow": check_piarflow,
     "trafsly": check_trafsly,
     "traffy": check_traffy,
-    "flyer": check_flyer,
     "flowly": check_flowly,
 }
  
@@ -953,6 +937,19 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
     else:
         redis_line = "настроен, но НЕ отвечает ❌ (проверьте URL и токен)"
  
+    try:
+        me = await message.bot.me()
+        member = await message.bot.get_chat_member(OWN_CHANNEL_ID, me.id)
+        st_own = _status_str(member)
+        own_line = "бот админ ✅" if st_own in ("administrator", "creator") else f"бот НЕ админ ❌ (статус: {st_own})"
+    except Exception as e:
+        own_line = f"❌ нет доступа к каналу ({e.__class__.__name__})"
+    try:
+        wh = await message.bot.get_webhook_info()
+        wh_line = "включён ✅" if "chat_member" in (wh.allowed_updates or []) else "НЕ включён ❌ (откройте /setup)"
+    except Exception:
+        wh_line = "не удалось проверить"
+ 
     lines = [
         "🔧 ДИАГНОСТИКА",
         f"BOT_TOKEN: {'задан' if BOT_TOKEN else 'НЕ ЗАДАН'}",
@@ -960,9 +957,10 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
         f"PIARFLOW_API_KEY: {key_status(PIARFLOW_API_KEY)}",
         f"TRAFSLY_API_KEY: {key_status(TRAFSLY_API_KEY)}",
         f"TRAFFY_API_KEY: {key_status(TRAFFY_API_KEY)}",
-        f"FLYER_API_KEY: {key_status(FLYER_API_KEY)}",
         f"FLOWLY_API_KEY: {key_status(FLOWLY_API_KEY)}",
         f"REDIS: {redis_line}",
+        f"СВОЙ КАНАЛ: {own_line}",
+        f"События chat_member (мгновенный штраф): {wh_line}",
         "",
     ]
  
@@ -1012,19 +1010,6 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
         lines.append(f"TRAFFY → HTTP {st}\n{body[:500]}\n")
  
         st, _, body = await api_post(
-            session, "flyer-me", f"{FLYER_API_URL}/get_me", {"key": FLYER_API_KEY}, flyer_headers(),
-        )
-        lines.append(f"FLYER get_me → HTTP {st}\n{body[:300]}\n")
- 
-        flyer_payload = {"key": FLYER_API_KEY, "user_id": user_id, "limit": 3}
-        if user.language_code:
-            flyer_payload["language_code"] = user.language_code
-        st, _, body = await api_post(
-            session, "flyer", f"{FLYER_API_URL}/get_tasks", flyer_payload, flyer_headers(),
-        )
-        lines.append(f"FLYER get_tasks → HTTP {st}\n{body[:500]}\n")
- 
-        st, _, body = await api_post(
             session, "flowly", f"{FLOWLY_API_URL}/offers",
             {
                 "tg_user_id": int(user_id),
@@ -1041,22 +1026,48 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
         await message.answer(text[i:i + 3900])
  
  
-# ================= /resetme (только админ, для тестов) =================
-@router.message(Command("resetme"))
-async def resetme_handler(message: Message, state: FSMContext) -> None:
-    if message.from_user.id != ADMIN_ID:
+# ================= /woot — полный сброс аккаунта (для тестов) =================
+# Работает у администратора и у id из переменной окружения TEST_IDS (через запятую).
+TEST_IDS = {int(x) for x in re.findall(r"-?\d+", os.environ.get("TEST_IDS", ""))}
+ 
+ 
+def is_tester(uid: int) -> bool:
+    return uid == ADMIN_ID or uid in TEST_IDS
+ 
+ 
+async def wipe_user(uid: int) -> None:
+    """Стирает всё о пользователе: баланс, рефералов, проверки, спонсоров, штрафы.
+    После этого он для бота — совершенно новый человек, и реферальная ссылка сработает снова."""
+    invited = await redis_cmd("SMEMBERS", f"refs:{uid}") or []
+    my_ref = await redis_cmd("GET", f"refby:{uid}")
+    cmds = [
+        ["DEL", user_key(uid)], ["SREM", "users", uid], ["ZREM", "users_joined", uid],
+        ["ZREM", "top_refs", uid], ["HDEL", "top_names", uid],
+        ["DEL", f"refs:{uid}"], ["DEL", f"refby:{uid}"], ["DEL", f"pending_ref:{uid}"],
+        ["DEL", f"verify:{uid}"], ["DEL", f"verify_pending:{uid}"], ["DEL", f"penalized:{uid}"],
+        ["DEL", f"watch:{uid}"], ["ZREM", "watch_list", uid],
+        ["DEL", f"sp_total:{uid}"], ["DEL", f"sp_paid:{uid}"], ["DEL", f"sp_own:{uid}"], ["DEL", f"sp_active:{uid}"],
+        ["SREM", "passed_users", uid], ["SREM", "income_users", uid],
+        ["DEL", f"user_done:{uid}"], ["DEL", f"user_skip:{uid}"], ["DEL", f"wd:{uid}"],
+        ["DEL", f"fsm:{uid}:{uid}:state"], ["DEL", f"fsm:{uid}:{uid}:data"],
+    ]
+    for rid in invited:  # приглашённые им больше не привязаны к нему (штраф не заденет новый аккаунт)
+        cmds.append(["DEL", f"refby:{rid}"])
+    if my_ref:  # его самого убираем из списка приглашённых тем, кто его звал
+        cmds.append(["SREM", f"refs:{str(my_ref).split(':')[0]}", uid])
+    await redis_pipeline(cmds)
+ 
+ 
+@router.message(Command("woot", "resetme"))
+async def woot_handler(message: Message, state: FSMContext) -> None:
+    if not is_tester(message.from_user.id):
         return
     await state.clear()
-    uid = message.from_user.id
-    await redis_cmd("SREM", "income_users", uid)
-    await redis_cmd("SREM", "passed_users", uid)
-    await redis_cmd("DEL", f"sp_total:{uid}")
-    await redis_cmd("DEL", f"sp_active:{uid}")
-    await redis_cmd("DEL", f"pending_ref:{uid}")
-    await redis_cmd("DEL", f"verify:{uid}")
-    await redis_cmd("DEL", f"verify_pending:{uid}")
+    await wipe_user(message.from_user.id)
+    # Ничего не создаём заново: пока человек не нажмёт /start или реф. ссылку, его «нет» в боте
     await message.answer(
-        "✅ Ваш аккаунт сброшен для теста. Нажмите /start — снова пройдёте спонсоров и проверку номера."
+        "✅ Аккаунт сброшен: баланс, рефералы, проверки и спонсоры обнулены.\n"
+        "Теперь можно перейти по реферальной ссылке — она сработает как для нового пользователя."
     )
  
  
@@ -1192,6 +1203,8 @@ class AccessMiddleware(BaseMiddleware):
         user = getattr(event, "from_user", None)
         if user is None or user.id == ADMIN_ID:
             return await handler(event, data)
+        if isinstance(event, Message) and (event.text or "").startswith("/woot") and is_tester(user.id):
+            return await handler(event, data)  # сброс доступен тестеру даже при бане/без проверки
  
         status = await get_verify_status(user.id)
         if status == "ok":
@@ -1507,7 +1520,7 @@ async def any_message_handler(message: Message, state: FSMContext) -> None:
 def build_sponsor_markup(all_links: list[str]) -> InlineKeyboardMarkup:
     buttons = []
     temp_row = []
-    for link in all_links[:TARGET_COUNT]:
+    for link in all_links[:MAX_SPONSORS]:
         temp_row.append(InlineKeyboardButton(text="✉️ Подписаться", url=link))
         if len(temp_row) == 2:
             buttons.append(temp_row)
@@ -1585,15 +1598,15 @@ async def show_sponsors(message: Message, user=None):
     try:
         timeout = aiohttp.ClientTimeout(total=5)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            # Все сервисы опрашиваются одновременно (быстрее для Vercel),
-            # затем из ответов набирается ровно TARGET_COUNT спонсоров по приоритету
+            # Всё опрашивается одновременно. Порядок = SERVICES:
+            # ваш канал, flowly, tgrass, traffy, piarflow, trafsly
             results = await asyncio.gather(
+                fetch_own(message.bot, user_id),
+                fetch_flowly(session, user_id, user_data, TARGET_COUNT),
                 fetch_tgrass(session, user_id, user_data, TARGET_COUNT),
+                fetch_traffy(session, user_id, user_data, TARGET_COUNT),
                 fetch_piarflow(session, user_id, chat_id, TARGET_COUNT),
                 fetch_trafsly(session, user_id, chat_id, user_data, TARGET_COUNT),
-                fetch_traffy(session, user_id, user_data, TARGET_COUNT),
-                fetch_flyer(session, user_id, user_data, TARGET_COUNT),
-                fetch_flowly(session, user_id, user_data, TARGET_COUNT),
                 return_exceptions=True,
             )
         collected = limit_sponsors(pick_sponsors(results))
@@ -1603,24 +1616,32 @@ async def show_sponsors(message: Message, user=None):
     print(f"[sponsors] user={user_id} " + " ".join(f"{n}={len(collected[n])}" for n in SERVICES))
  
     all_links = links_of(collected)
+    own_shown = bool(collected.get("own"))
+    paid_count = len(all_links) - (1 if own_shown else 0)   # ваш канал дохода не приносит
  
     if all_links:
         await set_active(user_id, {
             **collected,
             "total_count": len(all_links),
+            "paid_count": paid_count,
             "all": {n: list(collected[n]) for n in SERVICES},
         })
         # NX: не перезаписываем, чтобы сохранилось исходное число спонсоров
         await redis_cmd("SET", f"sp_total:{user_id}", len(all_links), "NX", "EX", 604800)
+        await redis_cmd("SET", f"sp_paid:{user_id}", paid_count, "NX", "EX", 604800)
+        if own_shown:
+            await redis_cmd("SET", f"sp_own:{user_id}", "1", "NX", "EX", 604800)
     else:
         await del_active(user_id)
         # Спонсоров сейчас нет. Если раньше они были показаны (число хранится в Redis) —
         # значит, пользователь на них уже подписался.
-        done_count = await pop_sponsor_total(user_id)
-        await add_income(user_id, done_count)
-        await record_sponsors(user_id, done_count)
+        done_total, done_paid, own_done = await pop_sponsor_counts(user_id)
+        await add_income(user_id, done_paid)
+        await record_sponsors(user_id, done_total)
+        if own_done:
+            await start_watch(user_id)
         await mark_passed(user_id)
-        await after_sponsors(message.bot, message, user, had_sponsors=done_count > 0)
+        await after_sponsors(message.bot, message, user, had_sponsors=done_total > 0)
         return
  
     markup = build_sponsor_markup(all_links)
@@ -1986,7 +2007,7 @@ async def admin_action_handler(callback: CallbackQuery) -> None:
 # ================= ШТРАФ ЗА ОТПИСКУ =================
 UNSUBSCRIBE_PENALTY = 4.5     # штраф пользователю, ⭐
 WATCH_DAYS = 3                # сколько дней нельзя отписываться
-RECHECK_INTERVAL = 3600       # как часто перепроверять одного пользователя при его заходах (сек)
+RECHECK_INTERVAL = 600        # как часто перепроверять одного пользователя при его заходах (сек)
 CRON_RECHECK = 6 * 3600       # как часто перепроверять по расписанию (сек)
 CRON_BATCH = 20               # сколько пользователей проверять за один вызов /cron
  
@@ -2042,47 +2063,13 @@ async def send_sponsors_done(target) -> None:
         print(f"send_sponsors_done error: {e!r}")
  
  
-# ----- проверка «всё ещё подписан» -----
-# Штраф выдаётся только если сервис ЯВНО ответил «не подписан». Ошибка или пустой ответ — не штраф.
-# Подключены сервисы, у которых API показывает текущее состояние подписки.
-async def retention_piarflow(session, uid, items):
-    _, res, _ = await api_post(
-        session, "piarflow-retention", f"{PIARFLOW_API_URL}/sponsors/check",
-        {"user_id": uid, "links": [i["link"] for i in items]}, piarflow_headers(),
-    )
-    if not isinstance(res, dict):
-        return []
-    bad = {s.get("link") for s in (res.get("sponsors") or []) if s.get("status") == "unsubscribed"}
-    return [i for i in items if i["link"] in bad]
- 
- 
-async def retention_flowly(session, uid, items):
-    async def one(item):
-        _, res, _ = await api_post(
-            session, "flowly-retention", f"{FLOWLY_API_URL}/check",
-            {"tg_user_id": int(uid), "offer_id": item["offer_id"]}, flowly_headers(),
-        )
-        return item, (res.get("status") if isinstance(res, dict) else None)
- 
-    results = await asyncio.gather(*(one(i) for i in items))
-    return [i for i, status in results if status == "not_subscribed"]
- 
- 
-RETENTION = {"piarflow": retention_piarflow, "flowly": retention_flowly}
- 
- 
-async def start_watch(uid: int, shown: dict) -> None:
-    """Пользователь выполнил спонсоров — следим за подпиской WATCH_DAYS дней."""
-    items = {n: list(shown.get(n) or []) for n in RETENTION if shown.get(n)}
-    if not items:
-        return
+# ----- слежка за подпиской на ВАШ канал -----
+# Если бот администратор канала, Telegram сам сообщает, подписан ли человек: отписка
+# определяется надёжно — мгновенно (событие chat_member), при заходе в бота и по расписанию.
+async def start_watch(uid: int) -> None:
+    """Пользователь подписался на ваш канал — следим за этим WATCH_DAYS дней."""
     now = time.time()
-    watch = {
-        "started": now,
-        "expires": now + WATCH_DAYS * 86400,
-        "items": items,
-        "last": now,
-    }
+    watch = {"kind": "own", "started": now, "expires": now + WATCH_DAYS * 86400, "last": now}
     await redis_set_json(f"watch:{uid}", watch, ex=(WATCH_DAYS + 1) * 86400)
     await redis_cmd("ZADD", "watch_list", now + RECHECK_INTERVAL, uid)
  
@@ -2124,30 +2111,24 @@ async def apply_unsubscribe_penalty(bot: Bot, uid: int) -> None:
  
  
 async def run_watch_check(bot: Bot, uid: int) -> bool:
-    """Перепроверяет подписки пользователя. True — штраф выдан."""
+    """Перепроверяет подписку на ваш канал. True — штраф выдан."""
     watch = await redis_get_json(f"watch:{uid}")
     now = time.time()
-    if not isinstance(watch, dict) or now >= to_float(watch.get("expires")):
-        # срок вышел или записи нет — следить больше не нужно
+    if not isinstance(watch, dict) or watch.get("kind") != "own" or now >= to_float(watch.get("expires")):
+        # срок вышел, записи нет или запись старого формата — следить не нужно
         await redis_cmd("DEL", f"watch:{uid}")
         await redis_cmd("ZREM", "watch_list", uid)
         return False
  
-    items = watch.get("items") or {}
-    names = [n for n in RETENTION if items.get(n)]
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
-        results = await asyncio.gather(
-            *(RETENTION[n](session, uid, items[n]) for n in names), return_exceptions=True,
-        )
-    unsubscribed = False
-    for name, res in zip(names, results):
-        if isinstance(res, Exception):
-            print(f"[{name}] ошибка проверки удержания: {res!r}")
-            continue
-        if res:
-            unsubscribed = True
+    status = None
+    try:
+        member = await bot.get_chat_member(chat_id=OWN_CHANNEL_ID, user_id=uid)
+        status = _status_str(member)
+    except Exception as e:
+        print(f"run_watch_check get_chat_member error: {e!r}")
  
-    if unsubscribed:
+    # 'left' — вышел сам. 'kicked' (удалён админом) и ошибки проверки — не штраф
+    if status == "left":
         await apply_unsubscribe_penalty(bot, uid)
         return True
  
@@ -2171,6 +2152,24 @@ async def maybe_check_watch(event) -> None:
         await run_watch_check(event.bot, uid)
     except Exception as e:
         print(f"maybe_check_watch error: {e!r}")
+ 
+ 
+@router.chat_member()
+async def own_channel_member_handler(event: ChatMemberUpdated, bot: Bot) -> None:
+    """Мгновенная реакция на выход из вашего канала (нужен chat_member в allowed_updates, см. /setup)."""
+    if event.chat.id != OWN_CHANNEL_ID:
+        return
+    target = event.new_chat_member.user
+    if _status_str(event.new_chat_member) != "left":
+        return
+    if event.from_user.id != target.id:  # убрал админ, а не человек сам отписался
+        return
+    watch = await redis_get_json(f"watch:{target.id}")
+    if not isinstance(watch, dict) or watch.get("kind") != "own":
+        return
+    if time.time() >= to_float(watch.get("expires")):
+        return
+    await apply_unsubscribe_penalty(bot, target.id)
  
  
 async def process_cron() -> int:
@@ -2701,7 +2700,14 @@ async def check_all_tasks_handler(callback: CallbackQuery) -> None:
         return
  
     user = callback.from_user
-    names = [n for n in SERVICES if tasks_data.get(n)]
+ 
+    # Ваш канал проверяем напрямую через Telegram
+    if tasks_data.get("own"):
+        sub = await check_subscription(callback.bot, OWN_CHANNEL_ID, user_id)
+        if sub is not False:  # подписан, либо проверить не удалось — человека не блокируем
+            tasks_data["own"] = []
+ 
+    names = [n for n in SERVICES if n != "own" and tasks_data.get(n)]
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
         results = await asyncio.gather(
             *(CHECKERS[n](session, user, tasks_data[n]) for n in names),
@@ -2718,10 +2724,16 @@ async def check_all_tasks_handler(callback: CallbackQuery) -> None:
  
     if not all_links:
         await del_active(user_id)
-        done_count = await pop_sponsor_total(user_id, tasks_data.get("total_count", 0))
-        await add_income(user_id, done_count)
-        await record_sponsors(user_id, done_count)
-        await start_watch(user_id, tasks_data.get("all") or {})
+        done_total, done_paid, own_done = await pop_sponsor_counts(
+            user_id,
+            tasks_data.get("total_count", 0),
+            tasks_data.get("paid_count", 0),
+            bool((tasks_data.get("all") or {}).get("own")),
+        )
+        await add_income(user_id, done_paid)
+        await record_sponsors(user_id, done_total)
+        if own_done:
+            await start_watch(user_id)
         await mark_passed(user_id)
  
         await safe_answer(callback)
@@ -2782,4 +2794,30 @@ def cron():
         return "Forbidden", 403
     checked = asyncio.run(process_cron())
     return f"checked: {checked}", 200
+ 
+ 
+def _secret_ok() -> bool:
+    secret = os.environ.get("CRON_SECRET")
+    given = (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip() or request.args.get("key", "")
+    return bool(secret) and hmac.compare_digest(given.encode(), secret.encode())
+ 
+ 
+async def configure_webhook(url: str):
+    """Ставит вебхук так, чтобы бот получал события chat_member (выход из канала)."""
+    bot = Bot(token=BOT_TOKEN)
+    try:
+        await bot.set_webhook(url=url, allowed_updates=["message", "callback_query", "chat_member"])
+        info = await bot.get_webhook_info()
+        return info.url, info.allowed_updates
+    finally:
+        await bot.session.close()
+ 
+ 
+@app.route("/setup", methods=["GET"])
+def setup():
+    """Открыть один раз: https://ВАШ-ДОМЕН/setup?key=<CRON_SECRET>"""
+    if not _secret_ok():
+        return "Forbidden", 403
+    url, allowed = asyncio.run(configure_webhook(f"https://{request.host}/"))
+    return f"webhook: {url}\nallowed_updates: {allowed}", 200
  
