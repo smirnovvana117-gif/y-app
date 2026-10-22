@@ -1,4 +1,3 @@
-
 import asyncio
 import hmac
 import html
@@ -43,7 +42,7 @@ PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "FNDvblihCM-RXnMX1U_UrErt_
 TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "at_99ddd0618296db80b905c92ff9adaa8c")
 TRAFFY_API_KEY = os.environ.get("TRAFFY_API_KEY", "pk_live_DJZaxY7dRIECCycKvEL5ALT0wW7UhEKb")
 FLOWLY_API_KEY = os.environ.get("FLOWLY_API_KEY", "9f0c8ea7e9a664b4a6326ce95f62b222")
-
+ 
 # Upstash Redis — ОБЯЗАТЕЛЕН: в нём хранятся все данные бота.
 # Vercel -> Storage -> Upstash Redis
 # Vercel может назвать переменные по-разному (UPSTASH_REDIS_REST_* или KV_REST_API_*) — поддерживаем оба варианта
@@ -1027,8 +1026,9 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
  
  
 # ================= /woot — полный сброс аккаунта (для тестов) =================
-# Работает у администратора и у id из переменной окружения TEST_IDS (через запятую).
-TEST_IDS = {int(x) for x in re.findall(r"-?\d+", os.environ.get("TEST_IDS", ""))}
+# Работает у администратора и у тестовых аккаунтов из TEST_IDS.
+# Тестовые аккаунты, на которых работает /woot (плюс id из переменной окружения TEST_IDS, если задана)
+TEST_IDS = {8789146386, 792875116} | {int(x) for x in re.findall(r"-?\d+", os.environ.get("TEST_IDS", ""))}
  
  
 def is_tester(uid: int) -> bool:
