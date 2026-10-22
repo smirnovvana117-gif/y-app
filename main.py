@@ -1,3 +1,4 @@
+
 import asyncio
 import hmac
 import html
@@ -8,7 +9,7 @@ import time
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
-
+ 
 import aiohttp
 from flask import Flask, request
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -27,7 +28,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,
     Update,
 )
-
+ 
 # ======================================================================
 #                         НАСТРОЙКИ
 #  Всё задаётся через переменные окружения Vercel.
@@ -35,14 +36,14 @@ from aiogram.types import (
 # ======================================================================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")   # токен бота (из Vercel)
 ADMIN_ID = 619112100                      # ID администратора
-
+ 
 TGRASS_API_KEY = os.environ.get("TGRASS_API_KEY", "6d6e9e9701e7440a81fe099d360710d5")
 PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv")
 TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "at_99ddd0618296db80b905c92ff9adaa8c")
-TRAFFY_API_KEY = os.environ.get("TRAFFY_API_KEY", "pk_live_38u8oOUn6p7OLmAnmKGrpsTsvwUfneBu")
+TRAFFY_API_KEY = os.environ.get("TRAFFY_API_KEY", "pk_live_DJZaxY7dRIECCycKvEL5ALT0wW7UhEKb")
 FLYER_API_KEY = os.environ.get("FLYER_API_KEY", "FL-XCelim-WHmkUj-vBuGgN-bbMxPy")
 FLOWLY_API_KEY = os.environ.get("FLOWLY_API_KEY", "9f0c8ea7e9a664b4a6326ce95f62b222")
-
+ 
 # Upstash Redis — ОБЯЗАТЕЛЕН: в нём хранятся все данные бота.
 # Vercel -> Storage -> Upstash Redis
 # Vercel может назвать переменные по-разному (UPSTASH_REDIS_REST_* или KV_REST_API_*) — поддерживаем оба варианта
