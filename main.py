@@ -1154,18 +1154,16 @@ async def ask_phone(target) -> None:
 
 
 async def after_sponsors(bot: Bot, target, user, had_sponsors: bool) -> None:
-    """Этап спонсоров пройден. Если номер ещё не подтверждён — просим его,
-    иначе сразу в меню. Награда рефералу выдаётся только после проверки номера."""
+    """Этап спонсоров пройден (проверки номера больше нет): награда рефералу и меню."""
     uid = user.id
+    # если человек застрял на старой проверке номера — берём исходное «были ли спонсоры»
+    pending = await redis_cmd("GETDEL", f"verify_pending:{uid}")
+    if pending is not None:
+        had_sponsors = pending == "1"
     if had_sponsors:
         await send_sponsors_done(target)
-    if await get_verify_status(uid) == "ok":
-        await reward_referrer_if_needed(bot, uid, had_sponsors)
-        await send_main_menu(target, user)
-        return
-    # NX: при повторном /start сохраняем исходное значение «были ли спонсоры»
-    await redis_cmd("SET", f"verify_pending:{uid}", "1" if had_sponsors else "0", "NX", "EX", 2592000)
-    await ask_phone(target)
+    await reward_referrer_if_needed(bot, uid, had_sponsors)
+    await send_main_menu(target, user)
 
 
 async def notify_referrer_banned(bot: Bot, user_id: int) -> None:
@@ -1214,73 +1212,17 @@ async def send_ban_text(event) -> None:
 
 
 class AccessMiddleware(BaseMiddleware):
-    """Забаненным — только текст блокировки. Тем, кто не прошёл проверку номера, доступен
-    только /start, этап спонсоров и отправка контакта; остальное игнорируется."""
+    """Проверки номера больше нет: только перепроверка подписки (штрафы) при заходе в бота."""
 
     async def __call__(self, handler, event, data):
         user = getattr(event, "from_user", None)
-        if user is None or user.id == ADMIN_ID:
-            return await handler(event, data)
-        # /woot доступна тестовым аккаунтам в любом состоянии (даже до проверки номера)
-        if (user.id in WOOT_IDS and isinstance(event, Message)
-                and (event.text or "").split("@")[0].strip() == "/woot"):
-            return await handler(event, data)
-
-        status = await get_verify_status(user.id)
-        if status == "ok":
+        if user is not None and user.id != ADMIN_ID:
             await maybe_check_watch(event)
-            return await handler(event, data)
-        if status == "banned":
-            await send_ban_text(event)
-            return
-
-        # проверку ещё не прошёл: «старожилы» освобождаются автоматически
-        if await is_legacy_user(user.id):
-            await redis_cmd("SET", f"verify:{user.id}", "ok")
-            return await handler(event, data)
-
-        if isinstance(event, Message):
-            if event.contact or (event.text or "").startswith("/start"):
-                return await handler(event, data)
-            return  # обычные сообщения (в том числе номер текстом) — ничего не происходит
-        if isinstance(event, CallbackQuery):
-            if event.data == "check_all_tasks":
-                return await handler(event, data)
-            try:
-                await event.answer("Сначала пройдите проверку — нажмите /start", show_alert=True)
-            except Exception:
-                pass
-            return
         return await handler(event, data)
 
 
 router.message.outer_middleware(AccessMiddleware())
 router.callback_query.outer_middleware(AccessMiddleware())
-
-
-@router.message(F.contact)
-async def contact_handler(message: Message, state: FSMContext) -> None:
-    user = message.from_user
-    uid = user.id
-    contact = message.contact
-
-    # Контакт должен быть именно своим (отправлен кнопкой), иначе — как обычное сообщение
-    if contact.user_id != uid:
-        return
-    pending = await redis_cmd("GET", f"verify_pending:{uid}")
-    if pending is None:
-        return  # этап спонсоров ещё не пройден
-    if await get_verify_status(uid) == "ok":
-        return
-
-    if is_cis_phone(contact.phone_number):
-        await redis_cmd("SET", f"verify:{uid}", "ok")
-        await redis_cmd("DEL", f"verify_pending:{uid}")
-        await message.answer("✅ Проверка пройдена!", reply_markup=ReplyKeyboardRemove())
-        await reward_referrer_if_needed(message.bot, uid, pending == "1")
-        await send_main_menu(message, user)
-    else:
-        await ban_user(message.bot, message, user)
 
 
 # ================= ВВОД ТЕКСТА (по состояниям) =================
