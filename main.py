@@ -40,8 +40,8 @@ WOOT_IDS = {ADMIN_ID, 8789146386, 792875116}
 OWN_CHANNEL_ID = -1004361145540
 OWN_CHANNEL_LINK = "https://t.me/DeveloperLead"
 
-TGRASS_API_KEY = os.environ.get("TGRASS_API_KEY", "6d6e9e9701e7440a81fe099d360710d5")
 PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv")
+TGRASS_API_KEY = os.environ.get("TGRASS_API_KEY", "6d6e9e9701e7440a81fe099d360710d5")
 TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "at_99ddd0618296db80b905c92ff9adaa8c")
 TRAFFY_API_KEY = os.environ.get("TRAFFY_API_KEY", "pk_live_DJZaxY7dRIECCycKvEL5ALT0wW7UhEKb")
 FLOWLY_API_KEY = os.environ.get("FLOWLY_API_KEY", "9f0c8ea7e9a664b4a6326ce95f62b222")
@@ -89,6 +89,7 @@ TARGET_COUNT = 6                  # всего кнопок: 5 спонсоро�
 EXTERNAL_LIMIT = 5                # максимум спонсоров из сервисов
 INCOME_PER_SPONSOR = 1.0          # доход (руб) за одну подписку на спонсора
 DEFAULT_REFERRAL_REWARD = 4.5     # награда за реферала по умолчанию
+MIN_SPONSORS_FOR_REWARD = 3       # минимум спонсоров (наш + из других сервисов), чтобы пригласивший получил награду
 FSM_TTL = 7 * 24 * 3600           # сколько хранить состояние диалога
 
 
@@ -1089,16 +1090,18 @@ async def woot_handler(message: Message, state: FSMContext) -> None:
 
 
 # ================= ЭТАП СПОНСОРОВ ЗАВЕРШЁН =================
-async def after_sponsors(bot: Bot, target, user, had_sponsors: bool) -> None:
+async def after_sponsors(bot: Bot, target, user, had_sponsors: bool, sponsors_count: int = 0) -> None:
     """Этап спонсоров пройден (проверки номера больше нет): награда рефералу и меню."""
     uid = user.id
     # если человек застрял на старой проверке номера — берём исходное «были ли спонсоры»
     pending = await redis_cmd("GETDEL", f"verify_pending:{uid}")
     if pending is not None:
         had_sponsors = pending == "1"
+        if not had_sponsors:
+            sponsors_count = 0
     if had_sponsors:
         await send_sponsors_done(target)
-    await reward_referrer_if_needed(bot, uid, had_sponsors)
+    await reward_referrer_if_needed(bot, uid, had_sponsors, sponsors_count)
     await send_main_menu(target, user)
 
 
@@ -1384,10 +1387,12 @@ def build_sponsor_markup(all_links: list[str]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-async def reward_referrer_if_needed(bot: Bot, user_id: int, had_sponsors: bool = True) -> None:
+async def reward_referrer_if_needed(
+    bot: Bot, user_id: int, had_sponsors: bool = True, sponsors_count: int = 0
+) -> None:
     """Сообщает пригласившему о результате.
-    had_sponsors=True  -> реферал подписался на спонсоров: награда + сообщение «подписался»
-    had_sponsors=False -> спонсоров не было: награды нет + сообщение «не подписался»"""
+    Награда выдаётся, только если реферал выполнил не меньше MIN_SPONSORS_FOR_REWARD спонсоров
+    (1 наш + остальные из других сервисов). Иначе — награды нет и приходит сообщение о подозрении."""
     # GETDEL: забираем и удаляем за одну операцию — награда выдаётся только один раз
     raw = await redis_cmd("GETDEL", f"pending_ref:{user_id}")
     if raw is None:
@@ -1401,12 +1406,13 @@ async def reward_referrer_if_needed(bot: Bot, user_id: int, had_sponsors: bool =
     me = await get_user(user_id)
     ref_username = me["username"] if me and me["username"] else f"id{user_id}"
 
-    # ----- спонсоров не было -> награды нет -----
-    if not had_sponsors:
+    # ----- спонсоров меньше нужного минимума -> награды нет -----
+    if not had_sponsors or sponsors_count < MIN_SPONSORS_FOR_REWARD:
         no_sponsors_msg = (
-            f"реферал: {ref_username}\n"
-            f"не подписался на спонсоров ваш доход 0.00 ⭐\n"
-            f"доход: {ref['balance']:.2f} ⭐"
+            "🚫спонсоры заподозрили что реферал не выполнил требуемые\n"
+            " условия, выплаты за реферала не начислена \n"
+            "доход 0.00 ⭐ \n"
+            f"баланс {ref['balance']:.2f} ⭐"
         )
         try:
             await bot.send_message(chat_id=ref_id, text=no_sponsors_msg)
@@ -1489,7 +1495,7 @@ async def show_sponsors(message: Message, user=None):
         await record_sponsors(user_id, done_count)
         if await mark_passed(user_id):
             await start_watch(user_id, {})
-        await after_sponsors(message.bot, message, user, had_sponsors=done_count > 0)
+        await after_sponsors(message.bot, message, user, had_sponsors=done_count > 0, sponsors_count=done_count)
         return
 
     markup = build_sponsor_markup(all_links)
@@ -2623,7 +2629,7 @@ async def check_all_tasks_handler(callback: CallbackQuery) -> None:
         await mark_passed(user_id)
 
         await safe_answer(callback)
-        await after_sponsors(callback.bot, callback, callback.from_user, had_sponsors=True)
+        await after_sponsors(callback.bot, callback, callback.from_user, had_sponsors=True, sponsors_count=done_count)
     else:
         await set_active(user_id, tasks_data)
         try:
