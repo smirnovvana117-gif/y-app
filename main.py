@@ -40,8 +40,8 @@ WOOT_IDS = {ADMIN_ID, 8789146386, 792875116}
 OWN_CHANNEL_ID = -1004361145540
 OWN_CHANNEL_LINK = "https://t.me/DeveloperLead"
 
-PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv")
 TGRASS_API_KEY = os.environ.get("TGRASS_API_KEY", "6d6e9e9701e7440a81fe099d360710d5")
+PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv")
 TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "at_99ddd0618296db80b905c92ff9adaa8c")
 TRAFFY_API_KEY = os.environ.get("TRAFFY_API_KEY", "pk_live_DJZaxY7dRIECCycKvEL5ALT0wW7UhEKb")
 FLOWLY_API_KEY = os.environ.get("FLOWLY_API_KEY", "9f0c8ea7e9a664b4a6326ce95f62b222")
@@ -713,6 +713,20 @@ def limit_sponsors(data: dict, limit: int = TARGET_COUNT) -> dict:
     return data
 
 
+def fill_test_sponsors(data: dict) -> dict:
+    """ТЕСТ-РЕЖИМ (/woot): гарантирует ровно TARGET_COUNT кнопок, даже если человек уже подписан
+    на часть спонсоров или сервисы отдали меньше. Наш канал показывается всегда, а недостающие
+    места занимают заглушки (ссылка на наш канал, помечены test=True — проверка считает их выполненными)."""
+    own = list(data.get("own") or [])
+    if not own:
+        own = [{"link": OWN_CHANNEL_LINK, "chat_id": OWN_CHANNEL_ID}]
+    external = sum(len(data.get(n) or []) for n in EXTERNAL_SERVICES)
+    for _ in range(max(TARGET_COUNT - external - len(own), 0)):
+        own.append({"link": OWN_CHANNEL_LINK, "test": True})
+    data["own"] = own
+    return data
+
+
 def pick_sponsors(results) -> dict[str, list]:
     """Из ответов сервисов (в порядке EXTERNAL_SERVICES) набирает до EXTERNAL_LIMIT спонсоров без повторов."""
     collected: dict[str, list] = {name: [] for name in SERVICES}
@@ -869,6 +883,8 @@ async def check_own(session, user, items):
         return items
     left = []
     for item in items:
+        if item.get("test"):  # заглушка тест-режима — всегда считается выполненной
+            continue
         st = await check_subscription(bot, item.get("chat_id", OWN_CHANNEL_ID), user.id)
         if st is False:
             left.append(item)
@@ -1081,9 +1097,12 @@ async def woot_handler(message: Message, state: FSMContext) -> None:
     ]
     await redis_pipeline(cmds)
     await redis_cmd("DEL", f"verify:{uid}")
+    # тест-режим: после /woot бот всегда выдаёт 6 спонсоров (см. fill_test_sponsors)
+    await redis_cmd("SET", f"woot_test:{uid}", "1")
 
     await message.answer(
-        "✅ Аккаунт полностью сброшен: баланс, рефералы, спонсоры, штрафы.\n\n"
+        "✅ Аккаунт полностью сброшен: баланс, рефералы, спонсоры, штрафы.\n"
+        "🧪 Тест-режим: вам всегда выдаётся 6 спонсоров, даже если вы уже подписаны на часть из них.\n\n"
         "Теперь вы как новый пользователь: нажмите /start (спонсоры запросятся заново) "
         "или перейдите по реферальной ссылке — реферал засчитается."
     )
@@ -1472,6 +1491,10 @@ async def show_sponsors(message: Message, user=None):
         collected = limit_sponsors(collected)
     except Exception as e:
         print(f"show_sponsors error: {e!r}")
+
+    # тест-режим после /woot: всегда ровно 6 спонсоров
+    if await redis_cmd("GET", f"woot_test:{user_id}"):
+        collected = limit_sponsors(fill_test_sponsors(collected))
 
     print(f"[sponsors] user={user_id} " + " ".join(f"{n}={len(collected[n])}" for n in SERVICES))
 
