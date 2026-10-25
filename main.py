@@ -988,6 +988,14 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
         )
         lines.append(f"TRAFFY → HTTP {st}\n{body[:500]}\n")
 
+        # Flyer: тип ключа (для заданий нужен «tasks») и пробный запрос заданий
+        me_data = await flyer_post("get_me", {})
+        lines.append(f"FLYER get_me → {me_data}\n")
+        fl_payload = {"user_id": user_id, "limit": 3}
+        if user.language_code:
+            fl_payload["language_code"] = user.language_code
+        lines.append(f"FLYER get_tasks → {await flyer_post('get_tasks', fl_payload)}\n")
+
 
     try:
         me_bot = await message.bot.me()
@@ -1559,8 +1567,9 @@ async def show_task(callback: CallbackQuery) -> None:
     task_id = task["id"]
     link = html.escape(str(task["link"]))
     reward = html.escape(str(task["reward"]))
+    number = await task_number(callback.from_user.id)
     text = (
-        f"<b>🎯 Доступно задание №{task_id}!</b>\n\n"
+        f"<b>🎯 Задание №{number}</b>\n\n"
         f"<b>• Подпишитесь на канал —> {link}</b>\n"
         f"<b>• Награда: {reward}⭐️</b>"
     )
@@ -1653,6 +1662,17 @@ async def skip_task_handler(callback: CallbackQuery) -> None:
     await show_task(callback)
 
 
+# ================= НОМЕР ЗАДАНИЯ =================
+async def task_number(uid: int) -> int:
+    """Порядковый номер задания для пользователя: сколько он уже выполнил + 1.
+    Считаются задания админа, Flyer и Linkni, поэтому нумерация идёт подряд (№1, №2, №3...),
+    а новое задание после выполненных получает следующий номер."""
+    done = 0
+    for key in (f"user_done:{uid}", f"flyer_done:{uid}", f"linkni_done:{uid}"):
+        done += to_int(await redis_cmd("SCARD", key))
+    return done + 1
+
+
 # ================= ЗАДАНИЯ FLYER =================
 # API: POST /get_tasks (список заданий пользователя) и POST /check_task (статус по signature).
 # Ключ должен быть типа «tasks» (см. POST /get_me), иначе будет ошибка "Prohibited method for a bot type".
@@ -1722,8 +1742,9 @@ async def show_flyer_task(callback: CallbackQuery) -> bool:
     # signature не влезает в callback_data надёжно — храним текущее задание в Redis
     await redis_cmd("SET", f"flyer_cur:{user.id}", str(task["signature"]), "EX", 86400)
     action = FLYER_TASK_TEXT.get(task.get("task"), "Выполните задание")
+    number = await task_number(user.id)
     text = (
-        f"<b>🎯 Доступно задание!</b>\n\n"
+        f"<b>🎯 Задание №{number}</b>\n\n"
         f"<b>• {action}</b>\n"
         f"<b>• Награда: {FLYER_REWARD:g}⭐️</b>"
     )
@@ -1853,8 +1874,9 @@ async def show_linkni_task(callback: CallbackQuery) -> bool:
     n = await pick_linkni_task(uid)
     if n is None:
         return False
+    number = await task_number(uid)
     text = (
-        f"<b>🎯 Доступно задание №{n} из {LINKNI_TASKS_COUNT}!</b>\n\n"
+        f"<b>🎯 Задание №{number}</b>\n\n"
         f"<b>• Подпишитесь на канал</b>\n"
         f"<b>• Награда: {LINKNI_REWARD:g}⭐️</b>"
     )
