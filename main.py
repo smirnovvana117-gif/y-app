@@ -515,8 +515,9 @@ async def save_tasks(tasks: list[dict]) -> None:
     await redis_set_json(TASKS_KEY, tasks)
 
 
-async def pick_task(uid: int) -> Optional[dict]:
-    """Первое задание, которое пользователь ещё не выполнял и не пропускал."""
+async def pick_task(uid: int, reset: bool = True) -> Optional[dict]:
+    """Первое задание, которое пользователь ещё не выполнял и не пропускал.
+    reset=False — если все оставшиеся пропущены, вернуть None (чтобы показать задания из других источников)."""
     tasks = await load_tasks()
     if not tasks:
         return None
@@ -527,6 +528,8 @@ async def pick_task(uid: int) -> Optional[dict]:
     skipped = {to_int(x) for x in (await redis_cmd("SMEMBERS", f"user_skip:{uid}") or [])}
     fresh = [t for t in candidates if t["id"] not in skipped]
     if not fresh:
+        if not reset:
+            return None
         await redis_cmd("DEL", f"user_skip:{uid}")
         fresh = candidates
     return fresh[0]
@@ -1554,16 +1557,23 @@ async def send_main_menu(message_or_callback, user=None):
 
 # ================= ЗАДАНИЯ =================
 async def show_task(callback: CallbackQuery) -> None:
-    task = await pick_task(callback.from_user.id)
-    if not task:
-        # заданий админа нет — предлагаем задания Flyer, затем Linkni
-        if await show_flyer_task(callback):
+    """Источники по порядку: задания админа -> Flyer -> Linkni.
+    Сначала ищем непропущенное задание в любом источнике (так «пропустить» реально переходит к другому),
+    и только если всё пропущено — показываем пропущенные заново."""
+    uid = callback.from_user.id
+    for reset in (False, True):
+        task = await pick_task(uid, reset)
+        if task:
+            await send_admin_task(callback, task)
             return
-        if await show_linkni_task(callback):
+        if await show_flyer_task(callback, reset):
             return
-        await replace_message(callback, "нет активных заданий для выполнения", back_markup("back_to_main"))
-        return
+        if await show_linkni_task(callback, reset):
+            return
+    await replace_message(callback, "нет активных заданий для выполнения", back_markup("back_to_main"))
 
+
+async def send_admin_task(callback: CallbackQuery, task: dict) -> None:
     task_id = task["id"]
     link = html.escape(str(task["link"]))
     reward = html.escape(str(task["reward"]))
@@ -1653,7 +1663,7 @@ async def done_task_handler(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("skip_task_"))
 async def skip_task_handler(callback: CallbackQuery) -> None:
-    await safe_answer(callback)
+    await safe_answer(callback, "⏭ Задание пропущено")
     task_id = int(callback.data.split("_")[2])
     user_id = callback.from_user.id
     # пропуск действует только для этого пользователя
@@ -1697,7 +1707,7 @@ async def flyer_post(method: str, payload: dict) -> Optional[dict]:
     return data if isinstance(data, dict) else None
 
 
-async def pick_flyer_task(user) -> Optional[dict]:
+async def pick_flyer_task(user, reset: bool = True) -> Optional[dict]:
     """Первое задание Flyer, которое пользователь ещё не выполнял и не пропускал."""
     if not key_filled(FLYER_API_KEY):
         return None
@@ -1728,15 +1738,17 @@ async def pick_flyer_task(user) -> Optional[dict]:
     skipped = {str(x) for x in (await redis_cmd("SMEMBERS", f"flyer_skip:{user.id}") or [])}
     fresh = [t for t in candidates if str(t["signature"]) not in skipped]
     if not fresh:
+        if not reset:
+            return None
         await redis_cmd("DEL", f"flyer_skip:{user.id}")
         fresh = candidates
     return fresh[0]
 
 
-async def show_flyer_task(callback: CallbackQuery) -> bool:
+async def show_flyer_task(callback: CallbackQuery, reset: bool = True) -> bool:
     """Показывает следующее задание Flyer. False — заданий нет."""
     user = callback.from_user
-    task = await pick_flyer_task(user)
+    task = await pick_flyer_task(user, reset)
     if not task:
         return False
     # signature не влезает в callback_data надёжно — храним текущее задание в Redis
@@ -1808,7 +1820,7 @@ async def flyer_done_handler(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "fl_skip")
 async def flyer_skip_handler(callback: CallbackQuery) -> None:
-    await safe_answer(callback)
+    await safe_answer(callback, "⏭ Задание пропущено")
     user_id = callback.from_user.id
     signature = await redis_cmd("GET", f"flyer_cur:{user_id}")
     if signature:
@@ -1854,7 +1866,7 @@ async def linkni_is_subscribed(uid: int, n: int) -> Optional[bool]:
     )
 
 
-async def pick_linkni_task(uid: int) -> Optional[int]:
+async def pick_linkni_task(uid: int, reset: bool = True) -> Optional[int]:
     """Номер первого задания Linkni, которое пользователь ещё не выполнял и не пропускал."""
     done = {to_int(x) for x in (await redis_cmd("SMEMBERS", f"linkni_done:{uid}") or [])}
     candidates = [n for n in range(1, LINKNI_TASKS_COUNT + 1) if n not in done]
@@ -1863,15 +1875,17 @@ async def pick_linkni_task(uid: int) -> Optional[int]:
     skipped = {to_int(x) for x in (await redis_cmd("SMEMBERS", f"linkni_skip:{uid}") or [])}
     fresh = [n for n in candidates if n not in skipped]
     if not fresh:
+        if not reset:
+            return None
         await redis_cmd("DEL", f"linkni_skip:{uid}")
         fresh = candidates
     return fresh[0]
 
 
-async def show_linkni_task(callback: CallbackQuery) -> bool:
+async def show_linkni_task(callback: CallbackQuery, reset: bool = True) -> bool:
     """Показывает следующее задание Linkni. False — заданий не осталось."""
     uid = callback.from_user.id
-    n = await pick_linkni_task(uid)
+    n = await pick_linkni_task(uid, reset)
     if n is None:
         return False
     number = await task_number(uid)
@@ -1931,7 +1945,7 @@ async def linkni_done_handler(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("lk_skip_"))
 async def linkni_skip_handler(callback: CallbackQuery) -> None:
-    await safe_answer(callback)
+    await safe_answer(callback, "⏭ Задание пропущено")
     n = to_int(callback.data.split("_")[2])
     user_id = callback.from_user.id
     await redis_cmd("SADD", f"linkni_skip:{user_id}", n)
