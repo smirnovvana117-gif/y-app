@@ -44,7 +44,7 @@ TGRASS_API_KEY = os.environ.get("TGRASS_API_KEY", "6d6e9e9701e7440a81fe099d36071
 PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv")
 TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "at_99ddd0618296db80b905c92ff9adaa8c")
 TRAFFY_API_KEY = os.environ.get("TRAFFY_API_KEY", "pk_live_DJZaxY7dRIECCycKvEL5ALT0wW7UhEKb")
-FLYER_API_KEY = os.environ.get("FLYER_API_KEY", "FL-uPkdRr-IzczEo-wWlnVF-aELiiT")
+FLYER_API_KEY = os.environ.get("FLYER_API_KEY", "FL-VZEliI-kGJGIJ-iSddvG-KPxDqs")
 
 # Upstash Redis — ОБЯЗАТЕЛЕН: в нём хранятся все данные бота.
 # Vercel -> Storage -> Upstash Redis
@@ -1021,7 +1021,7 @@ async def resetme_handler(message: Message, state: FSMContext) -> None:
     await redis_cmd("SREM", "passed_users", uid)
     await redis_cmd("DEL", f"sp_total:{uid}")
     await redis_cmd("DEL", f"sp_active:{uid}")
-    await redis_cmd("DEL", f"flyer_done:{uid}", f"flyer_skip:{uid}", f"flyer_cur:{uid}")
+    await redis_cmd("DEL", f"flyer_done:{uid}", f"flyer_skip:{uid}", f"flyer_cur:{uid}", f"flyer_dead:{uid}")
     await redis_cmd("DEL", f"pending_ref:{uid}")
     await redis_cmd("DEL", f"verify:{uid}")
     await redis_cmd("DEL", f"verify_pending:{uid}")
@@ -1052,7 +1052,7 @@ async def woot_handler(message: Message, state: FSMContext) -> None:
         "DEL", user_key(uid), f"refs:{uid}", f"refby:{uid}", f"pending_ref:{uid}",
         f"sp_total:{uid}", f"sp_active:{uid}", f"watch:{uid}", f"penalized:{uid}",
         f"user_done:{uid}", f"user_skip:{uid}", f"wd:{uid}", f"verify_pending:{uid}",
-        f"flyer_done:{uid}", f"flyer_skip:{uid}", f"flyer_cur:{uid}",
+        f"flyer_done:{uid}", f"flyer_skip:{uid}", f"flyer_cur:{uid}", f"flyer_dead:{uid}",
     ])
     cmds += [
         ["SREM", "users", uid],
@@ -1727,6 +1727,7 @@ async def pick_flyer_task(user, reset: bool = True) -> Optional[dict]:
         return None
 
     done = {str(x) for x in (await redis_cmd("SMEMBERS", f"flyer_done:{user.id}") or [])}
+    done |= {str(x) for x in (await redis_cmd("SMEMBERS", f"flyer_dead:{user.id}") or [])}
     candidates = [
         t for t in tasks
         if isinstance(t, dict)
@@ -1744,7 +1745,17 @@ async def pick_flyer_task(user, reset: bool = True) -> Optional[dict]:
             return None
         await redis_cmd("DEL", f"flyer_skip:{user.id}")
         fresh = candidates
-    return fresh[0]
+    # Перед показом проверяем, что ресурс ещё актуален: «unavailable» убираем сразу,
+    # чтобы человек не выполнял задание, за которое Flyer уже не платит.
+    for t in fresh[:3]:
+        chk = await flyer_post("check_task", {"signature": t["signature"]})
+        status = chk.get("result") if chk and not chk.get("error") else None
+        if status == "unavailable":
+            await redis_cmd("SADD", f"flyer_dead:{user.id}", str(t["signature"]))
+            await redis_cmd("EXPIRE", f"flyer_dead:{user.id}", 21600)
+            continue
+        return t
+    return None
 
 
 def flyer_button_url(raw) -> Optional[str]:
@@ -1812,8 +1823,9 @@ async def flyer_done_handler(callback: CallbackQuery) -> None:
         await safe_answer(callback, "⚠️ Не удалось проверить задание. Попробуйте чуть позже.", show_alert=True)
         return
     if status == "unavailable":
-        await safe_answer(callback, "Это задание больше не актуально.", show_alert=True)
-        await redis_cmd("SADD", f"flyer_skip:{user_id}", signature)
+        await redis_cmd("SADD", f"flyer_dead:{user_id}", signature)
+        await redis_cmd("EXPIRE", f"flyer_dead:{user_id}", 21600)
+        await safe_answer(callback, "Это задание больше не актуально, показываю другое.", show_alert=True)
         await show_task(callback)
         return
     # complete — выполнено и оплачено, waiting — выполнено, оплата Flyer придёт в течение 24 ч
@@ -1873,7 +1885,11 @@ async def taskdiag_handler(message: Message) -> None:
     else:
         for t in (data.get("result") or []):
             if isinstance(t, dict):
-                lines.append(f"FLYER: {t.get('task')} | {t.get('status')} | {t.get('links')}")
+                chk = await flyer_post("check_task", {"signature": t.get("signature")})
+                lines.append(
+                    f"FLYER: {t.get('task')} | get_tasks={t.get('status')} | check_task={(chk or {}).get('result') or (chk or {}).get('error')} "
+                    f"| {t.get('links')}"
+                )
         if not data.get("result"):
             lines.append("FLYER get_tasks: заданий для вас нет")
     nxt = await pick_task(uid, False)
