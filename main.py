@@ -1745,17 +1745,9 @@ async def pick_flyer_task(user, reset: bool = True) -> Optional[dict]:
             return None
         await redis_cmd("DEL", f"flyer_skip:{user.id}")
         fresh = candidates
-    # Перед показом проверяем, что ресурс ещё актуален: «unavailable» убираем сразу,
-    # чтобы человек не выполнял задание, за которое Flyer уже не платит.
-    for t in fresh[:3]:
-        chk = await flyer_post("check_task", {"signature": t["signature"]})
-        status = chk.get("result") if chk and not chk.get("error") else None
-        if status == "unavailable":
-            await redis_cmd("SADD", f"flyer_dead:{user.id}", str(t["signature"]))
-            await redis_cmd("EXPIRE", f"flyer_dead:{user.id}", 21600)
-            continue
-        return t
-    return None
+    # Показываем то, что отдал Flyer. Если при проверке окажется unavailable —
+    # задание помечается «мёртвым» (flyer_dead) и больше не показывается.
+    return fresh[0]
 
 
 def flyer_button_url(raw) -> Optional[str]:
