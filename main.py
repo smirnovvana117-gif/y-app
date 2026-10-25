@@ -44,7 +44,7 @@ TGRASS_API_KEY = os.environ.get("TGRASS_API_KEY", "6d6e9e9701e7440a81fe099d36071
 PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv")
 TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "at_99ddd0618296db80b905c92ff9adaa8c")
 TRAFFY_API_KEY = os.environ.get("TRAFFY_API_KEY", "pk_live_DJZaxY7dRIECCycKvEL5ALT0wW7UhEKb")
-FLYER_API_KEY = os.environ.get("FLYER_API_KEY", "FL-NelisY-SRnApI-zNZkhB-XGGECE")
+FLYER_API_KEY = os.environ.get("FLYER_API_KEY", "FL-VZEliI-kGJGIJ-iSddvG-KPxDqs")
 
 # Upstash Redis — ОБЯЗАТЕЛЕН: в нём хранятся все данные бота.
 # Vercel -> Storage -> Upstash Redis
@@ -1551,7 +1551,6 @@ async def send_main_menu(message_or_callback, user=None):
 
 # ================= ЗАДАНИЯ =================
 NO_TASKS_TEXT = "Сейчас нет доступных заданий"
-NOTIFY_ADMIN_NO_TASKS = True  # временная диагностика: присылать админу причину, если у пользователя нет заданий
 
 
 async def show_task(callback: CallbackQuery, repeat: bool = True) -> bool:
@@ -1572,21 +1571,6 @@ async def show_task(callback: CallbackQuery, repeat: bool = True) -> bool:
         except Exception as e:
             print(f"[tasks] flyer source error: {e!r}")
     text = NO_TASKS_TEXT
-    why = await redis_cmd("GET", f"flyer_why:{uid}") or "запрос не выполнялся (проверьте ключ)"
-    if uid in WOOT_IDS:  # админам показываем причину прямо в сообщении
-        text += f"\n\n🔧 Flyer: {why}"
-    elif NOTIFY_ADMIN_NO_TASKS:
-        # остальным — отправляем причину админу (не чаще 1 раза в минуту, чтобы не засорять чат)
-        if await redis_cmd("SET", "nt_notice_global", "1", "NX", "EX", 60):
-            try:
-                u = callback.from_user
-                await callback.bot.send_message(
-                    ADMIN_ID,
-                    f"🔧 Нет заданий у пользователя {u.id} (@{u.username or '-'}, язык {u.language_code or '-'})\n"
-                    f"Flyer: {why}",
-                )
-            except Exception as e:
-                print(f"[tasks] не удалось уведомить админа: {e!r}")
     await replace_message(callback, text, back_markup("back_to_main"))
     return False
 
@@ -1734,23 +1718,13 @@ async def pick_flyer_task(user, reset: bool = True) -> Optional[dict]:
     if user.language_code:
         payload["language_code"] = user.language_code
     data = await flyer_post("get_tasks", payload)
-
-    async def why(text: str) -> None:
-        await redis_cmd("SET", f"flyer_why:{user.id}", text, "EX", 600)
-
     if not data:
-        await why("Flyer не ответил (таймаут или сбой сети)")
         return None
     if data.get("error"):
         print(f"[flyer] get_tasks error: {data.get('error')}")
-        await why(f"ошибка Flyer: {data.get('error')}")
         return None
     tasks = data.get("result")
     if not isinstance(tasks, list):
-        await why(f"Flyer: {data.get('warning') or 'нет списка заданий'}")
-        return None
-    if not tasks:
-        await why("Flyer вернул 0 заданий для вашего аккаунта")
         return None
 
     done = {str(x) for x in (await redis_cmd("SMEMBERS", f"flyer_done:{user.id}") or [])}
@@ -1764,16 +1738,6 @@ async def pick_flyer_task(user, reset: bool = True) -> Optional[dict]:
         and str(t["signature"]) not in done
     ]
     if not candidates:
-        stats = {}
-        for t in tasks:
-            if isinstance(t, dict):
-                key = t.get("status") or "?"
-                if str(t.get("signature")) in done:
-                    key = "уже выполнено/недоступно у нас"
-                elif not t.get("links"):
-                    key = "нет ссылки"
-                stats[key] = stats.get(key, 0) + 1
-        await why(f"Flyer вернул {len(tasks)} заданий, но все отсеяны: {stats}")
         return None
     skipped = {str(x) for x in (await redis_cmd("SMEMBERS", f"flyer_skip:{user.id}") or [])}
     fresh = [t for t in candidates if str(t["signature"]) not in skipped]
