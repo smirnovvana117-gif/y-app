@@ -44,7 +44,6 @@ TGRASS_API_KEY = os.environ.get("TGRASS_API_KEY", "6d6e9e9701e7440a81fe099d36071
 PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv")
 TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "at_99ddd0618296db80b905c92ff9adaa8c")
 TRAFFY_API_KEY = os.environ.get("TRAFFY_API_KEY", "pk_live_DJZaxY7dRIECCycKvEL5ALT0wW7UhEKb")
-FLOWLY_API_KEY = os.environ.get("FLOWLY_API_KEY", "9f0c8ea7e9a664b4a6326ce95f62b222")
 
 # Upstash Redis — ОБЯЗАТЕЛЕН: в нём хранятся все данные бота.
 # Vercel -> Storage -> Upstash Redis
@@ -57,7 +56,6 @@ PIARFLOW_API_URL = "https://piarflow.com/v1"
 TRAFSLY_API_URL = "https://api.trafsly.com"
 TGRASS_API_URL = "https://tgrass.space"
 TRAFFY_API_URL = "https://api.traffy.ai/publisher"
-FLOWLY_API_URL = "https://flowly.guru/api/v1"
 
 PLACEHOLDER_MARK = "ВСТАВЬТЕ_КЛЮЧ"
 
@@ -72,7 +70,6 @@ for _name, _val in (
     ("PIARFLOW_API_KEY", PIARFLOW_API_KEY),
     ("TRAFSLY_API_KEY", TRAFSLY_API_KEY),
     ("TRAFFY_API_KEY", TRAFFY_API_KEY),
-    ("FLOWLY_API_KEY", FLOWLY_API_KEY),
     ("UPSTASH_REDIS_REST_URL", UPSTASH_URL),
     ("UPSTASH_REDIS_REST_TOKEN", UPSTASH_TOKEN),
 ):
@@ -89,7 +86,7 @@ TARGET_COUNT = 6                  # всего кнопок: 5 спонсоро�
 EXTERNAL_LIMIT = 5                # максимум спонсоров из сервисов
 INCOME_PER_SPONSOR = 1.0          # доход (руб) за одну подписку на спонсора
 DEFAULT_REFERRAL_REWARD = 4.5     # награда за реферала по умолчанию
-MIN_SPONSORS_FOR_REWARD = 3       # минимум спонсоров (наш + из других сервисов), чтобы пригласивший получил награду
+MIN_SPONSORS_FOR_REWARD = 4       # минимум спонсоров (3 из сервисов + наш канал), чтобы пригласивший получил награду
 FSM_TTL = 7 * 24 * 3600           # сколько хранить состояние диалога
 
 
@@ -692,9 +689,9 @@ async def fetch_trafsly(session, user_id, chat_id, user_data, limit):
     ][:limit]
 
 
-# ================= ДОПОЛНИТЕЛЬНЫЕ СПОНСОРЫ: Traffy, Flowly =================
-# Порядок = приоритет: 1 flowly, 2 tgrass, 3 traffy, 4 piarflow, 5 trafsly. Затем наш канал.
-EXTERNAL_SERVICES = ("flowly", "tgrass", "traffy", "piarflow", "trafsly")
+# ================= ДОПОЛНИТЕЛЬНЫЕ СПОНСОРЫ: Traffy и др. =================
+# Порядок = приоритет: 1 tgrass, 2 traffy, 3 piarflow, 4 trafsly. Затем наш канал.
+EXTERNAL_SERVICES = ("tgrass", "traffy", "piarflow", "trafsly")
 SERVICES = EXTERNAL_SERVICES + ("own",)
 
 
@@ -754,10 +751,6 @@ def traffy_headers():
     return {"x-publisher-api-key": TRAFFY_API_KEY, "Content-Type": "application/json"}
 
 
-def flowly_headers():
-    return {"Auth": FLOWLY_API_KEY, "Content-Type": "application/json"}
-
-
 async def fetch_traffy(session, user_id, user_data, limit):
     if not key_filled(TRAFFY_API_KEY):
         return []
@@ -776,26 +769,6 @@ async def fetch_traffy(session, user_id, user_data, limit):
         {"link": t["target_link"], "assignment_id": t["assignment_id"]}
         for t in tasks
         if t.get("target_link") and t.get("assignment_id")
-    ][:limit]
-
-
-async def fetch_flowly(session, user_id, user_data, limit):
-    if not key_filled(FLOWLY_API_KEY):
-        return []
-    payload = {
-        "tg_user_id": int(user_id),
-        "lang": user_data.get("language_code") or "ru",
-        "is_premium": bool(user_data.get("is_premium", False)),
-        "offers_limit": limit,
-    }
-    _, data, _ = await api_post(session, "flowly", f"{FLOWLY_API_URL}/offers", payload, flowly_headers())
-    if not isinstance(data, dict) or data.get("status") != "not_ok":
-        return []
-    offers = data.get("offers") or []
-    return [
-        {"link": o["link"], "offer_id": o["offer_id"]}
-        for o in offers
-        if o.get("link") and o.get("offer_id") is not None and not o.get("subscribed", False)
     ][:limit]
 
 
@@ -853,18 +826,6 @@ async def check_traffy(session, user, items):
     return [i for i in items if status_by_id.get(i["assignment_id"], "pending") in ("pending", "error")]
 
 
-async def check_flowly(session, user, items):
-    async def one(item):
-        _, res, _ = await api_post(
-            session, "flowly-check", f"{FLOWLY_API_URL}/check",
-            {"tg_user_id": int(user.id), "offer_id": item["offer_id"]}, flowly_headers(),
-        )
-        return item, (res.get("status") if isinstance(res, dict) else None)
-
-    results = await asyncio.gather(*(one(i) for i in items))
-    return [i for i, status in results if status not in ("subscribed", "offer_unavailable")]
-
-
 # ----- наш канал -----
 async def fetch_own(bot, user_id):
     """Наш канал показываем, только если пользователь ещё не подписан."""
@@ -897,7 +858,6 @@ CHECKERS = {
     "piarflow": check_piarflow,
     "trafsly": check_trafsly,
     "traffy": check_traffy,
-    "flowly": check_flowly,
 }
 
 
@@ -968,7 +928,6 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
         f"PIARFLOW_API_KEY: {key_status(PIARFLOW_API_KEY)}",
         f"TRAFSLY_API_KEY: {key_status(TRAFSLY_API_KEY)}",
         f"TRAFFY_API_KEY: {key_status(TRAFFY_API_KEY)}",
-        f"FLOWLY_API_KEY: {key_status(FLOWLY_API_KEY)}",
         f"REDIS: {redis_line}",
         "",
     ]
@@ -1018,17 +977,6 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
         )
         lines.append(f"TRAFFY → HTTP {st}\n{body[:500]}\n")
 
-        st, _, body = await api_post(
-            session, "flowly", f"{FLOWLY_API_URL}/offers",
-            {
-                "tg_user_id": int(user_id),
-                "lang": user.language_code or "ru",
-                "is_premium": bool(user.is_premium),
-                "offers_limit": 3,
-            },
-            flowly_headers(),
-        )
-        lines.append(f"FLOWLY → HTTP {st}\n{body[:500]}\n")
 
     try:
         me_bot = await message.bot.me()
@@ -1479,7 +1427,6 @@ async def show_sponsors(message: Message, user=None):
             # Все сервисы опрашиваются одновременно (быстрее для Vercel),
             # затем из ответов набирается до EXTERNAL_LIMIT спонсоров по приоритету
             results = await asyncio.gather(
-                fetch_flowly(session, user_id, user_data, EXTERNAL_LIMIT),
                 fetch_tgrass(session, user_id, user_data, EXTERNAL_LIMIT),
                 fetch_traffy(session, user_id, user_data, EXTERNAL_LIMIT),
                 fetch_piarflow(session, user_id, chat_id, EXTERNAL_LIMIT),
@@ -1955,18 +1902,6 @@ async def retention_piarflow(session, uid, items):
     return [i for i in items if i["link"] in bad]
 
 
-async def retention_flowly(session, uid, items):
-    async def one(item):
-        _, res, _ = await api_post(
-            session, "flowly-retention", f"{FLOWLY_API_URL}/check",
-            {"tg_user_id": int(uid), "offer_id": item["offer_id"]}, flowly_headers(),
-        )
-        return item, (res.get("status") if isinstance(res, dict) else None)
-
-    results = await asyncio.gather(*(one(i) for i in items))
-    return [i for i, status in results if status == "not_subscribed"]
-
-
 async def retention_own(session, uid, items):
     """Штраф только если Telegram явно показал, что человек не в канале."""
     bot = _current_bot.get()
@@ -1978,7 +1913,7 @@ async def retention_own(session, uid, items):
     ]
 
 
-RETENTION = {"own": retention_own, "piarflow": retention_piarflow, "flowly": retention_flowly}
+RETENTION = {"own": retention_own, "piarflow": retention_piarflow}
 
 
 async def start_watch(uid: int, shown: dict) -> None:
@@ -2733,3 +2668,4 @@ def cron():
         return "Forbidden", 403
     checked = asyncio.run(process_cron())
     return f"checked: {checked}", 200
+ 
