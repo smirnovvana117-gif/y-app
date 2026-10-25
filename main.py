@@ -314,8 +314,8 @@ def back_markup(cb: str = "back_to_main", text: str = "⬅️ Назад") -> In
 async def replace_message(
     callback: CallbackQuery, text: str, markup=None,
     parse_mode: Optional[str] = None, disable_preview: bool = False,
-) -> None:
-    """Отправляет новое сообщение и удаляет старое."""
+) -> bool:
+    """Отправляет новое сообщение и удаляет старое. True — новое сообщение отправлено."""
     try:
         kwargs = {"parse_mode": parse_mode} if parse_mode else {}
         if disable_preview:
@@ -323,11 +323,12 @@ async def replace_message(
         await callback.message.answer(text, reply_markup=markup, **kwargs)
     except Exception as e:
         print(f"replace_message error: {e}")
-        return
+        return False
     try:
         await callback.message.delete()
     except Exception:
         pass
+    return True
 
 
 async def replace_with_photo(callback: CallbackQuery, photo: str, text: str, markup=None) -> None:
@@ -1556,24 +1557,36 @@ async def send_main_menu(message_or_callback, user=None):
 
 
 # ================= ЗАДАНИЯ =================
-async def show_task(callback: CallbackQuery) -> None:
+NO_TASKS_TEXT = "Сейчас нет доступных заданий"
+
+
+async def show_task(callback: CallbackQuery, repeat: bool = True) -> bool:
     """Источники по порядку: задания админа -> Flyer -> Linkni.
     Сначала ищем непропущенное задание в любом источнике (так «пропустить» реально переходит к другому),
     и только если всё пропущено — показываем пропущенные заново."""
     uid = callback.from_user.id
-    for reset in (False, True):
-        task = await pick_task(uid, reset)
-        if task:
-            await send_admin_task(callback, task)
-            return
-        if await show_flyer_task(callback, reset):
-            return
-        if await show_linkni_task(callback, reset):
-            return
-    await replace_message(callback, "нет активных заданий для выполнения", back_markup("back_to_main"))
+    for reset in ((False, True) if repeat else (False,)):
+        try:
+            task = await pick_task(uid, reset)
+            if task and await send_admin_task(callback, task):
+                return True
+        except Exception as e:
+            print(f"[tasks] admin source error: {e!r}")
+        try:
+            if await show_flyer_task(callback, reset):
+                return True
+        except Exception as e:
+            print(f"[tasks] flyer source error: {e!r}")
+        try:
+            if await show_linkni_task(callback, reset):
+                return True
+        except Exception as e:
+            print(f"[tasks] linkni source error: {e!r}")
+    await replace_message(callback, NO_TASKS_TEXT, back_markup("back_to_main"))
+    return False
 
 
-async def send_admin_task(callback: CallbackQuery, task: dict) -> None:
+async def send_admin_task(callback: CallbackQuery, task: dict) -> bool:
     task_id = task["id"]
     link = html.escape(str(task["link"]))
     reward = html.escape(str(task["reward"]))
@@ -1591,7 +1604,7 @@ async def send_admin_task(callback: CallbackQuery, task: dict) -> None:
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
         ]
     )
-    await replace_message(callback, text, markup, parse_mode="HTML", disable_preview=True)
+    return await replace_message(callback, text, markup, parse_mode="HTML", disable_preview=True)
 
 
 @router.callback_query(F.data == "menu_task")
@@ -1663,13 +1676,14 @@ async def done_task_handler(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("skip_task_"))
 async def skip_task_handler(callback: CallbackQuery) -> None:
-    await safe_answer(callback, "⏭ Задание пропущено")
     task_id = int(callback.data.split("_")[2])
     user_id = callback.from_user.id
     # пропуск действует только для этого пользователя
     await redis_cmd("SADD", f"user_skip:{user_id}", task_id)
     await redis_cmd("EXPIRE", f"user_skip:{user_id}", 86400)
-    await show_task(callback)
+    # если других заданий нет, show_task сам заменит сообщение на «Сейчас нет доступных заданий»
+    await show_task(callback, repeat=False)
+    await safe_answer(callback, "⏭ Задание пропущено")
 
 
 # ================= НОМЕР ЗАДАНИЯ =================
@@ -1745,11 +1759,26 @@ async def pick_flyer_task(user, reset: bool = True) -> Optional[dict]:
     return fresh[0]
 
 
+def flyer_button_url(raw) -> Optional[str]:
+    """Приводит ссылку Flyer к виду, который принимает Telegram для url-кнопки."""
+    link = str(raw or "").strip()
+    if link.startswith(("https://", "http://", "tg://")):
+        return link
+    if re.match(r"^(?:t|telegram)\.me/", link, re.I):
+        return "https://" + link
+    return None
+
+
 async def show_flyer_task(callback: CallbackQuery, reset: bool = True) -> bool:
     """Показывает следующее задание Flyer. False — заданий нет."""
     user = callback.from_user
     task = await pick_flyer_task(user, reset)
     if not task:
+        return False
+    link = flyer_button_url(task["links"][0])
+    if not link:
+        print(f"[flyer] неподходящая ссылка у задания {task.get('signature')}: {task['links'][0]!r}")
+        await redis_cmd("SADD", f"flyer_skip:{user.id}", str(task["signature"]))
         return False
     # signature не влезает в callback_data надёжно — храним текущее задание в Redis
     await redis_cmd("SET", f"flyer_cur:{user.id}", str(task["signature"]), "EX", 86400)
@@ -1762,13 +1791,16 @@ async def show_flyer_task(callback: CallbackQuery, reset: bool = True) -> bool:
     )
     markup = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Выполнить", url=str(task["links"][0]))],
+            [InlineKeyboardButton(text="Выполнить", url=link)],
             [InlineKeyboardButton(text="пропустить задание", callback_data="fl_skip")],
             [InlineKeyboardButton(text="✅ Я выполнил", callback_data="fl_done")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
         ]
     )
-    await replace_message(callback, text, markup, parse_mode="HTML", disable_preview=True)
+    if not await replace_message(callback, text, markup, parse_mode="HTML", disable_preview=True):
+        # Telegram не принял сообщение — не зацикливаемся на нём, переходим к следующему
+        await redis_cmd("SADD", f"flyer_skip:{user.id}", str(task["signature"]))
+        return False
     return True
 
 
@@ -1820,13 +1852,14 @@ async def flyer_done_handler(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "fl_skip")
 async def flyer_skip_handler(callback: CallbackQuery) -> None:
-    await safe_answer(callback, "⏭ Задание пропущено")
     user_id = callback.from_user.id
     signature = await redis_cmd("GET", f"flyer_cur:{user_id}")
     if signature:
         await redis_cmd("SADD", f"flyer_skip:{user_id}", str(signature))
         await redis_cmd("EXPIRE", f"flyer_skip:{user_id}", 86400)
-    await show_task(callback)
+    # если других заданий нет, show_task сам заменит сообщение на «Сейчас нет доступных заданий»
+    await show_task(callback, repeat=False)
+    await safe_answer(callback, "⏭ Задание пропущено")
 
 
 # ================= ЗАДАНИЯ LINKNI =================
@@ -1902,7 +1935,9 @@ async def show_linkni_task(callback: CallbackQuery, reset: bool = True) -> bool:
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
         ]
     )
-    await replace_message(callback, text, markup, parse_mode="HTML", disable_preview=True)
+    if not await replace_message(callback, text, markup, parse_mode="HTML", disable_preview=True):
+        await redis_cmd("SADD", f"linkni_skip:{uid}", n)
+        return False
     return True
 
 
@@ -1945,12 +1980,47 @@ async def linkni_done_handler(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("lk_skip_"))
 async def linkni_skip_handler(callback: CallbackQuery) -> None:
-    await safe_answer(callback, "⏭ Задание пропущено")
     n = to_int(callback.data.split("_")[2])
     user_id = callback.from_user.id
     await redis_cmd("SADD", f"linkni_skip:{user_id}", n)
     await redis_cmd("EXPIRE", f"linkni_skip:{user_id}", 86400)
-    await show_task(callback)
+    # если других заданий нет, show_task сам заменит сообщение на «Сейчас нет доступных заданий»
+    await show_task(callback, repeat=False)
+    await safe_answer(callback, "⏭ Задание пропущено")
+
+
+@router.message(Command("taskdiag"))
+async def taskdiag_handler(message: Message) -> None:
+    """Для админов: откуда берутся задания и что у вас выполнено/пропущено."""
+    if message.from_user.id not in WOOT_IDS:
+        return
+    uid = message.from_user.id
+    tasks = await load_tasks()
+    lines = ["🔧 ЗАДАНИЯ", ""]
+    lines.append(f"АДМИН: всего {len(tasks)}, выполнено {to_int(await redis_cmd('SCARD', f'user_done:{uid}'))}, "
+                 f"пропущено {to_int(await redis_cmd('SCARD', f'user_skip:{uid}'))}")
+    lines.append(f"LINKNI: выполнено {await redis_cmd('SMEMBERS', f'linkni_done:{uid}')}, "
+                 f"пропущено {await redis_cmd('SMEMBERS', f'linkni_skip:{uid}')}")
+    lines.append(f"FLYER: выполнено {to_int(await redis_cmd('SCARD', f'flyer_done:{uid}'))}, "
+                 f"пропущено {to_int(await redis_cmd('SCARD', f'flyer_skip:{uid}'))}")
+    payload = {"user_id": uid, "limit": FLYER_TASKS_LIMIT}
+    if message.from_user.language_code:
+        payload["language_code"] = message.from_user.language_code
+    data = await flyer_post("get_tasks", payload)
+    if not data:
+        lines.append("FLYER get_tasks: нет ответа")
+    elif data.get("error"):
+        lines.append(f"FLYER get_tasks ошибка: {data.get('error')}")
+    else:
+        for t in (data.get("result") or []):
+            if isinstance(t, dict):
+                lines.append(f"FLYER: {t.get('task')} | {t.get('status')} | {t.get('links')}")
+        if not data.get("result"):
+            lines.append("FLYER get_tasks: заданий для вас нет")
+    nxt = await pick_task(uid, False)
+    lines.append(f"Следующее админское: {nxt['id'] if nxt else 'нет'}")
+    lines.append(f"Следующее Linkni: {await pick_linkni_task(uid, False) or 'нет'}")
+    await message.answer("\n".join(lines)[:3900], **no_preview())
 
 
 # ================= ПРОФИЛЬ =================
