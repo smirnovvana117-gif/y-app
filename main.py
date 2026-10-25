@@ -91,11 +91,6 @@ INCOME_PER_SPONSOR = 1.0          # доход (руб) за одну подпи
 DEFAULT_REFERRAL_REWARD = 4.5     # награда за реферала по умолчанию
 FLYER_REWARD = 0.25               # награда за одно задание Flyer, ⭐
 FLYER_TASKS_LIMIT = 5             # сколько заданий Flyer закрепляется за пользователем (макс. 10)
-LINKNI_CODE = os.environ.get("LINKNI_CODE", "39rwc")   # ваш sell code в Linkni
-LINKNI_APP_LINK = f"https://telegram.me/linknibot/app?startapp=x_{LINKNI_CODE}"
-LINKNI_API_URL = "https://go.linkni.me/api/subscriptions"
-LINKNI_TASKS_COUNT = 4            # сколько заданий Linkni доступно каждому пользователю
-LINKNI_REWARD = 0.125             # награда за одно задание Linkni, ⭐
 MIN_SPONSORS_FOR_REWARD = 4       # минимум спонсоров (3 из сервисов + наш канал), чтобы пригласивший получил награду
 FSM_TTL = 7 * 24 * 3600           # сколько хранить состояние диалога
 
@@ -1026,7 +1021,6 @@ async def resetme_handler(message: Message, state: FSMContext) -> None:
     await redis_cmd("SREM", "passed_users", uid)
     await redis_cmd("DEL", f"sp_total:{uid}")
     await redis_cmd("DEL", f"sp_active:{uid}")
-    await redis_cmd("DEL", f"linkni_done:{uid}", f"linkni_skip:{uid}")
     await redis_cmd("DEL", f"flyer_done:{uid}", f"flyer_skip:{uid}", f"flyer_cur:{uid}")
     await redis_cmd("DEL", f"pending_ref:{uid}")
     await redis_cmd("DEL", f"verify:{uid}")
@@ -1058,7 +1052,6 @@ async def woot_handler(message: Message, state: FSMContext) -> None:
         "DEL", user_key(uid), f"refs:{uid}", f"refby:{uid}", f"pending_ref:{uid}",
         f"sp_total:{uid}", f"sp_active:{uid}", f"watch:{uid}", f"penalized:{uid}",
         f"user_done:{uid}", f"user_skip:{uid}", f"wd:{uid}", f"verify_pending:{uid}",
-        f"linkni_done:{uid}", f"linkni_skip:{uid}",
         f"flyer_done:{uid}", f"flyer_skip:{uid}", f"flyer_cur:{uid}",
     ])
     cmds += [
@@ -1561,7 +1554,7 @@ NO_TASKS_TEXT = "Сейчас нет доступных заданий"
 
 
 async def show_task(callback: CallbackQuery, repeat: bool = True) -> bool:
-    """Источники по порядку: задания админа -> Flyer -> Linkni.
+    """Источники по порядку: задания админа -> Flyer.
     Сначала ищем непропущенное задание в любом источнике (так «пропустить» реально переходит к другому),
     и только если всё пропущено — показываем пропущенные заново."""
     uid = callback.from_user.id
@@ -1577,11 +1570,6 @@ async def show_task(callback: CallbackQuery, repeat: bool = True) -> bool:
                 return True
         except Exception as e:
             print(f"[tasks] flyer source error: {e!r}")
-        try:
-            if await show_linkni_task(callback, reset):
-                return True
-        except Exception as e:
-            print(f"[tasks] linkni source error: {e!r}")
     await replace_message(callback, NO_TASKS_TEXT, back_markup("back_to_main"))
     return False
 
@@ -1689,10 +1677,10 @@ async def skip_task_handler(callback: CallbackQuery) -> None:
 # ================= НОМЕР ЗАДАНИЯ =================
 async def task_number(uid: int) -> int:
     """Порядковый номер задания для пользователя: сколько он уже выполнил + 1.
-    Считаются задания админа, Flyer и Linkni, поэтому нумерация идёт подряд (№1, №2, №3...),
+    Считаются задания админа и Flyer, поэтому нумерация идёт подряд (№1, №2, №3...),
     а новое задание после выполненных получает следующий номер."""
     done = 0
-    for key in (f"user_done:{uid}", f"flyer_done:{uid}", f"linkni_done:{uid}"):
+    for key in (f"user_done:{uid}", f"flyer_done:{uid}"):
         done += to_int(await redis_cmd("SCARD", key))
     return done + 1
 
@@ -1862,133 +1850,6 @@ async def flyer_skip_handler(callback: CallbackQuery) -> None:
     await safe_answer(callback, "⏭ Задание пропущено")
 
 
-# ================= ЗАДАНИЯ LINKNI =================
-# Каждое задание — отдельная ссылка на мини-апп Linkni с уникальным sub code (u<id>t<номер>).
-# Подписку проверяем через API Linkni: GET /api/subscriptions?code=...&user_id=...&sub_code=...
-def linkni_sub_code(uid: int, n: int) -> str:
-    return f"u{uid}t{n}"
-
-
-def linkni_link(uid: int, n: int) -> str:
-    return f"{LINKNI_APP_LINK}_{linkni_sub_code(uid, n)}"
-
-
-async def linkni_is_subscribed(uid: int, n: int) -> Optional[bool]:
-    """True — Linkni подтвердил подписку, False — нет, None — не удалось проверить."""
-    sub_code = linkni_sub_code(uid, n)
-    params = {"code": LINKNI_CODE, "user_id": uid, "sub_code": sub_code}
-    try:
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as session:
-            async with session.get(LINKNI_API_URL, params=params) as resp:
-                body = await resp.text()
-                print(f"[linkni] HTTP {resp.status}: {body[:500]}")
-                if resp.status != 200:
-                    return None
-                data = json.loads(body)
-    except Exception as e:
-        print(f"[linkni] ОШИБКА ЗАПРОСА: {e!r}")
-        return None
-    if not isinstance(data, list):
-        return None
-    return any(
-        isinstance(row, dict)
-        and str(row.get("user_id")) == str(uid)
-        and row.get("sub_code") == sub_code
-        and row.get("status") == "subscribed"
-        for row in data
-    )
-
-
-async def pick_linkni_task(uid: int, reset: bool = True) -> Optional[int]:
-    """Номер первого задания Linkni, которое пользователь ещё не выполнял и не пропускал."""
-    done = {to_int(x) for x in (await redis_cmd("SMEMBERS", f"linkni_done:{uid}") or [])}
-    candidates = [n for n in range(1, LINKNI_TASKS_COUNT + 1) if n not in done]
-    if not candidates:
-        return None
-    skipped = {to_int(x) for x in (await redis_cmd("SMEMBERS", f"linkni_skip:{uid}") or [])}
-    fresh = [n for n in candidates if n not in skipped]
-    if not fresh:
-        if not reset:
-            return None
-        await redis_cmd("DEL", f"linkni_skip:{uid}")
-        fresh = candidates
-    return fresh[0]
-
-
-async def show_linkni_task(callback: CallbackQuery, reset: bool = True) -> bool:
-    """Показывает следующее задание Linkni. False — заданий не осталось."""
-    uid = callback.from_user.id
-    n = await pick_linkni_task(uid, reset)
-    if n is None:
-        return False
-    number = await task_number(uid)
-    text = (
-        f"<b>🎯 Задание №{number}</b>\n\n"
-        f"<b>• Подпишитесь на канал</b>\n"
-        f"<b>• Награда: {LINKNI_REWARD:g}⭐️</b>"
-    )
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Выполнить", url=linkni_link(uid, n))],
-            [InlineKeyboardButton(text="пропустить задание", callback_data=f"lk_skip_{n}")],
-            [InlineKeyboardButton(text="✅ Я выполнил", callback_data=f"lk_done_{n}")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
-        ]
-    )
-    if not await replace_message(callback, text, markup, parse_mode="HTML", disable_preview=True):
-        await redis_cmd("SADD", f"linkni_skip:{uid}", n)
-        return False
-    return True
-
-
-@router.callback_query(F.data.startswith("lk_done_"))
-async def linkni_done_handler(callback: CallbackQuery) -> None:
-    n = to_int(callback.data.split("_")[2])
-    user_id = callback.from_user.id
-    if not 1 <= n <= LINKNI_TASKS_COUNT:
-        await safe_answer(callback, "Задание не найдено.")
-        return
-    await ensure_user(callback.from_user)
-
-    if to_int(await redis_cmd("SISMEMBER", f"linkni_done:{user_id}", n)):
-        await safe_answer(callback, "Вы уже выполнили это задание!")
-        return
-
-    subscribed = await linkni_is_subscribed(user_id, n)
-    if subscribed is None:
-        await safe_answer(callback, "⚠️ Не удалось проверить подписку. Попробуйте чуть позже.", show_alert=True)
-        return
-    if not subscribed:
-        await safe_answer(callback, "вы не подписались на канал ❗", show_alert=True)
-        return
-
-    # SADD атомарно: награда выдаётся только один раз за задание
-    if to_int(await redis_cmd("SADD", f"linkni_done:{user_id}", n)) == 0:
-        await safe_answer(callback, "Вы уже выполнили это задание!")
-        return
-    await add_balance(user_id, LINKNI_REWARD)
-
-    await safe_answer(callback)
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="следующее задание", callback_data="menu_task")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
-        ]
-    )
-    await replace_message(callback, f"✅ На ваш баланс было зачислено {LINKNI_REWARD:g}⭐", markup)
-
-
-@router.callback_query(F.data.startswith("lk_skip_"))
-async def linkni_skip_handler(callback: CallbackQuery) -> None:
-    n = to_int(callback.data.split("_")[2])
-    user_id = callback.from_user.id
-    await redis_cmd("SADD", f"linkni_skip:{user_id}", n)
-    await redis_cmd("EXPIRE", f"linkni_skip:{user_id}", 86400)
-    # если других заданий нет, show_task сам заменит сообщение на «Сейчас нет доступных заданий»
-    await show_task(callback, repeat=False)
-    await safe_answer(callback, "⏭ Задание пропущено")
-
-
 @router.message(Command("taskdiag"))
 async def taskdiag_handler(message: Message) -> None:
     """Для админов: откуда берутся задания и что у вас выполнено/пропущено."""
@@ -1999,8 +1860,6 @@ async def taskdiag_handler(message: Message) -> None:
     lines = ["🔧 ЗАДАНИЯ", ""]
     lines.append(f"АДМИН: всего {len(tasks)}, выполнено {to_int(await redis_cmd('SCARD', f'user_done:{uid}'))}, "
                  f"пропущено {to_int(await redis_cmd('SCARD', f'user_skip:{uid}'))}")
-    lines.append(f"LINKNI: выполнено {await redis_cmd('SMEMBERS', f'linkni_done:{uid}')}, "
-                 f"пропущено {await redis_cmd('SMEMBERS', f'linkni_skip:{uid}')}")
     lines.append(f"FLYER: выполнено {to_int(await redis_cmd('SCARD', f'flyer_done:{uid}'))}, "
                  f"пропущено {to_int(await redis_cmd('SCARD', f'flyer_skip:{uid}'))}")
     payload = {"user_id": uid, "limit": FLYER_TASKS_LIMIT}
@@ -2019,7 +1878,6 @@ async def taskdiag_handler(message: Message) -> None:
             lines.append("FLYER get_tasks: заданий для вас нет")
     nxt = await pick_task(uid, False)
     lines.append(f"Следующее админское: {nxt['id'] if nxt else 'нет'}")
-    lines.append(f"Следующее Linkni: {await pick_linkni_task(uid, False) or 'нет'}")
     await message.answer("\n".join(lines)[:3900], **no_preview())
 
 
