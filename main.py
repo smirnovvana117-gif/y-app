@@ -5,6 +5,7 @@ import json
 import os
 import re
 import time
+from urllib.parse import quote
 from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -20,6 +21,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
     ChatMemberUpdated,
+    CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -91,7 +93,7 @@ WITHDRAW_PHOTO_URL = "https://i.postimg.cc/RVdQKYYf/6219881422739149362.jpg"
 TARGET_COUNT = 6                  # всего кнопок: 5 спонсоров из сервисов + наш канал
 EXTERNAL_LIMIT = 5                # максимум спонсоров из сервисов
 INCOME_PER_SPONSOR = 1.0          # доход (руб) за одну подписку на спонсора
-DEFAULT_REFERRAL_REWARD = 4.5     # награда за реферала по умолчанию
+DEFAULT_REFERRAL_REWARD = 4.0     # награда за реферала по умолчанию
 FLOWLY_REWARD = 0.25              # награда за одно задание Flowly, ⭐
 FLOWLY_OFFERS_LIMIT = 5           # сколько заданий запрашивать у Flowly
 FLYER_REWARD = 0.25               # награда за одно задание Flyer, ⭐
@@ -900,8 +902,8 @@ async def start_handler(message: Message, command: CommandObject, state: FSMCont
                     ref_msg = (
                         f"реферал: {username_str}\n"
                         f"доход: 0.00 ⭐\n"
-                        f"как только реферал подпишется на спонсоров, вы получите "
-                        f"{reward}⭐"
+                        f"как только реферал выполнит 7 заданий, вы получите "
+                        f"{reward:g}⭐️"
                     )
                     try:
                         await message.bot.send_message(chat_id=referrer_id, text=ref_msg)
@@ -910,7 +912,156 @@ async def start_handler(message: Message, command: CommandObject, state: FSMCont
         except ValueError:
             pass
 
-    await show_sponsors(message)
+    await send_referral_welcome(message)
+    await send_start_task(message)
+
+
+
+# ================= ПЕРВОЕ СООБЩЕНИЕ: РЕФЕРАЛЬНАЯ ССЫЛКА =================
+async def send_referral_welcome(message: Message) -> None:
+    user = await ensure_user(message.from_user)
+    bot_info = await message.bot.get_me()
+    referral_link = f"https://t.me/{bot_info.username}?start=ref_{message.from_user.id}"
+    reward = await get_referral_reward()
+    share_url = (
+        "https://t.me/share/url?url=" + quote(referral_link, safe="")
+        + "&text=" + quote("Присоединяйся и зарабатывай ⭐️", safe="")
+    )
+    text = (
+        f"Получай +{reward:g} ⭐️ за каждого приглашённого друга!\n"
+        f"🔗 Твоя реферальная ссылка:\n{html.escape(referral_link)}\n\n"
+        "🔗 Приглашай по этой ссылке своих друзей, отправляй её во все чаты и зарабатывай Звёзды!\n"
+        f"Приглашено тобой: {user['referrals']} 👤\n\n"
+        "❤️ Как это работает:\n"
+        "╠ Отправь свою ссылку другу\n"
+        "╠ Друг заходит и выполняет 7 заданий\n"
+        f"╚ Ты получаешь {reward:g}⭐️ после 7 выполненных заданий!"
+    )
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Скопировать ссылку", copy_text=CopyTextButton(text=referral_link))],
+        [InlineKeyboardButton(text="📨 Отправить другу", url=share_url)],
+    ])
+    await message.answer(text, reply_markup=markup, disable_web_page_preview=True)
+
+
+def task_action_label(task_type: str, link: str = "") -> str:
+    kind = (task_type or "").lower()
+    if kind == "bot" or "/start" in link or "t.me/" in link and "bot" in link.lower():
+        return "Запусти бота"
+    return "Подпишись на"
+
+
+def task_message_text(number: int, link: str, reward: float, task_type: str = "channel") -> str:
+    safe_link = html.escape(link, quote=True)
+    kind = (task_type or "").lower()
+    if kind == "bot" or "/start" in link:
+        action = f"🟢 Запусти <a href=\"{safe_link}\">бота</a> и нажми «Подтвердить»"
+    else:
+        action = f"🟢 Подпишись на <a href=\"{safe_link}\">канал</a> и нажми «Подтвердить»"
+    return (
+        "💡 Получай Звёзды за простые задания! 👇\n"
+        f"{action}\n"
+        f"Вознаграждение: +{reward:g}⭐️"
+    )
+
+
+def task_keyboard(go_url: str, confirm_data: str, skip_data: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔎 Перейти", url=go_url),
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data=confirm_data),
+        ],
+        [InlineKeyboardButton(text="⏭️ Пропустить", callback_data=skip_data)],
+    ])
+
+
+async def send_start_task(message: Message) -> None:
+    """Показывает задание сразу после приветствия, без обязательной подписки на спонсоров."""
+    user = message.from_user
+    uid = user.id
+
+    # Сначала задания, созданные администратором.
+    task = await pick_task(uid, reset=True)
+    if task:
+        link = str(task.get("link") or "")
+        reward = to_float(task.get("reward"), 0.25)
+        text = task_message_text(await task_number(uid), link, reward, "channel")
+        await message.answer(
+            text,
+            reply_markup=task_keyboard(link, f"done_task_{task['id']}", f"skip_task_{task['id']}"),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        return
+
+    # Затем Flyer, если интеграция вернула задание.
+    try:
+        flyer_task = await pick_flyer_task(user, reset=True)
+        if flyer_task:
+            link = flyer_button_url(flyer_task["links"][0])
+            if link:
+                signature = str(flyer_task["signature"])
+                await redis_cmd("SET", f"flyer_cur:{uid}", signature, "EX", 86400)
+                raw_type = str(flyer_task.get("task") or "channel").lower()
+                task_type = "bot" if "bot" in raw_type else "channel"
+                text = task_message_text(await task_number(uid), link, FLYER_REWARD, task_type)
+                await message.answer(
+                    text, reply_markup=task_keyboard(link, "fl_done", "fl_skip"),
+                    parse_mode="HTML", disable_web_page_preview=True,
+                )
+                return
+    except Exception as e:
+        print(f"[tasks] start Flyer error: {e!r}")
+
+    # Затем Flowly.
+    try:
+        offer = await pick_flowly_task(user, reset=True)
+        if offer:
+            link = flyer_button_url(offer.get("link"))
+            if link:
+                offer_id = str(offer["offer_id"])
+                await redis_cmd("SET", f"flowly_cur:{uid}", offer_id, "EX", 86400)
+                task_type = str(offer.get("type") or "channel").lower()
+                text = task_message_text(await task_number(uid), link, FLOWLY_REWARD, task_type)
+                await message.answer(
+                    text, reply_markup=task_keyboard(link, "flw_done", "flw_skip"),
+                    parse_mode="HTML", disable_web_page_preview=True,
+                )
+                return
+    except Exception as e:
+        print(f"[tasks] start Flowly error: {e!r}")
+
+    await message.answer("💡 Сейчас нет доступных заданий. Попробуй немного позже.")
+
+
+async def maybe_reward_referrer_after_tasks(bot: Bot, uid: int) -> None:
+    """Начисляет награду пригласившему один раз, когда реферал выполнил 7 заданий."""
+    done_keys = (f"user_done:{uid}", f"flyer_done:{uid}", f"flowly_done:{uid}")
+    counts = await asyncio.gather(*(redis_cmd("SCARD", key) for key in done_keys))
+    if sum(to_int(v) for v in counts) < 7:
+        return
+    raw = await redis_cmd("GETDEL", f"pending_ref:{uid}")
+    if raw is None:
+        return
+    try:
+        ref_id = int(raw)
+    except (TypeError, ValueError):
+        return
+    if ref_id == uid:
+        return
+    ref = await ensure_user_by_id(ref_id)
+    reward = await get_referral_reward()
+    await redis_cmd("SADD", f"refs:{ref_id}", uid)
+    await redis_cmd("HINCRBY", user_key(ref_id), "referrals", 1)
+    total = await add_balance(ref_id, reward)
+    await add_referral_to_top(ref_id, ref.get("name") or f"id{ref_id}")
+    try:
+        await bot.send_message(
+            chat_id=ref_id,
+            text=f"🎉 Твой друг выполнил 7 заданий! Начислено {reward:g}⭐️\nБаланс: {to_float(total):g}⭐️",
+        )
+    except Exception:
+        pass
 
 
 # ================= /debug (только админ) =================
@@ -1601,19 +1752,8 @@ async def send_admin_task(callback: CallbackQuery, task: dict) -> bool:
     link = html.escape(str(task["link"]))
     reward = html.escape(str(task["reward"]))
     number = await task_number(callback.from_user.id)
-    text = (
-        f"<b>🎯 Задание №{number}</b>\n\n"
-        f"<b>• Подпишитесь на канал —> {link}</b>\n"
-        f"<b>• Награда: {reward}⭐️</b>"
-    )
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Выполнить", url=task["link"])],
-            [InlineKeyboardButton(text="пропустить задание", callback_data=f"skip_task_{task_id}")],
-            [InlineKeyboardButton(text="✅ Я выполнил", callback_data=f"done_task_{task_id}")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
-        ]
-    )
+    text = task_message_text(number, str(task["link"]), to_float(task["reward"]), "channel")
+    markup = task_keyboard(str(task["link"]), f"done_task_{task_id}", f"skip_task_{task_id}")
     return await replace_message(callback, text, markup, parse_mode="HTML", disable_preview=True)
 
 
@@ -1665,6 +1805,7 @@ async def done_task_handler(callback: CallbackQuery) -> None:
         return
 
     await add_balance(user_id, to_float(task["reward"]))
+    await maybe_reward_referrer_after_tasks(callback.bot, user_id)
 
     count = to_int(await redis_cmd("INCR", f"task_cnt:{task_id}"))
     if count >= to_int(task.get("max_completions"), 1):
@@ -1795,19 +1936,10 @@ async def show_flyer_task(callback: CallbackQuery, reset: bool = True) -> bool:
     await redis_cmd("SET", f"flyer_cur:{user.id}", str(task["signature"]), "EX", 86400)
     action = FLYER_TASK_TEXT.get(task.get("task"), "Выполните задание")
     number = await task_number(user.id)
-    text = (
-        f"<b>🎯 Задание №{number}</b>\n\n"
-        f"<b>• {action}</b>\n"
-        f"<b>• Награда: {FLYER_REWARD:g}⭐️</b>"
-    )
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Выполнить", url=link)],
-            [InlineKeyboardButton(text="пропустить задание", callback_data="fl_skip")],
-            [InlineKeyboardButton(text="✅ Я выполнил", callback_data="fl_done")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
-        ]
-    )
+    raw_type = str(task.get("task") or "channel").lower()
+    task_type = "bot" if "bot" in raw_type else "channel"
+    text = task_message_text(number, link, FLYER_REWARD, task_type)
+    markup = task_keyboard(link, "fl_done", "fl_skip")
     if not await replace_message(callback, text, markup, parse_mode="HTML", disable_preview=True):
         # Telegram не принял сообщение — не зацикливаемся на нём, переходим к следующему
         await redis_cmd("SADD", f"flyer_skip:{user.id}", str(task["signature"]))
@@ -1851,6 +1983,7 @@ async def flyer_done_handler(callback: CallbackQuery) -> None:
         return
     await redis_cmd("DEL", f"flyer_cur:{user_id}")
     await add_balance(user_id, FLYER_REWARD)
+    await maybe_reward_referrer_after_tasks(callback.bot, user_id)
 
     await safe_answer(callback)
     markup = InlineKeyboardMarkup(
@@ -1941,19 +2074,10 @@ async def show_flowly_task(callback: CallbackQuery, reset: bool = True) -> bool:
     await redis_cmd("SET", f"flowly_cur:{user.id}", offer_id, "EX", 86400)
     action = FLOWLY_TASK_TEXT.get(offer.get("type"), "Выполните задание")
     number = await task_number(user.id)
-    text = (
-        f"<b>🎯 Задание №{number}</b>\n\n"
-        f"<b>• {action}</b>\n"
-        f"<b>• Награда: {FLOWLY_REWARD:g}⭐️</b>"
-    )
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Выполнить", url=flyer_button_url(offer["link"]))],
-            [InlineKeyboardButton(text="пропустить задание", callback_data="flw_skip")],
-            [InlineKeyboardButton(text="✅ Я выполнил", callback_data="flw_done")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
-        ]
-    )
+    link = flyer_button_url(offer["link"])
+    task_type = str(offer.get("type") or "channel").lower()
+    text = task_message_text(number, link, FLOWLY_REWARD, task_type)
+    markup = task_keyboard(link, "flw_done", "flw_skip")
     if not await replace_message(callback, text, markup, parse_mode="HTML", disable_preview=True):
         await redis_cmd("SADD", f"flowly_skip:{user.id}", offer_id)
         return False
@@ -1995,6 +2119,7 @@ async def flowly_done_handler(callback: CallbackQuery) -> None:
         return
     await redis_cmd("DEL", f"flowly_cur:{user_id}")
     await add_balance(user_id, FLOWLY_REWARD)
+    await maybe_reward_referrer_after_tasks(callback.bot, user_id)
 
     await safe_answer(callback)
     markup = InlineKeyboardMarkup(
@@ -2087,14 +2212,24 @@ async def referrals_handler(callback: CallbackQuery, state: FSMContext) -> None:
     user_id = callback.from_user.id
     referral_link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
     reward = await get_referral_reward()
-
+    user_data = await ensure_user(callback.from_user)
+    share_url = "https://t.me/share/url?url=" + quote(referral_link, safe="") + "&text=" + quote("Присоединяйся и зарабатывай ⭐️", safe="")
     text = (
-        f"За каждого друга, который перейдет по твоей ссылке, ты получаешь +{reward}⭐️!\n\n"
-        f"🔗 Твоя реферальная ссылка:\n"
-        f"{referral_link}\n\n"
-        f"🎉 Приглашай по этой ссылке своих друзей, отправляй её во все чаты и зарабатывай Звёзды!"
+        f"Получай +{reward:g} ⭐️ за каждого приглашённого друга!\n"
+        f"🔗 Твоя реферальная ссылка:\n{html.escape(referral_link)}\n\n"
+        "🔗 Приглашай по этой ссылке своих друзей, отправляй её во все чаты и зарабатывай Звёзды!\n"
+        f"Приглашено тобой: {user_data['referrals']} 👤\n\n"
+        "❤️ Как это работает:\n"
+        "╠ Отправь свою ссылку другу\n"
+        "╠ Друг заходит и выполняет 7 заданий\n"
+        f"╚ Ты получаешь {reward:g}⭐️ после 7 выполненных заданий!"
     )
-    await replace_with_photo(callback, REFERRAL_PHOTO_URL, text, back_markup("back_to_main"))
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Скопировать ссылку", copy_text=CopyTextButton(text=referral_link))],
+        [InlineKeyboardButton(text="📨 Отправить другу", url=share_url)],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
+    ])
+    await replace_message(callback, text, markup, disable_preview=True)
 
 
 # ================= ТОП =================
