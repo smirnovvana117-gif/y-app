@@ -58,6 +58,8 @@ TRAFSLY_API_URL = "https://api.trafsly.com"
 TGRASS_API_URL = "https://tgrass.space"
 TRAFFY_API_URL = "https://api.traffy.ai/publisher"
 FLYER_API_URL = "https://api.flyerhubs.com"
+FLOWLY_API_KEY = os.environ.get("FLOWLY_API_KEY", "b3216391cd5b1dd7d43802d3555ef78a")
+FLOWLY_API_URL = "https://flowly.guru/api/v1"
 
 PLACEHOLDER_MARK = "ВСТАВЬТЕ_КЛЮЧ"
 
@@ -73,6 +75,7 @@ for _name, _val in (
     ("TRAFSLY_API_KEY", TRAFSLY_API_KEY),
     ("TRAFFY_API_KEY", TRAFFY_API_KEY),
     ("FLYER_API_KEY", FLYER_API_KEY),
+    ("FLOWLY_API_KEY", FLOWLY_API_KEY),
     ("UPSTASH_REDIS_REST_URL", UPSTASH_URL),
     ("UPSTASH_REDIS_REST_TOKEN", UPSTASH_TOKEN),
 ):
@@ -89,8 +92,8 @@ TARGET_COUNT = 6                  # всего кнопок: 5 спонсоро�
 EXTERNAL_LIMIT = 5                # максимум спонсоров из сервисов
 INCOME_PER_SPONSOR = 1.0          # доход (руб) за одну подписку на спонсора
 DEFAULT_REFERRAL_REWARD = 4.5     # награда за реферала по умолчанию
-FLYER_WEB_LINK = os.environ.get("FLYER_WEB_LINK", "https://telegram.me/FlyWebTasksBot/app?startapp=fcgSSJn")  # мини-апп Flyer с заданиями
-FLYER_WEB_API_KEY = os.environ.get("FLYER_WEB_API_KEY", "FL-nGAjQk-nOelIf-bEWMOK-nMCYTI")  # ключ Flyer мини-аппа (webapp)
+FLOWLY_REWARD = 0.25              # награда за одно задание Flowly, ⭐
+FLOWLY_OFFERS_LIMIT = 5           # сколько заданий запрашивать у Flowly
 FLYER_REWARD = 0.25               # награда за одно задание Flyer, ⭐
 FLYER_TASKS_LIMIT = 5             # сколько заданий Flyer закрепляется за пользователем (макс. 10)
 MIN_SPONSORS_FOR_REWARD = 4       # минимум спонсоров (3 из сервисов + наш канал), чтобы пригласивший получил награду
@@ -939,6 +942,7 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
         f"PIARFLOW_API_KEY: {key_status(PIARFLOW_API_KEY)}",
         f"TRAFSLY_API_KEY: {key_status(TRAFSLY_API_KEY)}",
         f"TRAFFY_API_KEY: {key_status(TRAFFY_API_KEY)}",
+        f"FLOWLY_API_KEY: {key_status(FLOWLY_API_KEY)}",
         f"FLYER_API_KEY: {key_status(FLYER_API_KEY)} | "
         f"{FLYER_API_KEY[:5]}…{FLYER_API_KEY[-4:]} | "
         f"источник: {'переменная окружения Vercel' if os.environ.get('FLYER_API_KEY') else 'значение по умолчанию из кода'}",
@@ -999,14 +1003,13 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
             fl_payload["language_code"] = user.language_code
         lines.append(f"FLYER get_tasks → {await flyer_post('get_tasks', fl_payload)}\n")
 
-        # Flyer мини-апп (ключ webapp)
-        web_src = "переменная окружения Vercel" if os.environ.get("FLYER_WEB_API_KEY") else "значение по умолчанию из кода"
-        lines.append(
-            f"FLYER WEB ключ: {FLYER_WEB_API_KEY[:5]}…{FLYER_WEB_API_KEY[-4:]} | источник: {web_src}\n"
-            f"FLYER WEB get_me → {await flyer_post('get_me', {}, key=FLYER_WEB_API_KEY or None)}\n"
-            f"FLYER WEB get_completed_tasks → "
-            f"{await flyer_post('get_completed_tasks', {'user_id': user_id}, key=FLYER_WEB_API_KEY or None)}\n"
+        st, _, body = await api_post(
+            session, "flowly", f"{FLOWLY_API_URL}/offers",
+            {"tg_user_id": user_id, "lang": user.language_code or "ru",
+             "is_premium": bool(user.is_premium), "offers_limit": 3},
+            {"Auth": FLOWLY_API_KEY, "Content-Type": "application/json"},
         )
+        lines.append(f"FLOWLY → HTTP {st}\n{body[:500]}\n")
 
 
     try:
@@ -1035,6 +1038,7 @@ async def resetme_handler(message: Message, state: FSMContext) -> None:
     await redis_cmd("DEL", f"sp_total:{uid}")
     await redis_cmd("DEL", f"sp_active:{uid}")
     await redis_cmd("DEL", f"flyer_done:{uid}", f"flyer_skip:{uid}", f"flyer_cur:{uid}", f"flyer_dead:{uid}")
+    await redis_cmd("DEL", f"flowly_done:{uid}", f"flowly_skip:{uid}", f"flowly_cur:{uid}", f"flowly_dead:{uid}")
     await redis_cmd("DEL", f"pending_ref:{uid}")
     await redis_cmd("DEL", f"verify:{uid}")
     await redis_cmd("DEL", f"verify_pending:{uid}")
@@ -1066,6 +1070,7 @@ async def woot_handler(message: Message, state: FSMContext) -> None:
         f"sp_total:{uid}", f"sp_active:{uid}", f"watch:{uid}", f"penalized:{uid}",
         f"user_done:{uid}", f"user_skip:{uid}", f"wd:{uid}", f"verify_pending:{uid}",
         f"flyer_done:{uid}", f"flyer_skip:{uid}", f"flyer_cur:{uid}", f"flyer_dead:{uid}",
+        f"flowly_done:{uid}", f"flowly_skip:{uid}", f"flowly_cur:{uid}", f"flowly_dead:{uid}",
     ])
     cmds += [
         ["SREM", "users", uid],
@@ -1567,7 +1572,7 @@ NO_TASKS_TEXT = "Сейчас нет доступных заданий"
 
 
 async def show_task(callback: CallbackQuery, repeat: bool = True) -> bool:
-    """Источники по порядку: задания админа -> Flyer (API) -> Flyer (мини-апп).
+    """Источники по порядку: задания админа -> Flyer -> Flowly.
     Сначала ищем непропущенное задание в любом источнике (так «пропустить» реально переходит к другому),
     и только если всё пропущено — показываем пропущенные заново."""
     uid = callback.from_user.id
@@ -1584,10 +1589,10 @@ async def show_task(callback: CallbackQuery, repeat: bool = True) -> bool:
         except Exception as e:
             print(f"[tasks] flyer source error: {e!r}")
         try:
-            if await show_flyer_web_task(callback):
+            if await show_flowly_task(callback, reset):
                 return True
         except Exception as e:
-            print(f"[tasks] flyer web source error: {e!r}")
+            print(f"[tasks] flowly source error: {e!r}")
     text = NO_TASKS_TEXT
     await replace_message(callback, text, back_markup("back_to_main"))
     return False
@@ -1696,10 +1701,10 @@ async def skip_task_handler(callback: CallbackQuery) -> None:
 # ================= НОМЕР ЗАДАНИЯ =================
 async def task_number(uid: int) -> int:
     """Порядковый номер задания для пользователя: сколько он уже выполнил + 1.
-    Считаются задания админа и Flyer, поэтому нумерация идёт подряд (№1, №2, №3...),
+    Считаются задания админа, Flyer и Flowly, поэтому нумерация идёт подряд (№1, №2, №3...),
     а новое задание после выполненных получает следующий номер."""
     done = 0
-    for key in (f"user_done:{uid}", f"flyer_done:{uid}"):
+    for key in (f"user_done:{uid}", f"flyer_done:{uid}", f"flowly_done:{uid}"):
         done += to_int(await redis_cmd("SCARD", key))
     return done + 1
 
@@ -1873,55 +1878,128 @@ async def flyer_skip_handler(callback: CallbackQuery) -> None:
     await safe_answer(callback, "⏭ Задание пропущено")
 
 
-# ---- Flyer: мини-апп с заданиями (запасной источник) ----
-# Пользователь выполняет задания в мини-апп Flyer, а мы по кнопке «Я выполнил» запрашиваем
-# POST /get_completed_tasks и начисляем FLYER_REWARD за каждое новое выполненное задание.
-async def show_flyer_web_task(callback: CallbackQuery) -> bool:
-    if not FLYER_WEB_LINK:
+# ================= ЗАДАНИЯ FLOWLY =================
+# API: POST /offers (получить задания), POST /check (проверить одно задание). Заголовок Auth: <ключ>.
+FLOWLY_TASK_TEXT = {
+    "channel": "Подпишитесь на канал",
+    "bot": "Запустите бота",
+    "resource": "Перейдите по ссылке",
+}
+
+
+async def flowly_post(path: str, payload: dict) -> Optional[dict]:
+    """POST к Flowly API. Возвращает JSON-словарь или None при сбое/не-200."""
+    headers = {"Auth": FLOWLY_API_KEY, "Content-Type": "application/json"}
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+        status, data, _ = await api_post(session, f"flowly{path}", f"{FLOWLY_API_URL}{path}", payload, headers)
+    if status != 200 or not isinstance(data, dict):
+        return None
+    return data
+
+
+async def pick_flowly_task(user, reset: bool = True) -> Optional[dict]:
+    """Первое задание Flowly, которое пользователь ещё не выполнял и не пропускал."""
+    if not key_filled(FLOWLY_API_KEY):
+        return None
+    data = await flowly_post("/offers", {
+        "tg_user_id": user.id,
+        "lang": user.language_code or "ru",
+        "is_premium": bool(getattr(user, "is_premium", False)),
+        "offers_limit": FLOWLY_OFFERS_LIMIT,
+    })
+    if not data or data.get("status") != "not_ok":
+        return None
+    offers = data.get("offers")
+    if not isinstance(offers, list):
+        return None
+
+    done = {str(x) for x in (await redis_cmd("SMEMBERS", f"flowly_done:{user.id}") or [])}
+    done |= {str(x) for x in (await redis_cmd("SMEMBERS", f"flowly_dead:{user.id}") or [])}
+    candidates = [
+        o for o in offers
+        if isinstance(o, dict)
+        and o.get("offer_id") is not None
+        and flyer_button_url(o.get("link"))
+        and not o.get("subscribed")
+        and str(o["offer_id"]) not in done
+    ]
+    if not candidates:
+        return None
+    skipped = {str(x) for x in (await redis_cmd("SMEMBERS", f"flowly_skip:{user.id}") or [])}
+    fresh = [o for o in candidates if str(o["offer_id"]) not in skipped]
+    if not fresh:
+        if not reset:
+            return None
+        await redis_cmd("DEL", f"flowly_skip:{user.id}")
+        fresh = candidates
+    return fresh[0]
+
+
+async def show_flowly_task(callback: CallbackQuery, reset: bool = True) -> bool:
+    """Показывает следующее задание Flowly. False — заданий нет."""
+    user = callback.from_user
+    offer = await pick_flowly_task(user, reset)
+    if not offer:
         return False
-    number = await task_number(callback.from_user.id)
+    offer_id = str(offer["offer_id"])
+    await redis_cmd("SET", f"flowly_cur:{user.id}", offer_id, "EX", 86400)
+    action = FLOWLY_TASK_TEXT.get(offer.get("type"), "Выполните задание")
+    number = await task_number(user.id)
     text = (
         f"<b>🎯 Задание №{number}</b>\n\n"
-        f"<b>• Подпишитесь на канал</b>\n"
-        f"<b>• Награда: {FLYER_REWARD:g}⭐️</b>"
+        f"<b>• {action}</b>\n"
+        f"<b>• Награда: {FLOWLY_REWARD:g}⭐️</b>"
     )
     markup = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Выполнить", url=FLYER_WEB_LINK)],
-            [InlineKeyboardButton(text="✅ Я выполнил", callback_data="fw_done")],
+            [InlineKeyboardButton(text="Выполнить", url=flyer_button_url(offer["link"]))],
+            [InlineKeyboardButton(text="пропустить задание", callback_data="flw_skip")],
+            [InlineKeyboardButton(text="✅ Я выполнил", callback_data="flw_done")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
         ]
     )
-    return await replace_message(callback, text, markup, parse_mode="HTML", disable_preview=True)
+    if not await replace_message(callback, text, markup, parse_mode="HTML", disable_preview=True):
+        await redis_cmd("SADD", f"flowly_skip:{user.id}", offer_id)
+        return False
+    return True
 
 
-@router.callback_query(F.data == "fw_done")
-async def flyer_web_done_handler(callback: CallbackQuery) -> None:
+@router.callback_query(F.data == "flw_done")
+async def flowly_done_handler(callback: CallbackQuery) -> None:
     user_id = callback.from_user.id
     await ensure_user(callback.from_user)
-    data = await flyer_post("get_completed_tasks", {"user_id": user_id}, key=FLYER_WEB_API_KEY or None)
-    result = data.get("result") if data and not data.get("error") else None
-    if not isinstance(result, dict):
-        print(f"[flyer-web] get_completed_tasks: {data}")
-        await safe_answer(callback, "⚠️ Не удалось проверить задание. Попробуйте чуть позже.", show_alert=True)
+    offer_id = await redis_cmd("GET", f"flowly_cur:{user_id}")
+    if not offer_id:
+        await safe_answer(callback, "Задание устарело. Откройте раздел заданий заново.", show_alert=True)
+        return
+    offer_id = str(offer_id)
+
+    if to_int(await redis_cmd("SISMEMBER", f"flowly_done:{user_id}", offer_id)):
+        await safe_answer(callback, "Вы уже выполнили это задание!")
         return
 
-    paid = 0
-    for t in result.get("completed_tasks") or []:
-        if not isinstance(t, dict):
-            continue
-        sig = str(t.get("signature") or "")
-        if not sig or t.get("status") not in ("complete", "waiting"):
-            continue
-        # SADD атомарно: за каждое задание награда выдаётся один раз
-        if to_int(await redis_cmd("SADD", f"flyer_done:{user_id}", sig)) == 1:
-            paid += 1
-    if not paid:
+    data = await flowly_post("/check", {"tg_user_id": user_id, "offer_id": to_int(offer_id)})
+    status = data.get("status") if data else None
+    if status is None:
+        await safe_answer(callback, "⚠️ Не удалось проверить задание. Попробуйте чуть позже.", show_alert=True)
+        return
+    if status == "offer_unavailable":
+        await redis_cmd("SADD", f"flowly_dead:{user_id}", offer_id)
+        await redis_cmd("EXPIRE", f"flowly_dead:{user_id}", 21600)
+        await safe_answer(callback, "Это задание больше не актуально, показываю другое.", show_alert=True)
+        await show_task(callback)
+        return
+    if status != "subscribed":
         await safe_answer(callback, "вы не выполнили задание ❗", show_alert=True)
         return
 
-    total = round(FLYER_REWARD * paid, 2)
-    await add_balance(user_id, total)
+    # SADD атомарно: награда выдаётся только один раз за задание
+    if to_int(await redis_cmd("SADD", f"flowly_done:{user_id}", offer_id)) == 0:
+        await safe_answer(callback, "Вы уже выполнили это задание!")
+        return
+    await redis_cmd("DEL", f"flowly_cur:{user_id}")
+    await add_balance(user_id, FLOWLY_REWARD)
+
     await safe_answer(callback)
     markup = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1929,7 +2007,19 @@ async def flyer_web_done_handler(callback: CallbackQuery) -> None:
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
         ]
     )
-    await replace_message(callback, f"✅ На ваш баланс было зачислено {total:g}⭐", markup)
+    await replace_message(callback, f"✅ На ваш баланс было зачислено {FLOWLY_REWARD:g}⭐", markup)
+
+
+@router.callback_query(F.data == "flw_skip")
+async def flowly_skip_handler(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    offer_id = await redis_cmd("GET", f"flowly_cur:{user_id}")
+    if offer_id:
+        await redis_cmd("SADD", f"flowly_skip:{user_id}", str(offer_id))
+        await redis_cmd("EXPIRE", f"flowly_skip:{user_id}", 86400)
+    # если других заданий нет, show_task сам заменит сообщение на «Сейчас нет доступных заданий»
+    await show_task(callback, repeat=False)
+    await safe_answer(callback, "⏭ Задание пропущено")
 
 
 @router.message(Command("taskdiag"))
@@ -1962,8 +2052,6 @@ async def taskdiag_handler(message: Message) -> None:
                 )
         if not data.get("result"):
             lines.append("FLYER get_tasks: заданий для вас нет")
-    web = await flyer_post("get_completed_tasks", {"user_id": uid}, key=FLYER_WEB_API_KEY or None)
-    lines.append(f"FLYER WEB get_completed_tasks: {web}")
     nxt = await pick_task(uid, False)
     lines.append(f"Следующее админское: {nxt['id'] if nxt else 'нет'}")
     await message.answer("\n".join(lines)[:3900], **no_preview())
