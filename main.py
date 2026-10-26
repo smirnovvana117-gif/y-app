@@ -89,6 +89,8 @@ TARGET_COUNT = 6                  # всего кнопок: 5 спонсоро�
 EXTERNAL_LIMIT = 5                # максимум спонсоров из сервисов
 INCOME_PER_SPONSOR = 1.0          # доход (руб) за одну подписку на спонсора
 DEFAULT_REFERRAL_REWARD = 4.5     # награда за реферала по умолчанию
+FLYER_WEB_LINK = os.environ.get("FLYER_WEB_LINK", "https://telegram.me/FlyWebTasksBot/app?startapp=fcgSSJn")  # мини-апп Flyer с заданиями
+FLYER_WEB_API_KEY = os.environ.get("FLYER_WEB_API_KEY", "FL-nGAjQk-nOelIf-bEWMOK-nMCYTI")  # ключ Flyer мини-аппа (webapp)
 FLYER_REWARD = 0.25               # награда за одно задание Flyer, ⭐
 FLYER_TASKS_LIMIT = 5             # сколько заданий Flyer закрепляется за пользователем (макс. 10)
 MIN_SPONSORS_FOR_REWARD = 4       # минимум спонсоров (3 из сервисов + наш канал), чтобы пригласивший получил награду
@@ -997,6 +999,15 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
             fl_payload["language_code"] = user.language_code
         lines.append(f"FLYER get_tasks → {await flyer_post('get_tasks', fl_payload)}\n")
 
+        # Flyer мини-апп (ключ webapp)
+        web_src = "переменная окружения Vercel" if os.environ.get("FLYER_WEB_API_KEY") else "значение по умолчанию из кода"
+        lines.append(
+            f"FLYER WEB ключ: {FLYER_WEB_API_KEY[:5]}…{FLYER_WEB_API_KEY[-4:]} | источник: {web_src}\n"
+            f"FLYER WEB get_me → {await flyer_post('get_me', {}, key=FLYER_WEB_API_KEY or None)}\n"
+            f"FLYER WEB get_completed_tasks → "
+            f"{await flyer_post('get_completed_tasks', {'user_id': user_id}, key=FLYER_WEB_API_KEY or None)}\n"
+        )
+
 
     try:
         me_bot = await message.bot.me()
@@ -1556,7 +1567,7 @@ NO_TASKS_TEXT = "Сейчас нет доступных заданий"
 
 
 async def show_task(callback: CallbackQuery, repeat: bool = True) -> bool:
-    """Источники по порядку: задания админа -> Flyer.
+    """Источники по порядку: задания админа -> Flyer (API) -> Flyer (мини-апп).
     Сначала ищем непропущенное задание в любом источнике (так «пропустить» реально переходит к другому),
     и только если всё пропущено — показываем пропущенные заново."""
     uid = callback.from_user.id
@@ -1572,6 +1583,11 @@ async def show_task(callback: CallbackQuery, repeat: bool = True) -> bool:
                 return True
         except Exception as e:
             print(f"[tasks] flyer source error: {e!r}")
+        try:
+            if await show_flyer_web_task(callback):
+                return True
+        except Exception as e:
+            print(f"[tasks] flyer web source error: {e!r}")
     text = NO_TASKS_TEXT
     await replace_message(callback, text, back_markup("back_to_main"))
     return False
@@ -1701,9 +1717,9 @@ FLYER_TASK_TEXT = {
 }
 
 
-async def flyer_post(method: str, payload: dict) -> Optional[dict]:
+async def flyer_post(method: str, payload: dict, key: Optional[str] = None) -> Optional[dict]:
     """POST к Flyer API. Возвращает JSON-словарь или None при сбое."""
-    body = {"key": FLYER_API_KEY, **payload}
+    body = {"key": key or FLYER_API_KEY, **payload}
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as session:
         _, data, _ = await api_post(
             session, f"flyer-{method}", f"{FLYER_API_URL}/{method}", body,
@@ -1857,6 +1873,65 @@ async def flyer_skip_handler(callback: CallbackQuery) -> None:
     await safe_answer(callback, "⏭ Задание пропущено")
 
 
+# ---- Flyer: мини-апп с заданиями (запасной источник) ----
+# Пользователь выполняет задания в мини-апп Flyer, а мы по кнопке «Я выполнил» запрашиваем
+# POST /get_completed_tasks и начисляем FLYER_REWARD за каждое новое выполненное задание.
+async def show_flyer_web_task(callback: CallbackQuery) -> bool:
+    if not FLYER_WEB_LINK:
+        return False
+    number = await task_number(callback.from_user.id)
+    text = (
+        f"<b>🎯 Задание №{number}</b>\n\n"
+        f"<b>• Подпишитесь на канал</b>\n"
+        f"<b>• Награда: {FLYER_REWARD:g}⭐️</b>"
+    )
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Выполнить", url=FLYER_WEB_LINK)],
+            [InlineKeyboardButton(text="✅ Я выполнил", callback_data="fw_done")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
+        ]
+    )
+    return await replace_message(callback, text, markup, parse_mode="HTML", disable_preview=True)
+
+
+@router.callback_query(F.data == "fw_done")
+async def flyer_web_done_handler(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id
+    await ensure_user(callback.from_user)
+    data = await flyer_post("get_completed_tasks", {"user_id": user_id}, key=FLYER_WEB_API_KEY or None)
+    result = data.get("result") if data and not data.get("error") else None
+    if not isinstance(result, dict):
+        print(f"[flyer-web] get_completed_tasks: {data}")
+        await safe_answer(callback, "⚠️ Не удалось проверить задание. Попробуйте чуть позже.", show_alert=True)
+        return
+
+    paid = 0
+    for t in result.get("completed_tasks") or []:
+        if not isinstance(t, dict):
+            continue
+        sig = str(t.get("signature") or "")
+        if not sig or t.get("status") not in ("complete", "waiting"):
+            continue
+        # SADD атомарно: за каждое задание награда выдаётся один раз
+        if to_int(await redis_cmd("SADD", f"flyer_done:{user_id}", sig)) == 1:
+            paid += 1
+    if not paid:
+        await safe_answer(callback, "вы не выполнили задание ❗", show_alert=True)
+        return
+
+    total = round(FLYER_REWARD * paid, 2)
+    await add_balance(user_id, total)
+    await safe_answer(callback)
+    markup = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="следующее задание", callback_data="menu_task")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
+        ]
+    )
+    await replace_message(callback, f"✅ На ваш баланс было зачислено {total:g}⭐", markup)
+
+
 @router.message(Command("taskdiag"))
 async def taskdiag_handler(message: Message) -> None:
     """Для админов: откуда берутся задания и что у вас выполнено/пропущено."""
@@ -1887,6 +1962,8 @@ async def taskdiag_handler(message: Message) -> None:
                 )
         if not data.get("result"):
             lines.append("FLYER get_tasks: заданий для вас нет")
+    web = await flyer_post("get_completed_tasks", {"user_id": uid}, key=FLYER_WEB_API_KEY or None)
+    lines.append(f"FLYER WEB get_completed_tasks: {web}")
     nxt = await pick_task(uid, False)
     lines.append(f"Следующее админское: {nxt['id'] if nxt else 'нет'}")
     await message.answer("\n".join(lines)[:3900], **no_preview())
