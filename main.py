@@ -95,7 +95,7 @@ DEFAULT_REFERRAL_REWARD = 4.5     # награда за реферала по у
 FLOWLY_REWARD = 0.25              # награда за одно задание Flowly, ⭐
 FLOWLY_OFFERS_LIMIT = 5           # сколько заданий запрашивать у Flowly
 FLYER_REWARD = 0.25               # награда за одно задание Flyer, ⭐
-FLYER_TASKS_LIMIT = 5             # сколько заданий Flyer закрепляется за пользователем (макс. 10)
+FLYER_TASKS_LIMIT = 10            # сколько заданий Flyer закрепляется за пользователем (макс. 10 по документации)
 MIN_SPONSORS_FOR_REWARD = 4       # минимум спонсоров (3 из сервисов + наш канал), чтобы пригласивший получил награду
 FSM_TTL = 7 * 24 * 3600           # сколько хранить состояние диалога
 
@@ -998,9 +998,7 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
         # Flyer: тип ключа (для заданий нужен «tasks») и пробный запрос заданий
         me_data = await flyer_post("get_me", {})
         lines.append(f"FLYER get_me → {me_data}\n")
-        fl_payload = {"user_id": user_id, "limit": 3}
-        if user.language_code:
-            fl_payload["language_code"] = user.language_code
+        fl_payload = {"user_id": user_id, "language_code": user.language_code or "ru", "limit": FLYER_TASKS_LIMIT}
         lines.append(f"FLYER get_tasks → {await flyer_post('get_tasks', fl_payload)}\n")
 
         st, _, body = await api_post(
@@ -1737,9 +1735,7 @@ async def pick_flyer_task(user, reset: bool = True) -> Optional[dict]:
     """Первое задание Flyer, которое пользователь ещё не выполнял и не пропускал."""
     if not key_filled(FLYER_API_KEY):
         return None
-    payload = {"user_id": user.id, "limit": FLYER_TASKS_LIMIT}
-    if user.language_code:
-        payload["language_code"] = user.language_code
+    payload = {"user_id": user.id, "language_code": user.language_code or "ru", "limit": FLYER_TASKS_LIMIT}
     data = await flyer_post("get_tasks", payload)
     if not data:
         return None
@@ -1757,7 +1753,7 @@ async def pick_flyer_task(user, reset: bool = True) -> Optional[dict]:
         if isinstance(t, dict)
         and t.get("signature")
         and t.get("links")
-        and t.get("status") not in ("unavailable", "abort")
+        and t.get("status") not in ("complete", "waiting", "unavailable")
         and str(t["signature"]) not in done
     ]
     if not candidates:
