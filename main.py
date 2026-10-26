@@ -937,7 +937,9 @@ async def debug_handler(message: Message, state: FSMContext) -> None:
         f"PIARFLOW_API_KEY: {key_status(PIARFLOW_API_KEY)}",
         f"TRAFSLY_API_KEY: {key_status(TRAFSLY_API_KEY)}",
         f"TRAFFY_API_KEY: {key_status(TRAFFY_API_KEY)}",
-        f"FLYER_API_KEY: {key_status(FLYER_API_KEY)}",
+        f"FLYER_API_KEY: {key_status(FLYER_API_KEY)} | "
+        f"{FLYER_API_KEY[:5]}…{FLYER_API_KEY[-4:]} | "
+        f"источник: {'переменная окружения Vercel' if os.environ.get('FLYER_API_KEY') else 'значение по умолчанию из кода'}",
         f"REDIS: {redis_line}",
         "",
     ]
