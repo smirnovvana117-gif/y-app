@@ -46,7 +46,7 @@ def key(name: str) -> str:
 
 
 BOT_TOKEN = key("BOT_TOKEN")
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "619112100").split(",") if x.strip()}
 WEBHOOK_SECRET = key("WEBHOOK_SECRET")
 CRON_SECRET = key("CRON_SECRET")
 WITHDRAW_CHANNEL = "@AvoReputation"
