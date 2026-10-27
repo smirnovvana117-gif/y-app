@@ -1,4 +1,3 @@
-flask
-aiogram>=3
+aiogram
 aiohttp
- 
+fastapi
