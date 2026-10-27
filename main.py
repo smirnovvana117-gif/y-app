@@ -1,3316 +1,2378 @@
+# -*- coding: utf-8 -*-
+"""
+Реферальный бот со звёздами — версия для Vercel (webhook + Turso/libSQL).
+Работает через api/index.py (FastAPI). Локально не запускается (нет polling).
+"""
 import asyncio
-import hmac
+import base64
+import time
 import html
 import json
+import logging
 import os
+import random
 import re
-import time
+import string
+from datetime import datetime, timedelta
 from urllib.parse import quote
-from contextvars import ContextVar
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
 
 import aiohttp
-from flask import Flask, request
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
-from aiogram.filters import Command, CommandStart, CommandObject
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.base import BaseStorage, StorageKey, StateType
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.base import BaseStorage
 from aiogram.types import (
-    CallbackQuery,
-    ChatMemberUpdated,
-    CopyTextButton,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-    Update,
+    CallbackQuery, ChatMemberUpdated, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup,
+    KeyboardButton, Message, ReplyKeyboardMarkup,
 )
 
-# ======================================================================
-#                         НАСТРОЙКИ
-#  Всё задаётся через переменные окружения Vercel.
-#  Если переменной нет — используется значение-заглушка.
-# ======================================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")   # токен бота (из Vercel)
-ADMIN_ID = 619112100                      # ID администратора
-# Кому доступна команда /woot (полный сброс своего аккаунта для тестов)
-WOOT_IDS = {ADMIN_ID, 8789146386, 792875116}
-
-# Наш канал — всегда показывается как 6-й спонсор (бот должен быть АДМИНОМ канала)
-OWN_CHANNEL_ID = -1004361145540
-OWN_CHANNEL_LINK = "https://t.me/DeveloperLead"
-
-TGRASS_API_KEY = os.environ.get("TGRASS_API_KEY", "6d6e9e9701e7440a81fe099d360710d5")
-PIARFLOW_API_KEY = os.environ.get("PIARFLOW_API_KEY", "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv")
-TRAFSLY_API_KEY = os.environ.get("TRAFSLY_API_KEY", "at_99ddd0618296db80b905c92ff9adaa8c")
-TRAFFY_API_KEY = os.environ.get("TRAFFY_API_KEY", "pk_live_DJZaxY7dRIECCycKvEL5ALT0wW7UhEKb")
-FLYER_API_KEY = os.environ.get("FLYER_API_KEY", "FL-NelisY-SRnApI-zNZkhB-XGGECE")
-
-# Upstash Redis — ОБЯЗАТЕЛЕН: в нём хранятся все данные бота.
-# Vercel -> Storage -> Upstash Redis
-# Vercel может назвать переменные по-разному (UPSTASH_REDIS_REST_* или KV_REST_API_*) — поддерживаем оба варианта
-UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL") or os.environ.get("KV_REST_API_URL")
-UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN") or os.environ.get("KV_REST_API_TOKEN")
-# ======================================================================
-
-PIARFLOW_API_URL = "https://piarflow.com/v1"
-TRAFSLY_API_URL = "https://api.trafsly.com"
-TGRASS_API_URL = "https://tgrass.space"
-TRAFFY_API_URL = "https://api.traffy.ai/publisher"
-FLYER_API_URL = "https://api.flyerhubs.com"
-FLOWLY_API_KEY = os.environ.get("FLOWLY_API_KEY", "b3216391cd5b1dd7d43802d3555ef78a")
-FLOWLY_API_URL = "https://flowly.guru/api/v1"
-
-PLACEHOLDER_MARK = "ВСТАВЬТЕ_КЛЮЧ"
+# ============================== КОНФИГ ==============================
+# ---------- КЛЮЧИ: только из переменных окружения (Vercel -> Settings -> Environment Variables) ----------
+# BOT_TOKEN, FLYER_KEY, TGRASS_KEY, PIARFLOW_KEY, TRAFSLY_KEY, TRAFFY_KEY,
+# TURSO_URL, TURSO_TOKEN, WEBHOOK_SECRET, CRON_SECRET, ADMIN_IDS
 
 
-def key_filled(value: Optional[str]) -> bool:
-    return bool(value) and PLACEHOLDER_MARK not in value
+def key(name: str) -> str:
+    return os.getenv(name, "").strip()
 
 
-for _name, _val in (
-    ("BOT_TOKEN", BOT_TOKEN),
-    ("TGRASS_API_KEY", TGRASS_API_KEY),
-    ("PIARFLOW_API_KEY", PIARFLOW_API_KEY),
-    ("TRAFSLY_API_KEY", TRAFSLY_API_KEY),
-    ("TRAFFY_API_KEY", TRAFFY_API_KEY),
-    ("FLYER_API_KEY", FLYER_API_KEY),
-    ("FLOWLY_API_KEY", FLOWLY_API_KEY),
-    ("UPSTASH_REDIS_REST_URL", UPSTASH_URL),
-    ("UPSTASH_REDIS_REST_TOKEN", UPSTASH_TOKEN),
-):
-    if not key_filled(_val):
-        print(f"⚠️ НЕ ЗАПОЛНЕНО: {_name}")
+BOT_TOKEN = key("BOT_TOKEN")
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
+WEBHOOK_SECRET = key("WEBHOOK_SECRET")
+CRON_SECRET = key("CRON_SECRET")
+WITHDRAW_CHANNEL = "@AvoReputation"
+# Flyer (flyerhubs.com): ключ берётся из переменной окружения FLYER_KEY (тип ключа должен быть "tasks")
+FLYER_KEY = key("FLYER_KEY")
+FLYER_URL = "https://api.flyerhubs.com"
+FLYER_LIMIT = 10  # сколько заданий Flyer закрепляет за пользователем (макс. 10)
+# TGrass (tgrass.space): ключ из переменной окружения TGRASS_KEY
+TGRASS_KEY = key("TGRASS_KEY")
+TGRASS_URL = "https://tgrass.space"
+TGRASS_ENDPOINT = os.getenv("TGRASS_ENDPOINT", "tasks")  # "tasks" — для ботов с заданиями, "offers" — для обязательных офферов
+TGRASS_VERIFY_SSL = os.getenv("TGRASS_VERIFY_SSL", "1") != "0"  # если будут ошибки сертификата: $env:TGRASS_VERIFY_SSL="0"
+# Trafsly (trafsly.com): токен бота (at_...) из @TrafslyBot -> переменная окружения TRAFSLY_KEY
+TRAFSLY_KEY = key("TRAFSLY_KEY")
+TRAFSLY_URL = "https://api.trafsly.com/api/v1"
+# PiarFlow (piarflow.com): API key бота -> PIARFLOW_KEY
+PIARFLOW_KEY = key("PIARFLOW_KEY")
+PIARFLOW_URL = "https://piarflow.com/v1"
+PIARFLOW_NO_TOKEN = os.getenv("PIARFLOW_NO_TOKEN", "0") == "1"  # 1 — если бот подключён в PiarFlow БЕЗ токена бота
+# Traffy (traffy.ai): ключ pk_live_... -> TRAFFY_KEY
+TRAFFY_KEY = key("TRAFFY_KEY")
+TRAFFY_URL = "https://api.traffy.ai/publisher"
+# Кому доступна команда /e (сброс аккаунта для тестов рефералки)
+RESET_IDS = {792875116, 8789146386, 8956779618}
+POST_PAYOUTS_TO_CHANNEL = False  # True -> после выплаты бот пишет в канал (бот должен быть админом)
 
-PHOTO_URL = "https://i.postimg.cc/XvPS1pB2/5883351235946024467.jpg"
-REFERRAL_PHOTO_URL = "https://i.postimg.cc/TYbwVvFM/6219881422739149359.jpg"
-PROFILE_PHOTO_URL = "https://i.postimg.cc/bvcFZkbf/6219881422739149361.jpg"
-TOP_PHOTO_URL = "https://i.postimg.cc/tJfCWpFM/6219881422739149363.jpg"
-WITHDRAW_PHOTO_URL = "https://i.postimg.cc/RVdQKYYf/6219881422739149362.jpg"
+# Настройки по умолчанию (потом меняются в админке: ⚙️ Настройки)
+DEFAULT_SETTINGS = {
+    "ref_reward": "4.5",  # награда за реферала
+    "ref_tasks": "7",     # сколько заданий должен выполнить реферал, чтобы ты получил награду
+    "flyer_reward": "0.25",  # награда пользователю за одно задание от Flyer
+    "tgrass_reward": "0.25",  # награда пользователю за одно задание от TGrass
+    "trafsly_reward": "0.25",  # награда за одно задание Trafsly
+    "piarflow_reward": "0.25",  # награда за одно задание PiarFlow
+    "traffy_reward": "0.25",  # награда за одно задание Traffy
+    "unsub_penalty": "0.25",  # штраф рефералу за отписку от канала спонсора
+    "unsub_days": "3",        # сколько дней после выполнения задания следим за отпиской
+}
+UNSUB_CHECK_INTERVAL = 5 * 60  # как часто проверять отписки (сек)
+DEFAULT_TASK_REWARD = 0.25
 
-TARGET_COUNT = 6                  # всего кнопок: 5 спонсоров из сервисов + наш канал
-EXTERNAL_LIMIT = 5                # максимум спонсоров из сервисов
-INCOME_PER_SPONSOR = 1.0          # доход (руб) за одну подписку на спонсора
-DEFAULT_REFERRAL_REWARD = 4.0     # награда за реферала по умолчанию
-REFERRAL_TASKS_REQUIRED = 7       # сколько заданий должен выполнить приглашённый друг
-FLOWLY_REWARD = 0.25              # награда за одно задание Flowly, ⭐
-FLOWLY_OFFERS_LIMIT = 5           # сколько заданий запрашивать у Flowly
-FLYER_REWARD = 0.25               # награда за одно задание Flyer, ⭐
-FLYER_TASKS_LIMIT = 10            # сколько заданий Flyer закрепляется за пользователем (макс. 10 по документации)
-MIN_SPONSORS_FOR_REWARD = 4       # минимум спонсоров (3 из сервисов + наш канал), чтобы пригласивший получил награду
-FSM_TTL = 7 * 24 * 3600           # сколько хранить состояние диалога
+# (цена, название, эмодзи)
+GIFTS = [
+    (15, "сердце", "💖"), (15, "Мишка", "🧸"),
+    (25, "Подарок", "🎁"), (25, "Роза", "🌹"),
+    (50, "ТОРТ", "🎂"), (50, "Букет", "💐"),
+    (50, "Ракета", "🚀"), (50, "Шампанское", "🍾"),
+    (100, "Кубок", "🏆"), (100, "Кольцо", "💍"),
+    (100, "Алмаз", "💎"),
+]
+
+# ============================ ПРЕМИУМ ЭМОДЗИ ============================
+def pe(emoji_id: str, fallback: str) -> str:
+    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
+
+STAR = pe("5954135079662916434", "⭐")
+HEART = pe("5204044811220295470", "❤")
+PARTY = pe("4996755833950831347", "🎉")
+USER_E = pe("5373012449597335010", "👤")
+LINK_E = pe("5271604874419647061", "🔗")
+BULB = pe("5422439311196834318", "💡")
+GREEN = pe("5416081784641168838", "🟢")
+BLUE = pe("5201802752392447916", "🟦")
+HAT = pe("5778145208411624388", "👤")
+BOLT = pe("5456140674028019486", "⚡️")
+CHECK_E = pe("5021905410089550576", "✅")
+WARN_E = pe("5274099962655816924", "❗️")
+TROPHY = pe("5409008750893734809", "🏆")
+MEDALS = [
+    pe("5794164805065514131", "1⃣"), pe("5794085322400733645", "2⃣"),
+    pe("5794280000383358988", "3⃣"), pe("5794241397217304511", "4⃣"),
+    pe("5793985348446984682", "5⃣"),
+]
+
+# ============================== КНОПКИ ==============================
+B_EARN = "⭐ Заработать звёзды"
+B_TASK = "💎 Задание"
+B_WD = "🎁 Вывести звёзды"
+B_PROFILE = "👤 Профиль"
+B_TOP = "🏆 Топ"
+B_PROMO = "🎁 Промокод"
+B_ADMIN = "⚙️ Админ-панель"
 
 
-# ================= REDIS (Upstash REST) =================
-# Сессия aiohttp на время одного апдейта — чтобы не открывать соединение на каждую команду.
-_redis_session: ContextVar = ContextVar("redis_session", default=None)
-# Бот текущего апдейта — нужен для проверки подписки на наш канал внутри проверок
-_current_bot: ContextVar = ContextVar("current_bot", default=None)
+def btn(text, cb=None, url=None, copy=None, style=None) -> InlineKeyboardButton:
+    """style: primary (синяя) / success (зелёная) / danger (красная) — Bot API 9.4+"""
+    kw = {}
+    if cb:
+        kw["callback_data"] = cb
+    if url:
+        kw["url"] = url
+    if copy:
+        kw["copy_text"] = CopyTextButton(text=copy)
+    if style:
+        kw["style"] = style
+    return InlineKeyboardButton(text=text, **kw)
 
 
-def redis_enabled() -> bool:
-    return bool(UPSTASH_URL and UPSTASH_TOKEN)
+def kb(*rows) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[list(r) for r in rows])
 
 
-async def redis_cmd(*args):
-    """Выполняет команду Redis через Upstash REST. При ошибке или без Redis — None."""
-    if not redis_enabled():
+async def set_menu(m: Message):
+    """Ставит нижнюю клавиатуру. Сообщение НЕ удаляем (иначе клавиатура пропадает) —
+    отправляем почти пустое: невидимый символ U+2800."""
+    try:
+        await m.answer("\u2800", reply_markup=main_kb(m.from_user.id))
+    except TelegramBadRequest:
+        await m.answer("⭐", reply_markup=main_kb(m.from_user.id))
+
+
+def main_kb(uid: int) -> ReplyKeyboardMarkup:
+    rows = [
+        [KeyboardButton(text=B_EARN), KeyboardButton(text=B_TASK)],
+        [KeyboardButton(text=B_WD)],
+        [KeyboardButton(text=B_PROFILE), KeyboardButton(text=B_TOP)],
+        [KeyboardButton(text=B_PROMO)],
+    ]
+    if uid in ADMIN_IDS:
+        rows.append([KeyboardButton(text=B_ADMIN)])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
+
+
+# ============================== БАЗА ДАННЫХ ==============================
+BOT_USERNAME = ""
+
+
+class _Http:
+    """Ленивая aiohttp-сессия: на serverless event loop может меняться между вызовами."""
+
+    def __init__(self):
+        self._s = None
+        self._loop = None
+
+    def _sess(self):
+        loop = asyncio.get_running_loop()
+        if self._s is None or self._s.closed or self._loop is not loop:
+            self._s = aiohttp.ClientSession()
+            self._loop = loop
+        return self._s
+
+    def post(self, *a, **k):
+        return self._sess().post(*a, **k)
+
+    async def close(self):
+        if self._s is not None and not self._s.closed:
+            await self._s.close()
+
+
+http = _Http()
+
+
+# ---- Turso (libSQL) по HTTP: тот же SQLite-диалект, что и раньше ----
+class Row:
+    __slots__ = ("_c", "_v")
+
+    def __init__(self, cols, vals):
+        self._c = {c: i for i, c in enumerate(cols)}
+        self._v = tuple(vals)
+
+    def __getitem__(self, k):
+        return self._v[k] if isinstance(k, int) else self._v[self._c[k]]
+
+    def keys(self):
+        return list(self._c)
+
+    def __iter__(self):
+        return iter(self._v)
+
+    def __len__(self):
+        return len(self._v)
+
+
+class Cursor:
+    def __init__(self, rows, rowcount, lastrowid):
+        self._rows, self.rowcount, self.lastrowid = rows, rowcount, lastrowid
+
+    async def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    async def fetchall(self):
+        return self._rows
+
+
+class _Exec:
+    """Результат db.execute(): можно и await, и async with."""
+
+    def __init__(self, coro):
+        self._coro = coro
+
+    def __await__(self):
+        return self._coro.__await__()
+
+    async def __aenter__(self):
+        return await self._coro
+
+    async def __aexit__(self, *a):
+        return False
+
+
+def _h_arg(v):
+    if v is None:
+        return {"type": "null"}
+    if isinstance(v, bool):
+        return {"type": "integer", "value": str(int(v))}
+    if isinstance(v, int):
+        return {"type": "integer", "value": str(v)}
+    if isinstance(v, float):
+        return {"type": "float", "value": v}
+    if isinstance(v, (bytes, bytearray)):
+        return {"type": "blob", "base64": base64.b64encode(bytes(v)).decode()}
+    return {"type": "text", "value": str(v)}
+
+
+def _h_val(x):
+    t = x.get("type")
+    if t == "null":
         return None
-    payload = [str(a) for a in args]
-    session = _redis_session.get()
-    own = session is None or session.closed
-    if own:
-        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))
-    try:
-        async with session.post(
-            UPSTASH_URL,
-            json=payload,
-            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
-        ) as resp:
-            data = await resp.json(content_type=None)
-            if isinstance(data, dict) and data.get("error"):
-                print(f"redis error [{payload[0]}]: {data['error']}")
-                return None
-            return data.get("result") if isinstance(data, dict) else None
-    except Exception as e:
-        print(f"redis exception [{payload[0] if payload else ''}]: {e!r}")
+    if t == "integer":
+        return int(x["value"])
+    if t == "float":
+        return float(x["value"])
+    if t == "blob":
+        return base64.b64decode(x.get("base64", ""))
+    return x.get("value")
+
+
+class TursoDB:
+    def __init__(self, url: str, token: str):
+        self.token = token
+        base = (url or "").strip().replace("libsql://", "https://").rstrip("/")
+        self.endpoint = base + "/v2/pipeline"
+
+    async def _pipeline(self, stmts):
+        if not self.token or not self.endpoint.startswith("http"):
+            raise RuntimeError("TURSO_URL / TURSO_TOKEN не заданы")
+        body = {"requests": [{"type": "execute", "stmt": {"sql": sql, "args": [_h_arg(a) for a in args]}}
+                             for sql, args in stmts] + [{"type": "close"}]}
+        read_only = all(sql.lstrip().upper().startswith(("SELECT", "PRAGMA")) for sql, _ in stmts)
+        last = None
+        for attempt in range(3 if read_only else 1):
+            try:
+                async with http.post(self.endpoint, json=body, headers={"Authorization": f"Bearer {self.token}"},
+                                     timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    data = await r.json(content_type=None)
+                    if r.status != 200:
+                        raise RuntimeError(f"Turso HTTP {r.status}: {data}")
+                    break
+            except (aiohttp.ClientError, asyncio.TimeoutError) as ex:
+                last = ex
+                await asyncio.sleep(0.3 * (attempt + 1))
+        else:
+            raise RuntimeError(f"Turso недоступен: {last!r}")
+        out = []
+        for res in data["results"][:len(stmts)]:
+            if res.get("type") == "error":
+                raise RuntimeError(f"SQL error: {(res.get('error') or {}).get('message')}")
+            r = res["response"]["result"]
+            cols = [c.get("name") for c in r.get("cols", [])]
+            rows = [Row(cols, [_h_val(x) for x in row]) for row in r.get("rows", [])]
+            lid = r.get("last_insert_rowid")
+            out.append(Cursor(rows, r.get("affected_row_count", 0), int(lid) if lid is not None else None))
+        return out
+
+    async def _one(self, sql, args):
+        return (await self._pipeline([(sql, tuple(args))]))[0]
+
+    def execute(self, sql, args=()):
+        return _Exec(self._one(sql, args))
+
+    async def batch(self, stmts):
+        """Несколько запросов за один HTTP-вызов."""
+        return await self._pipeline([(sql, tuple(a)) for sql, a in stmts])
+
+    async def executescript(self, script: str):
+        parts = [p.strip() for p in script.split(";") if p.strip()]
+        await self._pipeline([(p, ()) for p in parts])
+
+    async def commit(self):
         return None
-    finally:
-        if own:
-            await session.close()
 
 
-async def redis_pipeline(commands: list) -> list:
-    """Несколько команд Redis одним запросом (Upstash /pipeline). При сбое — по одной."""
-    if not commands:
-        return []
-    if not redis_enabled():
-        return [None] * len(commands)
-    payload = [[str(a) for a in cmd] for cmd in commands]
-    session = _redis_session.get()
-    own = session is None or session.closed
-    if own:
-        session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))
+db = TursoDB(key("TURSO_URL"), key("TURSO_TOKEN"))
+
+
+async def fetchone(sql, args=()):
+    async with db.execute(sql, args) as cur:
+        return await cur.fetchone()
+
+
+async def fetchall(sql, args=()):
+    async with db.execute(sql, args) as cur:
+        return await cur.fetchall()
+
+
+async def run(sql, args=()):
+    cur = await db.execute(sql, args)
+    await db.commit()
+    return cur
+
+
+SCHEMA_V = "1"  # увеличь, если меняешь таблицы/настройки по умолчанию
+
+
+async def init_db():
+    await db.executescript("""
+    CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY, username TEXT, full_name TEXT,
+        ref_code TEXT UNIQUE, referrer_id INTEGER,
+        balance REAL DEFAULT 0, earned REAL DEFAULT 0, withdrawn REAL DEFAULT 0,
+        ref_paid INTEGER DEFAULT 0, banned INTEGER DEFAULT 0, created_at TEXT);
+    CREATE TABLE IF NOT EXISTS tasks(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, url TEXT, chat_id TEXT,
+        reward REAL, active INTEGER DEFAULT 1);
+    CREATE TABLE IF NOT EXISTS user_tasks(
+        user_id INTEGER, task_id INTEGER, status TEXT, day TEXT,
+        PRIMARY KEY(user_id, task_id));
+    CREATE TABLE IF NOT EXISTS promos(
+        code TEXT PRIMARY KEY, reward REAL, max_uses INTEGER DEFAULT 0, uses INTEGER DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS promo_uses(
+        user_id INTEGER, code TEXT, PRIMARY KEY(user_id, code));
+    CREATE TABLE IF NOT EXISTS withdrawals(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, recipient TEXT,
+        amount INTEGER, gift TEXT, status TEXT DEFAULT 'pending', created_at TEXT);
+    CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE IF NOT EXISTS flyer_tasks(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, signature TEXT, task TEXT, url TEXT,
+        status TEXT DEFAULT 'shown', day TEXT, UNIQUE(user_id, signature));
+    CREATE TABLE IF NOT EXISTS tgrass_tasks(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, offer_id INTEGER, link TEXT, kind TEXT,
+        status TEXT DEFAULT 'shown', day TEXT, UNIQUE(user_id, offer_id));
+    CREATE TABLE IF NOT EXISTS ext_tasks(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, provider TEXT, ext_id TEXT,
+        link TEXT, kind TEXT, status TEXT DEFAULT 'shown', day TEXT, penalized INTEGER DEFAULT 0,
+        UNIQUE(user_id, provider, ext_id));
+    CREATE TABLE IF NOT EXISTS fsm(k TEXT PRIMARY KEY, state TEXT, data TEXT);
+    CREATE TABLE IF NOT EXISTS cast_log(ck TEXT, user_id INTEGER, ok INTEGER, PRIMARY KEY(ck, user_id));
+    CREATE VIEW IF NOT EXISTS done_tasks AS
+        SELECT user_id, day FROM user_tasks WHERE status='done'
+        UNION ALL
+        SELECT user_id, day FROM flyer_tasks WHERE status='done'
+        UNION ALL
+        SELECT user_id, day FROM tgrass_tasks WHERE status='done'
+        UNION ALL
+        SELECT user_id, day FROM ext_tasks WHERE status='done';
+    """)
+    ver = await fetchone("SELECT value FROM settings WHERE key='schema_v'")
+    if ver and ver["value"] == SCHEMA_V:
+        return
+    await migrate_db()
+    await db.batch([("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
+                    for k, v in DEFAULT_SETTINGS.items()]
+                   + [("INSERT OR REPLACE INTO settings(key,value) VALUES('schema_v',?)", (SCHEMA_V,))])
+
+
+# Нужные колонки: если bot.db создан старой версией/другим ботом — недостающие добавятся сами
+REQUIRED_COLUMNS = {
+    "users": {
+        "username": "TEXT", "full_name": "TEXT", "ref_code": "TEXT", "referrer_id": "INTEGER",
+        "balance": "REAL DEFAULT 0", "earned": "REAL DEFAULT 0", "withdrawn": "REAL DEFAULT 0",
+        "ref_paid": "INTEGER DEFAULT 0", "banned": "INTEGER DEFAULT 0", "created_at": "TEXT",
+        "ref_penalized": "INTEGER DEFAULT 0", "fresh": "INTEGER DEFAULT 0",
+    },
+    "flyer_tasks": {"penalized": "INTEGER DEFAULT 0"},
+    "tgrass_tasks": {"penalized": "INTEGER DEFAULT 0"},
+    "tasks": {"kind": "TEXT", "url": "TEXT", "chat_id": "TEXT", "reward": "REAL", "active": "INTEGER DEFAULT 1"},
+    "user_tasks": {"status": "TEXT", "day": "TEXT", "penalized": "INTEGER DEFAULT 0"},
+    "promos": {"reward": "REAL", "max_uses": "INTEGER DEFAULT 0", "uses": "INTEGER DEFAULT 0"},
+    "withdrawals": {"user_id": "INTEGER", "recipient": "TEXT", "amount": "INTEGER", "gift": "TEXT",
+                    "status": "TEXT DEFAULT 'pending'", "created_at": "TEXT"},
+}
+
+
+KEY_COLUMNS = {
+    "users": ["id"], "tasks": ["id"], "withdrawals": ["id"], "promos": ["code"],
+    "user_tasks": ["user_id", "task_id"], "promo_uses": ["user_id", "code"], "settings": ["key"],
+}
+
+
+async def migrate_db():
+    for table, cols in REQUIRED_COLUMNS.items():
+        existing = {r["name"] for r in await fetchall(f"PRAGMA table_info({table})")}
+        for col, typ in cols.items():
+            if col not in existing:
+                await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+                logging.info("migrate: %s.%s added", table, col)
+    await db.commit()
+
+
+_SET_CACHE = {}
+
+
+async def get_setting(key: str) -> float:
+    hit = _SET_CACHE.get(key)
+    if hit and time.monotonic() - hit[1] < 15:
+        return hit[0]
+    row = await fetchone("SELECT value FROM settings WHERE key=?", (key,))
+    val = float(row["value"] if row else DEFAULT_SETTINGS[key])
+    _SET_CACHE[key] = (val, time.monotonic())
+    return val
+
+
+def fmt(x) -> str:
+    return f"{round(float(x), 2):g}"
+
+
+def now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def today() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def esc(s) -> str:
+    return html.escape(str(s or ""))
+
+
+async def get_user(uid: int):
+    return await fetchone("SELECT * FROM users WHERE id=?", (uid,))
+
+
+def gen_code() -> str:
+    return "".join(random.choices(string.ascii_letters + string.digits, k=10))
+
+
+async def get_or_create_user(tg, ref_code=None):
+    row = await get_user(tg.id)
+    if row:
+        await run("UPDATE users SET username=?, full_name=? WHERE id=?",
+                  (tg.username, tg.full_name, tg.id))
+        return await get_user(tg.id), False
+    referrer = None
+    if ref_code:
+        r = await fetchone("SELECT id FROM users WHERE ref_code=?", (ref_code,))
+        if r and r["id"] != tg.id:
+            referrer = r["id"]
+    while True:
+        code = gen_code()
+        if not await fetchone("SELECT 1 FROM users WHERE ref_code=?", (code,)):
+            break
+    await run(
+        "INSERT INTO users(id,username,full_name,ref_code,referrer_id,created_at) VALUES(?,?,?,?,?,?)",
+        (tg.id, tg.username, tg.full_name, code, referrer, now()))
+    return await get_user(tg.id), True
+
+
+async def ref_count(uid: int) -> int:
+    r = await fetchone("SELECT COUNT(*) c FROM users WHERE referrer_id=?", (uid,))
+    return r["c"]
+
+
+async def ref_tasks_done(uid: int) -> int:
+    r = await fetchone(
+        "SELECT COUNT(*) c FROM done_tasks dt JOIN users u ON u.id=dt.user_id "
+        "WHERE u.referrer_id=?", (uid,))
+    return r["c"]
+
+
+# ============================== ТЕКСТЫ ==============================
+def ref_link(code: str) -> str:
+    return f"https://t.me/{BOT_USERNAME}?start={code}"
+
+
+async def ref_text(u) -> str:
+    rr = fmt(await get_setting("ref_reward"))
+    need = int(await get_setting("ref_tasks"))
+    cnt = await ref_count(u["id"])
+    return (
+        f"<b>Получай +{rr} {STAR} за каждого приглашенного друга!</b>\n\n"
+        f"<i>{LINK_E} Твоя реферальная ссылка:\n{ref_link(u['ref_code'])}</i>\n\n"
+        f"<b>{PARTY} Приглашай по этой ссылке своих друзей, отправляй её во все чаты "
+        f"и зарабатывай Звёзды!</b>\n\n"
+        f"<b>Приглашено тобой:</b> {cnt} {USER_E}\n\n"
+        f"{HEART}<b>Как это работает:</b>\n"
+        f"╠ Отправь свою ссылку другу\n"
+        f"╠ Друг заходит и выполняет {need} заданий\n"
+        f"╚ Ты получаешь {rr}{STAR} сразу же!"
+    )
+
+
+def ref_kb(u) -> InlineKeyboardMarkup:
+    link = ref_link(u["ref_code"])
+    share = "https://t.me/share/url?url=" + quote(link, safe="")
+    return kb([
+        btn("Скопировать ссылку", copy=link, style="primary"),
+        btn("Отправить другу", url=share, style="success"),
+    ])
+
+
+def task_text(t) -> str:
+    link = html.escape(t["url"], quote=True)
+    if t["kind"] == "bot":
+        action = f'Запусти <a href="{link}">бота</a> и нажми «Подтвердить»'
+    else:
+        action = f'Подпишись на <a href="{link}">канал</a> и нажми «Подтвердить»'
+    return (
+        f"{BULB} Получай Звёзды за простые задания! 👇\n\n"
+        f"{GREEN} {action}\n\n"
+        f"Вознаграждение: +{fmt(t['reward'])}{STAR}"
+    )
+
+
+def task_kb(t) -> InlineKeyboardMarkup:
+    return kb(
+        [btn("🔎 Перейти", url=t["url"], style="primary"),
+         btn("✅ Подтвердить", cb=f"tc:{t['id']}", style="success")],
+        [btn("⏭️ Пропустить", cb=f"ts:{t['id']}", style="danger")],
+    )
+
+
+async def profile_text(uid: int) -> str:
+    u = await get_user(uid)
+    done = (await fetchone("SELECT COUNT(*) c FROM done_tasks WHERE user_id=?", (uid,)))["c"]
+    td = (await fetchone("SELECT COUNT(*) c FROM done_tasks WHERE user_id=? AND day=?",
+                         (uid, today())))["c"]
+    return (
+        f"{HAT} <b>Ваш профиль</b>\n\n"
+        f"{BLUE} <code>{uid}</code>\n\n"
+        f"{STAR}<b>Баланс</b>\n\n"
+        f"<blockquote>Доступно: {fmt(u['balance'])} {STAR}\n"
+        f"Заработано всего: {fmt(u['earned'])}\n"
+        f"Выведено всего: {fmt(u['withdrawn'])} {STAR}</blockquote>\n\n"
+        f"<b>Ваш профиль</b>\n\n"
+        f"├ Выполнено заданий: {done}\n\n"
+        f"└ За сегодня: {td}"
+    )
+
+
+def wd_menu_kb() -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for i, (amt, name, emo) in enumerate(GIFTS):
+        row.append(btn(f"{amt}⭐ {name} ({emo})", cb=f"wd:{i}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return kb(*rows)
+
+
+async def wd_menu_text(uid: int) -> str:
+    u = await get_user(uid)
+    return (f"Заработано: {fmt(u['balance'])} {STAR}\n\n"
+            f"Выбери сумму и подарок для вывода\n\n"
+            f"Канал с выводами: {WITHDRAW_CHANNEL}")
+
+
+def gift_label(i: int) -> str:
+    amt, name, emo = GIFTS[i]
+    return f"{amt}⭐ {name} ({emo})"
+
+
+# ============================== ЗАДАНИЯ ==============================
+async def next_task(uid: int):
+    return await fetchone(
+        "SELECT * FROM tasks t WHERE active=1 AND NOT EXISTS "
+        "(SELECT 1 FROM user_tasks u WHERE u.user_id=? AND u.task_id=t.id) ORDER BY id LIMIT 1", (uid,))
+
+
+async def send_task(target: Message, uid: int, edit: bool = False, lang: str = None, tgu=None):
+    FLYER_REWARD_CACHE["v"] = await get_setting("flyer_reward")
+    TGRASS_REWARD_CACHE["v"] = await get_setting("tgrass_reward")
+    ft = await next_flyer_task(uid, lang)
+    gt = None if ft else await next_tgrass_task(tgu)
+    et = None if (ft or gt) else await next_ext_task(tgu)
+    t = None if (ft or gt or et) else await next_task(uid)
+    if ft:
+        text, markup = flyer_task_text(ft), flyer_task_kb(ft)
+    elif gt:
+        text, markup = tgrass_task_text(gt), tgrass_task_kb(gt)
+    elif et:
+        text, markup = await ext_task_text(et), ext_task_kb(et)
+    elif t:
+        text, markup = task_text(t), task_kb(t)
+    else:
+        text, markup = "🎉 Пока доступных заданий нет. Загляни позже — скоро появятся новые!", None
+    if edit:
+        try:
+            await target.edit_text(text, reply_markup=markup)
+        except TelegramBadRequest:
+            pass
+    else:
+        await target.answer(text, reply_markup=markup)
+
+
+async def check_task(bot: Bot, uid: int, t) -> bool:
+    """Проверка выполнения. Для каналов — через get_chat_member (бот должен быть админом канала)."""
+    if t["kind"] == "channel":
+        if not t["chat_id"]:
+            return True
+        try:
+            m = await bot.get_chat_member(t["chat_id"], uid)
+            return m.status in ("member", "administrator", "creator")
+        except Exception as ex:
+            logging.warning("check_task error: %s", ex)
+            return False
+    # Задание «запустить бота»: Bot API не позволяет проверить запуск чужого бота.
+    # Сюда подключается API спонсорской платформы (Subgram и т.п.). Пока — считаем выполненным.
+    return True
+
+
+def uref(u) -> str:
+    return f"@{u['username']}" if u["username"] else esc(u["full_name"])
+
+
+async def credit(uid: int, amount: float):
+    await db.execute("UPDATE users SET balance=balance+?, earned=earned+? WHERE id=?", (amount, amount, uid))
+    await db.commit()
+
+
+async def after_task_done(bot: Bot, uid: int, reward: float):
+    """Начисляет награду за задание и, если нужно, награду рефереру."""
+    await credit(uid, reward)
+    u = await get_user(uid)
+    if not u["referrer_id"] or u["ref_paid"]:
+        return
+    need = int(await get_setting("ref_tasks"))
+    done = (await fetchone("SELECT COUNT(*) c FROM done_tasks WHERE user_id=?", (uid,)))["c"]
+    if done < need:
+        return
+    cur = await db.execute("UPDATE users SET ref_paid=1 WHERE id=? AND ref_paid=0", (uid,))
+    await db.commit()
+    if cur.rowcount == 0:
+        return
+    rr = await get_setting("ref_reward")
+    await credit(u["referrer_id"], rr)
     try:
-        async with session.post(
-            UPSTASH_URL.rstrip("/") + "/pipeline",
-            json=payload,
-            headers={"Authorization": f"Bearer {UPSTASH_TOKEN}"},
-        ) as resp:
-            data = await resp.json(content_type=None)
-        if isinstance(data, list) and len(data) == len(commands):
-            return [d.get("result") if isinstance(d, dict) else None for d in data]
-    except Exception as e:
-        print(f"redis pipeline exception: {e!r}")
-    finally:
-        if own:
-            await session.close()
-    return list(await asyncio.gather(*(redis_cmd(*cmd) for cmd in commands)))
-
-
-async def redis_get_json(key: str, default=None):
-    raw = await redis_cmd("GET", key)
-    if raw is None:
-        return default
-    try:
-        return json.loads(raw)
+        await bot.send_message(
+            u["referrer_id"],
+            f"{CHECK_E} Пользователь {uref(u)} выполнил нужное количество заданий!\n\n"
+            f"Ты получаешь {fmt(rr)} {STAR}")
     except Exception:
-        return default
-
-
-async def redis_set_json(key: str, value, ex: Optional[int] = None) -> None:
-    args = ["SET", key, json.dumps(value, ensure_ascii=False, default=str)]
-    if ex:
-        args += ["EX", ex]
-    await redis_cmd(*args)
-
-
-def to_int(value, default: int = 0) -> int:
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return default
-
-
-def to_float(value, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-# ================= FSM-ХРАНИЛИЩЕ В REDIS =================
-class UpstashStorage(BaseStorage):
-    """Состояния диалогов (ввод суммы, username, промокода и т.д.) хранятся в Redis,
-    поэтому не теряются при перезапуске Vercel."""
-
-    @staticmethod
-    def _k(key: StorageKey, part: str) -> str:
-        return f"fsm:{key.chat_id}:{key.user_id}:{part}"
-
-    async def set_state(self, key: StorageKey, state: StateType = None) -> None:
-        value = state.state if isinstance(state, State) else state
-        if value is None:
-            await redis_cmd("DEL", self._k(key, "state"))
-        else:
-            await redis_cmd("SET", self._k(key, "state"), value, "EX", FSM_TTL)
-
-    async def get_state(self, key: StorageKey) -> Optional[str]:
-        return await redis_cmd("GET", self._k(key, "state"))
-
-    async def set_data(self, key: StorageKey, data: dict[str, Any]) -> None:
-        if not data:
-            await redis_cmd("DEL", self._k(key, "data"))
-        else:
-            await redis_set_json(self._k(key, "data"), dict(data), ex=FSM_TTL)
-
-    async def get_data(self, key: StorageKey) -> dict[str, Any]:
-        data = await redis_get_json(self._k(key, "data"), {})
-        return data if isinstance(data, dict) else {}
-
-    async def close(self) -> None:
         pass
 
 
-dp = Dispatcher(storage=UpstashStorage() if redis_enabled() else MemoryStorage())
-router = Router()
+async def complete_task(bot: Bot, uid: int, t):
+    cur = await db.execute("INSERT OR IGNORE INTO user_tasks(user_id,task_id,status,day) VALUES(?,?,?,?)",
+                           (uid, t["id"], "done", today()))
+    await db.commit()
+    if cur.rowcount == 0:
+        return False
+    await after_task_done(bot, uid, t["reward"])
+    return True
 
 
-class AlwaysAnswerCallback(BaseMiddleware):
-    """Гарантирует ответ на нажатие кнопки. Если обработчик упал с ошибкой или забыл
-    ответить, Telegram иначе держит кнопку «в загрузке» и повторно нажать её нельзя."""
-
-    async def __call__(self, handler, event, data):
-        try:
-            return await handler(event, data)
-        finally:
+# ============================== ШТРАФЫ ЗА ОТПИСКУ ==============================
+async def apply_unsub_penalty(bot: Bot, uid: int, link: str, table: str, where: str, args: tuple):
+    """Один раз штрафует реферала за отписку от канала и (если награда уже выдана) — пригласившего."""
+    cur = await db.execute(f"UPDATE {table} SET penalized=1 WHERE {where} AND penalized=0", args)
+    await db.commit()
+    if cur.rowcount == 0:
+        return
+    UNSUB_STATS["penalized"] += 1
+    u = await get_user(uid)
+    if not u:
+        return
+    # штраф самому рефералу
+    pen = await get_setting("unsub_penalty")
+    await db.execute("UPDATE users SET balance=MAX(0, balance-?) WHERE id=?", (pen, uid))
+    await db.commit()
+    try:
+        await bot.send_message(
+            uid,
+            f"😡 Мы заметили, что ты отписался от канала {esc(link)}\n\n"
+            f"За это мы списали с твоего баланса -{fmt(pen)} {STAR}")
+    except Exception:
+        pass
+    # штраф пригласившему (только если награда за этого реферала уже была выдана, и только 1 раз)
+    if u["referrer_id"] and u["ref_paid"] and not u["ref_penalized"]:
+        c2 = await db.execute("UPDATE users SET ref_penalized=1 WHERE id=? AND ref_penalized=0", (uid,))
+        await db.commit()
+        if c2.rowcount:
+            rr = await get_setting("ref_reward")
+            await db.execute("UPDATE users SET balance=balance-?, earned=earned-? WHERE id=?",
+                             (rr, rr, u["referrer_id"]))
+            await db.commit()
             try:
-                await event.answer()  # если уже отвечали — Telegram вернёт ошибку, её глушим
+                await bot.send_message(
+                    u["referrer_id"],
+                    f"⚠️ Штраф за реферала\n\n"
+                    f"Реферал {uref(u)} отписался от выполненных спонсоров.\n\n"
+                    f"С вашего баланса списано -{fmt(rr)} {STAR}\n"
+                    f"Сумма равна награде за этого реферала.")
             except Exception:
                 pass
 
 
-router.callback_query.outer_middleware(AlwaysAnswerCallback())
+UNSUB_STATS = {"penalized": 0}
 
 
-# ================= FSM =================
-class WithdrawStates(StatesGroup):
-    waiting_for_custom_amount = State()
-    waiting_for_username = State()
-    waiting_for_confirmation = State()
+async def check_unsubs(bot: Bot) -> list:
+    """Проверяет отписки рефералов. Возвращает строки отчёта (для /unsub и логов)."""
+    days = int(await get_setting("unsub_days"))
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    report = []
+    deadline = time.monotonic() + UNSUB_BUDGET
 
-
-class PromocodeStates(StatesGroup):
-    waiting_for_activation_input = State()
-    admin_name = State()
-    admin_activations = State()
-    admin_price = State()
-
-
-class AdminBroadcastStates(StatesGroup):
-    waiting_for_text = State()
-    confirm = State()
-
-
-class AdminTaskStates(StatesGroup):
-    text = State()
-    link = State()
-    chat_id = State()
-    reward = State()
-    max_completions = State()
-    preview = State()
-
-
-class AdminRewardStates(StatesGroup):
-    waiting_for_new_value = State()
-    confirm = State()
-
-
-# ================= ХЕЛПЕРЫ ИНТЕРФЕЙСА =================
-try:  # aiogram 3.7+
-    from aiogram.types import LinkPreviewOptions
-except ImportError:  # более старые версии
-    LinkPreviewOptions = None
-
-
-def no_preview() -> dict:
-    """Параметры отправки сообщения без предпросмотра ссылок."""
-    if LinkPreviewOptions is not None:
-        return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
-    return {"disable_web_page_preview": True}
-
-
-async def safe_answer(callback: CallbackQuery, *args, **kwargs) -> None:
-    """Повторный callback.answer() вызывает ошибку, поэтому глушим её."""
-    try:
-        await callback.answer(*args, **kwargs)
-    except Exception:
-        pass
-
-
-def back_markup(cb: str = "back_to_main", text: str = "⬅️ Назад") -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=text, callback_data=cb)]])
-
-
-def main_reply_keyboard(user_id: Optional[int] = None) -> ReplyKeyboardMarkup:
-    """Шесть постоянных кнопок меню; у администратора есть седьмая кнопка."""
-    rows = [
-        [KeyboardButton(text="⭐ Задание"), KeyboardButton(text="👤 Профиль")],
-        [KeyboardButton(text="👥 Рефералы"), KeyboardButton(text="🏆 Топ")],
-        [KeyboardButton(text="📥 Вывести звёзды"), KeyboardButton(text="🎁 Промокод")],
-    ]
-    if user_id == ADMIN_ID:
-        rows.append([KeyboardButton(text="👑 Админ панель")])
-    return ReplyKeyboardMarkup(
-        keyboard=rows,
-        resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder="Выбери раздел…",
-    )
-
-
-async def replace_message(
-    callback: CallbackQuery, text: str, markup=None,
-    parse_mode: Optional[str] = None, disable_preview: bool = False,
-) -> bool:
-    """Отправляет новое сообщение и удаляет старое. True — новое сообщение отправлено."""
-    try:
-        kwargs = {"parse_mode": parse_mode} if parse_mode else {}
-        if disable_preview:
-            kwargs.update(no_preview())
-        await callback.message.answer(text, reply_markup=markup, **kwargs)
-    except Exception as e:
-        print(f"replace_message error: {e}")
-        return False
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-    return True
-
-
-async def replace_with_photo(callback: CallbackQuery, photo: str, text: str, markup=None) -> None:
-    try:
-        await callback.message.answer_photo(photo=photo, caption=text, reply_markup=markup)
-    except Exception as e:
-        print(f"photo error: {e}")
+    async def section(name, coro):
+        UNSUB_STATS["penalized"] = 0
         try:
-            await callback.message.answer(text, reply_markup=markup)
-        except Exception:
+            checked, info = await coro
+        except Exception as ex:
+            logging.exception("unsub %s", name)
+            report.append(f"{name}: ОШИБКА {ex!r}")
             return
-    try:
-        await callback.message.delete()
-    except Exception:
-        pass
-
-
-# ================= ПОЛЬЗОВАТЕЛИ (Redis) =================
-def user_key(uid: int) -> str:
-    return f"user:{uid}"
-
-
-def _parse_user(res) -> Optional[dict]:
-    if not res:
-        return None
-    if isinstance(res, list):
-        d = dict(zip(res[0::2], res[1::2]))
-    elif isinstance(res, dict):
-        d = res
-    else:
-        return None
-    return {
-        "name": d.get("name") or "",
-        "username": d.get("username") or "",
-        "balance": to_float(d.get("balance")),
-        "referrals": to_int(d.get("referrals")),
-        "join_ts": to_float(d.get("join_ts")),
-    }
-
-
-async def get_user(uid: int) -> Optional[dict]:
-    return _parse_user(await redis_cmd("HGETALL", user_key(uid)))
-
-
-async def _create_user(uid: int, name: str, username: str) -> dict:
-    now = time.time()
-    await redis_cmd(
-        "HSET", user_key(uid),
-        "name", name, "username", username,
-        "balance", "0", "referrals", "0", "join_ts", str(now),
-    )
-    await redis_cmd("SADD", "users", uid)
-    await redis_cmd("ZADD", "users_joined", now, uid)
-    return {"name": name, "username": username, "balance": 0.0, "referrals": 0, "join_ts": now}
-
-
-async def ensure_user(user) -> dict:
-    """Возвращает данные пользователя; при первом обращении создаёт запись.
-    В результате есть ключ is_new (True, если пользователь создан только что)."""
-    uid = user.id
-    username_str = f"@{user.username}" if user.username else f"id{uid}"
-    data = await get_user(uid)
-    if data is None:
-        data = await _create_user(uid, user.first_name or "", username_str)
-        data["is_new"] = True
-    else:
-        data["is_new"] = False
-    return data
-
-
-async def ensure_user_by_id(uid: int) -> dict:
-    data = await get_user(uid)
-    if data is None:
-        data = await _create_user(uid, f"id{uid}", f"id{uid}")
-    return data
-
-
-async def add_balance(uid: int, amount: float) -> Optional[float]:
-    """Атомарно меняет баланс. Возвращает новый баланс."""
-    res = await redis_cmd("HINCRBYFLOAT", user_key(uid), "balance", amount)
-    return to_float(res) if res is not None else None
-
-
-# ================= НАСТРОЙКИ И СТАТИСТИКА (Redis) =================
-async def get_referral_reward() -> float:
-    # Однократная миграция: устанавливаем награду 4 ⭐ для существующих баз Redis.
-    # После миграции администратор при желании может изменить её через админ-панель.
-    migrated = await redis_cmd("SET", "cfg:referral_reward_migration_v3", "1", "NX")
-    if migrated:
-        await redis_cmd("SET", "cfg:referral_reward", str(DEFAULT_REFERRAL_REWARD))
-    val = await redis_cmd("GET", "cfg:referral_reward")
-    return to_float(val, DEFAULT_REFERRAL_REWARD) if val is not None else DEFAULT_REFERRAL_REWARD
-
-
-async def add_referral_to_top(ref_id: int, name: str) -> None:
-    await redis_cmd("ZINCRBY", "top_refs", 1, ref_id)
-    await redis_cmd("HSET", "top_names", ref_id, name or f"id{ref_id}")
-
-
-async def get_top(limit: int = 5) -> list[tuple[int, str, int]]:
-    """Возвращает [(user_id, имя, рефералов), ...] от большего к меньшему."""
-    res = await redis_cmd("ZREVRANGE", "top_refs", 0, limit - 1, "WITHSCORES")
-    if not res:
-        return []
-    ids = res[0::2]
-    scores = res[1::2]
-    names = await redis_cmd("HMGET", "top_names", *ids) if ids else []
-    names = names or [None] * len(ids)
-    return [
-        (int(uid), name or f"id{uid}", to_int(score))
-        for uid, name, score in zip(ids, names, scores)
-    ]
-
-
-async def get_user_refs_and_rank(user_id: int) -> tuple[int, Optional[int]]:
-    score = await redis_cmd("ZSCORE", "top_refs", user_id)
-    if score is None:
-        u = await get_user(user_id)
-        return (u["referrals"] if u else 0), None
-    rank = await redis_cmd("ZREVRANK", "top_refs", user_id)
-    return to_int(score), (int(rank) + 1 if rank is not None else None)
-
-
-async def mark_passed(uid: int) -> bool:
-    """Пользователь прошёл спонсоров — учитываем один раз."""
-    added = await redis_cmd("SADD", "passed_users", uid)
-    if to_int(added) == 1:
-        await redis_cmd("INCR", "stat:sponsors_completed")
-        return True
-    return False
-
-
-async def add_income(user_id: int, count: int) -> None:
-    """Добавляет к доходу число спонсоров, на которых подписался пользователь.
-    Каждый пользователь учитывается один раз."""
-    if count <= 0:
-        return
-    added = await redis_cmd("SADD", "income_users", user_id)
-    if added is None or to_int(added) == 0:
-        return
-    await redis_cmd("INCRBY", "income_sponsors", count)
-
-
-async def get_income_sponsors() -> int:
-    return to_int(await redis_cmd("GET", "income_sponsors"))
-
-
-async def pop_sponsor_total(user_id: int, fallback: int = 0) -> int:
-    """Достаёт из Redis исходное число показанных спонсоров и удаляет ключ."""
-    val = await redis_cmd("GET", f"sp_total:{user_id}")
-    await redis_cmd("DEL", f"sp_total:{user_id}")
-    return min(max(to_int(val), fallback), TARGET_COUNT)  # доход за одного пользователя — не больше TARGET_COUNT
-
-
-# ================= АКТИВНЫЕ СПОНСОРЫ / ВЫВОД (Redis) =================
-async def get_active(uid: int) -> Optional[dict]:
-    return await redis_get_json(f"sp_active:{uid}")
-
-
-async def set_active(uid: int, data: dict) -> None:
-    await redis_set_json(f"sp_active:{uid}", data, ex=86400)
-
-
-async def del_active(uid: int) -> None:
-    await redis_cmd("DEL", f"sp_active:{uid}")
-
-
-async def get_wd(uid: int) -> dict:
-    return await redis_get_json(f"wd:{uid}", {}) or {}
-
-
-async def set_wd(uid: int, data: dict) -> None:
-    await redis_set_json(f"wd:{uid}", data, ex=3600)
-
-
-async def del_wd(uid: int) -> None:
-    await redis_cmd("DEL", f"wd:{uid}")
-
-
-# ================= ЗАДАНИЯ (Redis) =================
-TASKS_KEY = "admin_tasks"
-
-
-async def load_tasks() -> list[dict]:
-    tasks = await redis_get_json(TASKS_KEY, [])
-    return tasks if isinstance(tasks, list) else []
-
-
-async def save_tasks(tasks: list[dict]) -> None:
-    await redis_set_json(TASKS_KEY, tasks)
-
-
-async def pick_task(uid: int, reset: bool = True) -> Optional[dict]:
-    """Первое задание, которое пользователь ещё не выполнял и не пропускал.
-    reset=False — если все оставшиеся пропущены, вернуть None (чтобы показать задания из других источников)."""
-    tasks = await load_tasks()
-    if not tasks:
-        return None
-    done = {to_int(x) for x in (await redis_cmd("SMEMBERS", f"user_done:{uid}") or [])}
-    candidates = [t for t in tasks if t["id"] not in done]
-    if not candidates:
-        return None
-    skipped = {to_int(x) for x in (await redis_cmd("SMEMBERS", f"user_skip:{uid}") or [])}
-    fresh = [t for t in candidates if t["id"] not in skipped]
-    if not fresh:
-        if not reset:
-            return None
-        await redis_cmd("DEL", f"user_skip:{uid}")
-        fresh = candidates
-    return fresh[0]
-
-
-# ================= ПРОВЕРКА ПОДПИСКИ НА КАНАЛ ЗАДАНИЯ =================
-def normalize_task_link(text: str) -> Optional[str]:
-    """Приводит ввод админа к ссылке https://t.me/... Возвращает None, если формат не подходит."""
-    t = (text or "").strip()
-    if re.fullmatch(r"@\w{4,}", t):
-        return f"https://t.me/{t[1:]}"
-    m = re.match(r"^(?:https?://)?(?:t|telegram)\.me/(\S+)$", t, re.I)
-    if m:
-        return f"https://t.me/{m.group(1)}"
-    return None
-
-
-def chat_ref_from_link(link: str) -> Optional[str]:
-    """@username канала из публичной ссылки. Для закрытых ссылок (t.me/+...) возвращает None."""
-    m = re.match(r"^(?:https?://)?(?:t|telegram)\.me/(\S+)$", (link or "").strip(), re.I)
-    if not m:
-        return None
-    first = m.group(1).split("?")[0].strip("/").split("/")[0]
-    if not first or first.startswith("+") or first.lower() in ("joinchat", "c", "addlist"):
-        return None
-    return f"@{first}" if re.fullmatch(r"\w{4,}", first) else None
-
-
-def _status_str(member) -> str:
-    return str(getattr(member.status, "value", member.status))
-
-
-async def validate_task_chat(bot: Bot, chat_ref) -> tuple[Optional[int], str, str]:
-    """Проверяет, что канал существует и бот в нём администратор (иначе подписки не проверить).
-    Возвращает (chat_id, название, текст_ошибки)."""
-    try:
-        chat = await bot.get_chat(chat_ref)
-    except Exception:
-        return None, "", "❌ Канал не найден. Проверьте ссылку или ID и попробуйте снова."
-    try:
-        me = await bot.me()
-        member = await bot.get_chat_member(chat.id, me.id)
-    except Exception:
-        member = None
-    if member is None or _status_str(member) not in ("administrator", "creator"):
-        return None, "", (
-            "❌ Бот не администратор в этом канале, поэтому не сможет проверять подписки.\n"
-            "Добавьте бота админом и отправьте ссылку снова."
-        )
-    return chat.id, (chat.title or chat.username or str(chat.id)), ""
-
-
-async def check_subscription(bot: Bot, chat_ref, user_id: int) -> Optional[bool]:
-    """True — подписан, False — нет, None — не удалось проверить."""
-    try:
-        member = await bot.get_chat_member(chat_id=chat_ref, user_id=user_id)
-    except Exception as e:
-        print(f"check_subscription error: {e!r}")
-        return None
-    status = _status_str(member)
-    if status in ("creator", "administrator", "member"):
-        return True
-    if status == "restricted":
-        return bool(getattr(member, "is_member", False))
-    return False
-
-
-# ================= ПРОМОКОДЫ (Redis) =================
-async def get_promo(code: str) -> Optional[dict]:
-    res = await redis_cmd("HGETALL", f"promo:{code}")
-    if not res:
-        return None
-    d = dict(zip(res[0::2], res[1::2])) if isinstance(res, list) else dict(res)
-    return {
-        "name": d.get("name") or code,
-        "price": to_float(d.get("price")),
-        "activations": to_int(d.get("activations")),
-    }
-
-
-async def create_promo(name: str, activations: int, price: float) -> None:
-    await redis_cmd("DEL", f"promo_used:{name}")
-    await redis_cmd("HSET", f"promo:{name}", "name", name, "price", price, "activations", activations)
-    await redis_cmd("ZADD", "promos", time.time(), name)
-
-
-async def delete_promo(code: str) -> None:
-    await redis_cmd("DEL", f"promo:{code}")
-    await redis_cmd("DEL", f"promo_used:{code}")
-    await redis_cmd("ZREM", "promos", code)
-
-
-# ================= API СПОНСОРОВ =================
-async def api_post(session, name, url, payload, headers):
-    """Возвращает (http_status, json_или_None, сырое_тело). Всё логирует."""
-    try:
-        async with session.post(url, json=payload, headers=headers) as resp:
-            body = await resp.text()
-            print(f"[{name}] HTTP {resp.status}: {body[:500]}")
-            try:
-                data = json.loads(body)
-            except Exception:
-                data = None
-            return resp.status, data, body
-    except Exception as e:
-        print(f"[{name}] ОШИБКА ЗАПРОСА: {e!r}")
-        return None, None, repr(e)
-
-
-def tgrass_headers():
-    return {"Auth": TGRASS_API_KEY, "Content-Type": "application/json", "accept": "application/json"}
-
-
-def piarflow_headers():
-    return {"Authorization": f"Bearer {PIARFLOW_API_KEY}", "Content-Type": "application/json"}
-
-
-def trafsly_headers():
-    return {"Auth": TRAFSLY_API_KEY, "Content-Type": "application/json"}
-
-
-async def fetch_tgrass(session, user_id, user_data, limit):
-    payload = {
-        "tg_user_id": int(user_id),
-        "tg_login": user_data.get("username"),
-        "lang": user_data.get("language_code") or "ru",
-        "is_premium": bool(user_data.get("is_premium", False)),
-        "offers_limit": limit,
-    }
-    _, data, _ = await api_post(session, "tgrass", f"{TGRASS_API_URL}/offers", payload, tgrass_headers())
-    if not isinstance(data, dict):
-        return []
-    if data.get("status") == "ok":
-        return []
-    offers = data.get("offers", []) or []
-    return [o for o in offers if not o.get("subscribed", True)][:limit]
-
-
-async def fetch_piarflow(session, user_id, chat_id, limit):
-    payload = {"user_id": user_id, "chat_id": chat_id, "max_sponsors": limit}
-    _, data, _ = await api_post(session, "piarflow", f"{PIARFLOW_API_URL}/sponsors", payload, piarflow_headers())
-    if not isinstance(data, dict):
-        return []
-    sponsors = data.get("sponsors", []) or []
-    return [
-        {"link": s["link"], "type": "piarflow"}
-        for s in sponsors
-        if s.get("status") == "unsubscribed" and s.get("link")
-    ][:limit]
-
-
-async def fetch_trafsly(session, user_id, chat_id, user_data, limit):
-    payload = {
-        "user_id": user_id,
-        "chat_id": chat_id,
-        "first_name": user_data.get("first_name", ""),
-        "username": user_data.get("username", ""),
-        "language_code": user_data.get("language_code", "ru"),
-        "is_premium": bool(user_data.get("is_premium", False)),
-        "max_sponsors": limit,
-    }
-    _, data, _ = await api_post(session, "trafsly", f"{TRAFSLY_API_URL}/api/v1/get-sponsors", payload, trafsly_headers())
-    if not isinstance(data, dict):
-        return []
-    sponsors = data.get("sponsors", []) or []
-    return [
-        {"link": s["link"], "ads_id": s.get("ads_id"), "type": "trafsly"}
-        for s in sponsors
-        if s.get("link")
-    ][:limit]
-
-
-# ================= ДОПОЛНИТЕЛЬНЫЕ СПОНСОРЫ: Traffy и др. =================
-# Порядок = приоритет: 1 tgrass, 2 traffy, 3 piarflow, 4 trafsly. Затем наш канал.
-EXTERNAL_SERVICES = ("tgrass", "traffy", "piarflow", "trafsly")
-SERVICES = EXTERNAL_SERVICES + ("own",)
-
-
-def links_of(data: dict) -> list[str]:
-    """Все ссылки спонсоров в порядке приоритета сервисов."""
-    return [item["link"] for name in SERVICES for item in (data.get(name) or [])]
-
-
-def limit_sponsors(data: dict, limit: int = TARGET_COUNT) -> dict:
-    """Жёстко обрезает общий список спонсоров до limit (по приоритету сервисов)."""
-    left = limit
-    for name in SERVICES:
-        items = (data.get(name) or [])[:max(left, 0)]
-        data[name] = items
-        left -= len(items)
-    return data
-
-
-def fill_test_sponsors(data: dict) -> dict:
-    """ТЕСТ-РЕЖИМ (/woot): гарантирует ровно TARGET_COUNT кнопок, даже если человек уже подписан
-    на часть спонсоров или сервисы отдали меньше. Наш канал показывается всегда, а недостающие
-    места занимают заглушки (ссылка на наш канал, помечены test=True — проверка считает их выполненными)."""
-    own = list(data.get("own") or [])
-    if not own:
-        own = [{"link": OWN_CHANNEL_LINK, "chat_id": OWN_CHANNEL_ID}]
-    external = sum(len(data.get(n) or []) for n in EXTERNAL_SERVICES)
-    for _ in range(max(TARGET_COUNT - external - len(own), 0)):
-        own.append({"link": OWN_CHANNEL_LINK, "test": True})
-    data["own"] = own
-    return data
-
-
-def pick_sponsors(results) -> dict[str, list]:
-    """Из ответов сервисов (в порядке EXTERNAL_SERVICES) набирает до EXTERNAL_LIMIT спонсоров без повторов."""
-    collected: dict[str, list] = {name: [] for name in SERVICES}
-    seen: set[str] = set()
-    remaining = EXTERNAL_LIMIT
-    for name, res in zip(EXTERNAL_SERVICES, results):
-        if remaining <= 0:
-            break
-        if isinstance(res, Exception):
-            print(f"[{name}] ошибка получения спонсоров: {res!r}")
-            continue
-        for item in res or []:
-            link = item.get("link")
-            if not link or link in seen:
-                continue
-            seen.add(link)
-            collected[name].append(item)
-            remaining -= 1
-            if remaining <= 0:
+        report.append(f"{name}: проверено {checked}, штрафов {UNSUB_STATS['penalized']}" + (f" ({info})" if info else ""))
+
+    async def admin_tasks():
+        rows = await fetchall(
+            "SELECT ut.user_id, ut.task_id, t.chat_id, t.url FROM user_tasks ut "
+            "JOIN tasks t ON t.id=ut.task_id JOIN users u ON u.id=ut.user_id "
+            "WHERE ut.status='done' AND ut.penalized=0 AND t.kind='channel' "
+            "AND t.chat_id IS NOT NULL AND t.chat_id!='' AND u.referrer_id IS NOT NULL AND ut.day>=? ORDER BY RANDOM() LIMIT 100", (cutoff,))
+        errs = 0
+        for r in rows:
+            if time.monotonic() > deadline:
                 break
-    return collected
+            try:
+                m = await bot.get_chat_member(r["chat_id"], r["user_id"])
+                left = m.status in ("left", "kicked")
+            except Exception as ex:
+                errs += 1
+                logging.info("unsub admin-task get_chat_member %s: %s", r["chat_id"], ex)
+                left = False  # при ошибке не штрафуем
+            if left:
+                await apply_unsub_penalty(bot, r["user_id"], r["url"] or str(r["chat_id"]),
+                                          "user_tasks", "user_id=? AND task_id=?", (r["user_id"], r["task_id"]))
+            await asyncio.sleep(0.1)
+        return len(rows), (f"ошибок проверки: {errs} — бот должен быть админом канала" if errs else "")
+
+    async def flyer():
+        rows = await fetchall(
+            "SELECT f.* FROM flyer_tasks f JOIN users u ON u.id=f.user_id "
+            "WHERE f.status='done' AND f.penalized=0 AND f.task='subscribe channel' "
+            "AND u.referrer_id IS NOT NULL AND f.day>=? ORDER BY RANDOM() LIMIT 100", (cutoff,))
+        seen = set()
+        for r in rows:
+            if time.monotonic() > deadline:
+                break
+            res = await flyer_call("check_task", {"signature": r["signature"]})
+            seen.add(str(res.get("result") or res.get("error")))
+            logging.info("unsub flyer user=%s result=%s", r["user_id"], res)
+            if res.get("result") in ("incomplete", "abort"):
+                await apply_unsub_penalty(bot, r["user_id"], r["url"], "flyer_tasks", "id=?", (r["id"],))
+            await asyncio.sleep(0.2)
+        return len(rows), ("ответы: " + ", ".join(sorted(seen))) if seen else ""
+
+    async def tgrass():
+        rows = await fetchall(
+            "SELECT g.* FROM tgrass_tasks g JOIN users u ON u.id=g.user_id "
+            "WHERE g.status='done' AND g.penalized=0 AND g.kind='channel' "
+            "AND u.referrer_id IS NOT NULL AND g.day>=? ORDER BY RANDOM() LIMIT 100", (cutoff,))
+        seen = set()
+        for r in rows:
+            if time.monotonic() > deadline:
+                break
+            res = await tgrass_call("check", {"tg_user_id": r["user_id"], "offer_id": r["offer_id"]})
+            seen.add(str(res.get("status") or res.get("error")))
+            logging.info("unsub tgrass user=%s result=%s", r["user_id"], res)
+            if res.get("status") == "not_subscribed":
+                await apply_unsub_penalty(bot, r["user_id"], r["link"], "tgrass_tasks", "id=?", (r["id"],))
+            await asyncio.sleep(0.2)
+        return len(rows), ("ответы: " + ", ".join(sorted(seen))) if seen else ""
+
+    async def ext():
+        rows = await fetchall(
+            "SELECT e.* FROM ext_tasks e JOIN users u ON u.id=e.user_id "
+            "WHERE e.status='done' AND e.penalized=0 AND e.kind='channel' "
+            "AND u.referrer_id IS NOT NULL AND e.day>=? ORDER BY RANDOM() LIMIT 100", (cutoff,))
+        seen = set()
+        for r in rows:
+            if time.monotonic() > deadline:
+                break
+            state, _ = await EXT_CHECK[r["provider"]](r["user_id"], r)
+            seen.add(f"{r['provider']}:{state}")
+            logging.info("unsub %s user=%s state=%s", r["provider"], r["user_id"], state)
+            if state == "unsub":
+                await apply_unsub_penalty(bot, r["user_id"], r["link"], "ext_tasks", "id=?", (r["id"],))
+            await asyncio.sleep(0.2)
+        return len(rows), ("ответы: " + ", ".join(sorted(seen))) if seen else ""
+
+    await section("Каналы админа", admin_tasks())
+    if FLYER_KEY:
+        await section("Flyer", flyer())
+    if TGRASS_KEY:
+        await section("TGrass", tgrass())
+    await section("PiarFlow/Trafsly/Traffy", ext())
+    logging.info("unsub-check: %s", " | ".join(report))
+    return report
 
 
-def traffy_headers():
-    return {"x-publisher-api-key": TRAFFY_API_KEY, "Content-Type": "application/json"}
+UNSUB_BUDGET = 40  # секунд на один вызов проверки (лимит функции Vercel — 60 с)
 
 
-async def fetch_traffy(session, user_id, user_data, limit):
-    if not key_filled(TRAFFY_API_KEY):
-        return []
-    payload = {"telegram_id": user_id, "limit": limit}
-    if user_data.get("first_name"):
-        payload["first_name"] = user_data["first_name"]
-    if user_data.get("username"):
-        payload["username"] = user_data["username"]
-    if user_data.get("language_code"):
-        payload["language_code"] = user_data["language_code"]
-    _, data, _ = await api_post(session, "traffy", f"{TRAFFY_API_URL}/tasks", payload, traffy_headers())
-    if not isinstance(data, dict):
-        return []
-    tasks = data.get("tasks") or []
-    return [
-        {"link": t["target_link"], "assignment_id": t["assignment_id"]}
-        for t in tasks
-        if t.get("target_link") and t.get("assignment_id")
-    ][:limit]
+async def _ext_unsub(bot: Bot, provider: str, uid: int, cond: str, args: tuple) -> int:
+    """Штраф по событию-вебхуку от сервиса (только рефералы, задания за последние unsub_days дней)."""
+    days = int(await get_setting("unsub_days"))
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    rows = await fetchall(
+        "SELECT e.id, e.link FROM ext_tasks e JOIN users u ON u.id=e.user_id "
+        "WHERE e.provider=? AND e.user_id=? AND e.status='done' AND e.penalized=0 "
+        f"AND u.referrer_id IS NOT NULL AND e.day>=? AND {cond}", (provider, uid, cutoff, *args))
+    for r in rows:
+        await apply_unsub_penalty(bot, uid, r["link"], "ext_tasks", "id=?", (r["id"],))
+    return len(rows)
 
 
-# ----- проверка выполнения (каждая функция возвращает, что осталось невыполненным) -----
-async def check_tgrass(session, user, items):
-    payload = {
-        "tg_user_id": int(user.id),
-        "tg_login": user.username,
-        "lang": user.language_code or "ru",
-        "is_premium": bool(user.is_premium),
-    }
-    _, res, _ = await api_post(session, "tgrass-check", f"{TGRASS_API_URL}/offers", payload, tgrass_headers())
-    if not isinstance(res, dict):
-        return items
-    if res.get("status") == "ok":
-        return []
-    offers = res.get("offers", []) or []
-    active_links = {o["link"] for o in offers if not o.get("subscribed", True)}
-    return [o for o in items if o["link"] in active_links]
+async def handle_provider_hook(bot: Bot, provider: str, p: dict) -> int:
+    """Вебхуки об отписках от PiarFlow / Trafsly / Traffy. Возвращает число оштрафованных заданий."""
+    n = 0
+    if provider == "piarflow":
+        if not p.get("test") and p.get("status") == "unsubscribed":
+            n += await _ext_unsub(bot, "piarflow", int(p["tg_user_id"]), "e.link=?", (str(p.get("offer_link")),))
+    elif provider == "trafsly":
+        for w in p.get("webhooks") or []:
+            if w.get("status") == "unsubscribed":
+                n += await _ext_unsub(bot, "trafsly", int(w["user_id"]), "(e.ext_id=? OR e.link=?)",
+                                      (str(w.get("ads_id")), str(w.get("link"))))
+    elif provider == "traffy":
+        if p.get("type") == "retention" and p.get("status") == "unsubscribed":
+            n += await _ext_unsub(bot, "traffy", int(p["telegram_id"]), "e.ext_id=?", (str(p.get("task_id")),))
+    return n
 
 
-async def check_piarflow(session, user, items):
-    _, res, _ = await api_post(
-        session, "piarflow-check", f"{PIARFLOW_API_URL}/sponsors/check",
-        {"user_id": user.id, "links": [i["link"] for i in items]}, piarflow_headers(),
-    )
-    if not isinstance(res, dict):
-        return items
-    sponsors = res.get("sponsors", []) or []
-    subscribed = {s["link"] for s in sponsors if s.get("status") == "subscribed"}
-    return [i for i in items if i["link"] not in subscribed]
+# ---------- FSM-хранилище в Turso (память процесса на Vercel не сохраняется) ----------
+class TursoStorage(BaseStorage):
+    @staticmethod
+    def _k(key) -> str:
+        return f"{key.bot_id}:{key.chat_id}:{key.user_id}:{getattr(key, 'thread_id', None)}:{key.destiny}"
+
+    async def set_state(self, key, state=None):
+        st = state.state if isinstance(state, State) else state
+        await db.execute("INSERT INTO fsm(k,state,data) VALUES(?,?,'{}') "
+                         "ON CONFLICT(k) DO UPDATE SET state=excluded.state", (self._k(key), st))
+
+    async def get_state(self, key):
+        r = await fetchone("SELECT state FROM fsm WHERE k=?", (self._k(key),))
+        return r["state"] if r else None
+
+    async def set_data(self, key, data):
+        await db.execute("INSERT INTO fsm(k,state,data) VALUES(?,NULL,?) "
+                         "ON CONFLICT(k) DO UPDATE SET data=excluded.data",
+                         (self._k(key), json.dumps(data, ensure_ascii=False, default=str)))
+
+    async def get_data(self, key):
+        r = await fetchone("SELECT data FROM fsm WHERE k=?", (self._k(key),))
+        return json.loads(r["data"]) if r and r["data"] else {}
+
+    async def close(self):
+        return None
 
 
-async def check_trafsly(session, user, items):
-    async def one(sponsor):
-        _, res, _ = await api_post(
-            session, "trafsly-check", f"{TRAFSLY_API_URL}/api/v1/confirm-subscription",
-            {"user_id": user.id, "ads_id": sponsor.get("ads_id")}, trafsly_headers(),
-        )
-        return sponsor, bool(isinstance(res, dict) and res.get("subscribed", False))
-
-    results = await asyncio.gather(*(one(s) for s in items))
-    return [s for s, done in results if not done]
+# ---------- Инициализация (один раз на «тёплый» инстанс) ----------
+_READY = False
 
 
-async def check_traffy(session, user, items):
-    _, res, _ = await api_post(
-        session, "traffy-check", f"{TRAFFY_API_URL}/tasks/check",
-        {"telegram_id": user.id, "assignment_ids": [i["assignment_id"] for i in items]}, traffy_headers(),
-    )
-    if not isinstance(res, dict):
-        return items
-    status_by_id = {r.get("assignment_id"): r.get("status") for r in (res.get("results") or [])}
-    # completed — выполнено; rejected/expired — выполнить уже нельзя, не держим пользователя
-    return [i for i in items if status_by_id.get(i["assignment_id"], "pending") in ("pending", "error")]
+async def ensure_ready(bot: Bot):
+    global _READY, BOT_USERNAME
+    if not _READY:
+        await init_db()
+        _READY = True
+    if not BOT_USERNAME:
+        BOT_USERNAME = (await bot.get_me()).username
 
 
-# ----- наш канал -----
-async def fetch_own(bot, user_id):
-    """Наш канал показываем, только если пользователь ещё не подписан."""
-    status = await check_subscription(bot, OWN_CHANNEL_ID, user_id)
-    if status is None:
-        print("[own] не удалось проверить подписку — бот должен быть админом канала")
-        return []
-    if status is False:
-        return [{"link": OWN_CHANNEL_LINK, "chat_id": OWN_CHANNEL_ID}]
-    return []
+# ============================== FLYER ==============================
+FLYER_REWARD_CACHE = {"v": 0.25}
 
 
-async def check_own(session, user, items):
-    bot = _current_bot.get()
-    if bot is None:
-        return items
-    left = []
-    for item in items:
-        if item.get("test"):  # заглушка тест-режима — всегда считается выполненной
-            continue
-        st = await check_subscription(bot, item.get("chat_id", OWN_CHANNEL_ID), user.id)
-        if st is False:
-            left.append(item)
-    return left
+async def flyer_call(method: str, payload: dict) -> dict:
+    try:
+        async with http.post(f"{FLYER_URL}/{method}", json={"key": FLYER_KEY, **payload},
+                             timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json(content_type=None)
+            return data if isinstance(data, dict) else {"error": f"bad response: {data!r}"}
+    except Exception as ex:
+        logging.warning("flyer %s failed: %s", method, ex)
+        return {"error": str(ex)}
 
 
-CHECKERS = {
-    "own": check_own,
-    "tgrass": check_tgrass,
-    "piarflow": check_piarflow,
-    "trafsly": check_trafsly,
-    "traffy": check_traffy,
+FLYER_VERBS = {
+    "start bot": ("Запусти", "бота"),
+    "subscribe channel": ("Подпишись на", "канал"),
+    "give boost": ("Отправь буст", "каналу"),
+    "follow link": ("Перейди по", "ссылке"),
+    "perform action": ("Выполни", "действие"),
+    "view posts": ("Посмотри", "посты"),
 }
 
 
-# ================= /start =================
-@router.message(CommandStart())
-async def start_handler(message: Message, command: CommandObject, state: FSMContext) -> None:
-    await state.clear()
-    user_id = message.from_user.id
-    username_str = f"@{message.from_user.username}" if message.from_user.username else f"id{user_id}"
-
-    data = await ensure_user(message.from_user)
-    is_new = data["is_new"]
-    await redis_cmd(
-        "HSET", user_key(user_id),
-        "name", message.from_user.first_name or "", "username", username_str,
-    )
-
-    args = command.args
-    if args and args.startswith("ref_") and is_new:
-        try:
-            referrer_id = int(args.split("_")[1])
-            if referrer_id != user_id:
-                saved = await redis_cmd("SET", f"pending_ref:{user_id}", referrer_id, "NX", "EX", 2592000)
-                if saved and await get_user(referrer_id):
-                    reward = await get_referral_reward()
-                    ref_msg = (
-                        f"реферал: {username_str}\n"
-                        f"доход: 0.00 ⭐\n"
-                        f"как только реферал выполнит {REFERRAL_TASKS_REQUIRED} заданий, вы получите "
-                        f"{reward:g}⭐️"
-                    )
-                    try:
-                        await message.bot.send_message(chat_id=referrer_id, text=ref_msg)
-                    except Exception:
-                        pass
-        except ValueError:
-            pass
-
-    # Сначала два основных сообщения: реферальная ссылка, затем задание.
-    await send_referral_welcome(message)
-    await send_start_task(message)
-    # Reply-клавиатуру показываем отдельно: Telegram не умеет совмещать её
-    # с inline-кнопками копирования/отправки и кнопками задания в одном сообщении.
-    await message.answer("Быстрые кнопки меню находятся внизу 👇", reply_markup=main_reply_keyboard(message.from_user.id))
+async def next_flyer_task(uid: int, lang: str = None):
+    """Возвращает строку flyer_tasks с очередным заданием от Flyer или None."""
+    if not FLYER_KEY:
+        return None
+    data = await flyer_call("get_tasks", {"user_id": uid, "language_code": lang or "ru", "limit": FLYER_LIMIT})
+    if data.get("error"):
+        logging.info("flyer get_tasks: %s", data["error"])
+        return None
+    for t in data.get("result") or []:
+        if t.get("status") != "incomplete" or not t.get("links"):
+            continue
+        row = await fetchone("SELECT * FROM flyer_tasks WHERE user_id=? AND signature=?", (uid, t["signature"]))
+        if row and row["status"] in ("done", "skip"):
+            continue
+        if not row:
+            await run("INSERT OR IGNORE INTO flyer_tasks(user_id,signature,task,url,status) VALUES(?,?,?,?,'shown')",
+                      (uid, t["signature"], t.get("task", ""), t["links"][0]))
+            row = await fetchone("SELECT * FROM flyer_tasks WHERE user_id=? AND signature=?", (uid, t["signature"]))
+        return row
+    logging.info("flyer: для %s нет подходящих заданий. Ответ: %s", uid,
+                 [(t.get("task"), t.get("status")) for t in (data.get("result") or [])])
+    return None
 
 
-
-# ================= ПЕРВОЕ СООБЩЕНИЕ: РЕФЕРАЛЬНАЯ ССЫЛКА =================
-async def send_referral_welcome(message: Message) -> None:
-    user = await ensure_user(message.from_user)
-    bot_info = await message.bot.get_me()
-    referral_link = f"https://t.me/{bot_info.username}?start=ref_{message.from_user.id}"
-    reward = await get_referral_reward()
-    share_url = (
-        "https://t.me/share/url?url=" + quote(referral_link, safe="")
-        + "&text=" + quote("Присоединяйся и зарабатывай ⭐️", safe="")
-    )
-    text = (
-        f"Получай +{DEFAULT_REFERRAL_REWARD:g} ⭐️ за каждого приглашенного друга!\n"
-        f"🔗 Твоя реферальная ссылка:\n{html.escape(referral_link)}\n\n"
-        f"Приглашено тобой: {user['referrals']} 👤\n\n"
-        "❤️ Как это работает:\n"
-        "╠ Отправь свою ссылку другу\n"
-        f"╠ Друг заходит и выполняет {REFERRAL_TASKS_REQUIRED} заданий\n"
-        f"╚ Ты получаешь {DEFAULT_REFERRAL_REWARD:g}⭐️ сразу же!"
-    )
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Скопировать ссылку", copy_text=CopyTextButton(text=referral_link))],
-        [InlineKeyboardButton(text="📨 Отправить другу", url=share_url)],
-    ])
-    await message.answer(text, reply_markup=markup, disable_web_page_preview=True)
-
-
-def task_action_label(task_type: str, link: str = "") -> str:
-    kind = (task_type or "").lower()
-    if kind == "bot" or "/start" in link or "t.me/" in link and "bot" in link.lower():
-        return "Запусти бота"
-    return "Подпишись на"
-
-
-def task_message_text(number: int, link: str, reward: float, task_type: str = "channel") -> str:
-    safe_link = html.escape(link, quote=True)
-    kind = (task_type or "").lower()
-    is_bot_task = kind == "bot" or "/start" in link or ("t.me/" in link and "bot" in link.lower())
-    if is_bot_task:
-        action = f"🟢 Запусти <a href=\"{safe_link}\">бота</a> и нажми «Подтвердить»"
-    else:
-        action = f"🟢 Подпишись на <a href=\"{safe_link}\">канал</a> и нажми «Подтвердить»"
+def flyer_task_text(ft) -> str:
+    verb, noun = FLYER_VERBS.get(ft["task"], ("Выполни", "задание"))
+    link = html.escape(ft["url"], quote=True)
     return (
-        "💡 Получай Звёзды за простые задания! 👇\n"
-        f"{action}\n"
-        f"Вознаграждение: +{reward:g}⭐️"
+        f"{BULB} Получай Звёзды за простые задания! 👇\n\n"
+        f"{GREEN} {verb} <a href=\"{link}\">{noun}</a> и нажми «Подтвердить»\n\n"
+        f"Вознаграждение: +{fmt(FLYER_REWARD_CACHE['v'])}{STAR}"
     )
 
 
-def task_keyboard(go_url: str, confirm_data: str, skip_data: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🔎 Перейти", url=go_url),
-            InlineKeyboardButton(text="✅ Подтвердить", callback_data=confirm_data),
-        ],
-        [InlineKeyboardButton(text="⏭️ Пропустить", callback_data=skip_data)],
-    ])
+def flyer_task_kb(ft) -> InlineKeyboardMarkup:
+    return kb(
+        [btn("🔎 Перейти", url=ft["url"], style="primary"),
+         btn("✅ Подтвердить", cb=f"fc:{ft['id']}", style="success")],
+        [btn("⏭️ Пропустить", cb=f"fs:{ft['id']}", style="danger")],
+    )
 
 
-async def send_start_task(message: Message) -> None:
-    """Показывает задание сразу после приветствия, без обязательной подписки на спонсоров."""
-    user = message.from_user
-    uid = user.id
+# ============================== TGRASS ==============================
+TGRASS_REWARD_CACHE = {"v": 0.25}
 
-    # Сначала задания, созданные администратором.
-    task = await pick_task(uid, reset=True)
-    if task:
-        link = str(task.get("link") or "")
-        reward = to_float(task.get("reward"), 0.25)
-        task_type = str(task.get("type") or task.get("task_type") or "").lower()
-        text = task_message_text(await task_number(uid), link, reward, task_type)
-        await message.answer(
-            text,
-            reply_markup=task_keyboard(link, f"done_task_{task['id']}", f"skip_task_{task['id']}"),
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-        return
+TGRASS_VERBS = {
+    "channel": ("Подпишись на", "канал"),
+    "bot": ("Запусти", "бота"),
+    "resource": ("Перейди по", "ссылке"),
+    "folder": ("Подпишись на", "папку"),
+}
 
-    # Затем Flyer, если интеграция вернула задание.
+
+async def tgrass_call(method: str, payload: dict) -> dict:
     try:
-        flyer_task = await pick_flyer_task(user, reset=True)
-        if flyer_task:
-            link = flyer_button_url(flyer_task["links"][0])
-            if link:
-                signature = str(flyer_task["signature"])
-                await redis_cmd("SET", f"flyer_cur:{uid}", signature, "EX", 86400)
-                raw_type = str(flyer_task.get("task") or "channel").lower()
-                task_type = "bot" if "bot" in raw_type else "channel"
-                text = task_message_text(await task_number(uid), link, FLYER_REWARD, task_type)
-                await message.answer(
-                    text, reply_markup=task_keyboard(link, "fl_done", "fl_skip"),
-                    parse_mode="HTML", disable_web_page_preview=True,
-                )
-                return
-    except Exception as e:
-        print(f"[tasks] start Flyer error: {e!r}")
+        async with http.post(f"{TGRASS_URL}/{method}", json=payload,
+                             headers={"Auth": TGRASS_KEY, "accept": "application/json"},
+                             timeout=aiohttp.ClientTimeout(total=10), ssl=TGRASS_VERIFY_SSL) as r:
+            data = await r.json(content_type=None)
+            if r.status != 200:
+                return {"error": f"HTTP {r.status}: {data}"}
+            return data if isinstance(data, dict) else {"error": f"bad response: {data!r}"}
+    except Exception as ex:
+        logging.warning("tgrass %s failed: %s", method, ex)
+        return {"error": str(ex)}
 
-    # Затем Flowly.
+
+async def tgrass_offers(tgu) -> dict:
+    payload = {"tg_user_id": tgu.id, "lang": tgu.language_code or "ru", "is_premium": bool(tgu.is_premium)}
+    if tgu.username:
+        payload["tg_login"] = tgu.username
+    return await tgrass_call(TGRASS_ENDPOINT, payload)
+
+
+async def next_tgrass_task(tgu):
+    """Возвращает строку tgrass_tasks с очередным оффером или None."""
+    if not TGRASS_KEY or tgu is None:
+        return None
+    for attempt in range(2):
+        data = await tgrass_offers(tgu)
+        if data.get("error"):
+            logging.info("tgrass: %s", data["error"])
+            return None
+        for o in data.get("offers") or []:
+            if o.get("subscribed") or not o.get("link") or o.get("offer_id") is None:
+                continue
+            row = await fetchone("SELECT * FROM tgrass_tasks WHERE user_id=? AND offer_id=?", (tgu.id, o["offer_id"]))
+            if row and row["status"] in ("done", "skip"):
+                continue
+            if not row:
+                await run("INSERT OR IGNORE INTO tgrass_tasks(user_id,offer_id,link,kind,status) VALUES(?,?,?,?,'shown')",
+                          (tgu.id, o["offer_id"], o["link"], o.get("type", "")))
+                row = await fetchone("SELECT * FROM tgrass_tasks WHERE user_id=? AND offer_id=?",
+                                     (tgu.id, o["offer_id"]))
+            return row
+        if data.get("status") == "ok" and attempt == 0:
+            # пользователь выполнил все текущие офферы — просим TGrass выдать новые сразу
+            await tgrass_call("reset_offers", {"tg_user_id": tgu.id})
+            continue
+        break
+    logging.info("tgrass: для %s нет подходящих заданий (status=%s)", tgu.id, data.get("status"))
+    return None
+
+
+def tgrass_task_text(gt) -> str:
+    verb, noun = TGRASS_VERBS.get(gt["kind"], ("Перейди по", "ссылке"))
+    link = html.escape(gt["link"], quote=True)
+    return (
+        f"{BULB} Получай Звёзды за простые задания! 👇\n\n"
+        f"{GREEN} {verb} <a href=\"{link}\">{noun}</a> и нажми «Подтвердить»\n\n"
+        f"Вознаграждение: +{fmt(TGRASS_REWARD_CACHE['v'])}{STAR}"
+    )
+
+
+def tgrass_task_kb(gt) -> InlineKeyboardMarkup:
+    return kb(
+        [btn("🔎 Перейти", url=gt["link"], style="primary"),
+         btn("✅ Подтвердить", cb=f"gc:{gt['id']}", style="success")],
+        [btn("⏭️ Пропустить", cb=f"gs:{gt['id']}", style="danger")],
+    )
+
+
+# ============== TRAFSLY / PIARFLOW / TRAFFY (общая таблица ext_tasks) ==============
+EXT_NAMES = {"trafsly": "Trafsly", "piarflow": "PiarFlow", "traffy": "Traffy"}
+
+
+async def ext_post(url: str, headers: dict, payload: dict):
+    """Возвращает (http_status, json|{}). При сетевой ошибке (0, {})."""
     try:
-        offer = await pick_flowly_task(user, reset=True)
-        if offer:
-            link = flyer_button_url(offer.get("link"))
-            if link:
-                offer_id = str(offer["offer_id"])
-                await redis_cmd("SET", f"flowly_cur:{uid}", offer_id, "EX", 86400)
-                task_type = str(offer.get("type") or "channel").lower()
-                text = task_message_text(await task_number(uid), link, FLOWLY_REWARD, task_type)
-                await message.answer(
-                    text, reply_markup=task_keyboard(link, "flw_done", "flw_skip"),
-                    parse_mode="HTML", disable_web_page_preview=True,
-                )
-                return
-    except Exception as e:
-        print(f"[tasks] start Flowly error: {e!r}")
-
-    await message.answer("💡 Сейчас нет доступных заданий. Попробуй немного позже.")
+        async with http.post(url, json=payload, headers=headers,
+                             timeout=aiohttp.ClientTimeout(total=10)) as r:
+            data = await r.json(content_type=None)
+            return r.status, (data if isinstance(data, dict) else {})
+    except Exception as ex:
+        logging.warning("ext_post %s failed: %s", url, ex)
+        return 0, {}
 
 
-async def maybe_reward_referrer_after_tasks(bot: Bot, uid: int) -> None:
-    """Начисляет награду пригласившему один раз, когда реферал выполнил 7 заданий."""
-    done_keys = (f"user_done:{uid}", f"flyer_done:{uid}", f"flowly_done:{uid}")
-    counts = await asyncio.gather(*(redis_cmd("SCARD", key) for key in done_keys))
-    if sum(to_int(v) for v in counts) < REFERRAL_TASKS_REQUIRED:
-        return
-    raw = await redis_cmd("GETDEL", f"pending_ref:{uid}")
-    if raw is None:
-        return
-    try:
-        ref_id = int(raw)
-    except (TypeError, ValueError):
-        return
-    if ref_id == uid:
-        return
-    ref = await ensure_user_by_id(ref_id)
-    reward = await get_referral_reward()
-    await redis_cmd("SADD", f"refs:{ref_id}", uid)
-    await redis_cmd("HINCRBY", user_key(ref_id), "referrals", 1)
-    total = await add_balance(ref_id, reward)
-    await add_referral_to_top(ref_id, ref.get("name") or f"id{ref_id}")
-    try:
-        await bot.send_message(
-            chat_id=ref_id,
-            text=f"🎉 Твой друг выполнил {REFERRAL_TASKS_REQUIRED} заданий! Начислено {reward:g}⭐️\nБаланс: {to_float(total):g}⭐️",
-        )
-    except Exception:
-        pass
+def guess_kind(link: str) -> str:
+    l = (link or "").lower()
+    if "?start=" in l or re.search(r"t\.me/[a-z0-9_]*bot(\?|/|$)", l):
+        return "bot"
+    return "channel"
 
 
-# ================= /debug (только админ) =================
-@router.message(Command("debug"))
-async def debug_handler(message: Message, state: FSMContext) -> None:
-    if message.from_user.id != ADMIN_ID:
-        return
-    await state.clear()
+async def ext_seen_links(uid: int, provider: str):
+    rows = await fetchall("SELECT link FROM ext_tasks WHERE user_id=? AND provider=? AND status IN ('done','skip') "
+                          "ORDER BY id DESC LIMIT 50", (uid, provider))
+    return [r["link"] for r in rows if r["link"]]
 
-    user = message.from_user
-    user_id = user.id
-    chat_id = message.chat.id
 
-    def key_status(v: Optional[str]) -> str:
-        return f"заполнен ({len(v)} симв.)" if key_filled(v) else "НЕ ЗАПОЛНЕН"
+async def ext_get_or_create(uid: int, provider: str, ext_id: str, link: str, kind: str):
+    row = await fetchone("SELECT * FROM ext_tasks WHERE user_id=? AND provider=? AND ext_id=?",
+                         (uid, provider, str(ext_id)))
+    if row and row["status"] in ("done", "skip"):
+        return None
+    if not row:
+        await run("INSERT OR IGNORE INTO ext_tasks(user_id,provider,ext_id,link,kind,status) VALUES(?,?,?,?,?,'shown')",
+                  (uid, provider, str(ext_id), link, kind))
+        row = await fetchone("SELECT * FROM ext_tasks WHERE user_id=? AND provider=? AND ext_id=?",
+                             (uid, provider, str(ext_id)))
+    return row
 
-    ping = await redis_cmd("PING") if redis_enabled() else None
-    if not redis_enabled():
-        redis_line = "НЕ НАСТРОЕН — данные НЕ сохраняются!"
-    elif ping == "PONG":
-        redis_line = "работает ✅"
+
+# ---------- Trafsly ----------
+def _trafsly_headers():
+    return {"Auth": TRAFSLY_KEY, "Content-Type": "application/json"}
+
+
+async def next_trafsly(tgu):
+    if not TRAFSLY_KEY or tgu is None:
+        return None
+    payload = {"user_id": tgu.id, "first_name": tgu.first_name or "", "language_code": tgu.language_code or "ru",
+               "is_premium": bool(tgu.is_premium)}
+    if tgu.username:
+        payload["username"] = tgu.username
+    seen = await ext_seen_links(tgu.id, "trafsly")
+    if seen:
+        payload["exclude_links"] = seen
+    code, data = await ext_post(f"{TRAFSLY_URL}/get-sponsors", _trafsly_headers(), payload)
+    if code != 200:
+        logging.info("trafsly get-sponsors: %s %s", code, data)
+        return None
+    for sp in data.get("sponsors") or []:
+        if sp.get("status") != "unsubscribed" or not sp.get("link") or sp.get("ads_id") is None:
+            continue
+        row = await ext_get_or_create(tgu.id, "trafsly", sp["ads_id"], sp["link"],
+                                      sp.get("type") or guess_kind(sp["link"]))
+        if row:
+            return row
+    return None
+
+
+async def check_trafsly(uid: int, row):
+    ads_id = row["ext_id"]
+    ads_id = int(ads_id) if ads_id.isdigit() else ads_id
+    code, data = await ext_post(f"{TRAFSLY_URL}/confirm-subscription", _trafsly_headers(),
+                                {"user_id": uid, "ads_id": ads_id})
+    if code != 200:
+        return "wait", ""
+    if data.get("subscribed"):
+        return "ok", ""
+    msg = str(data.get("message") or "")
+    if msg == "Unsubscribed":
+        return "unsub", ""
+    if msg == "Subscription not verified":
+        return "no", ""
+    if msg in ("Sponsor was not shown", "Not subscribed, request get-sponsors again"):
+        return "refresh", ""
+    if msg == "Too many confirmation attempts":
+        return "wait", ""
+    return "gone", msg
+
+
+# ---------- PiarFlow ----------
+def _piar_headers():
+    return {"Authorization": f"Bearer {PIARFLOW_KEY}", "Content-Type": "application/json"}
+
+
+async def next_piarflow(tgu):
+    if not PIARFLOW_KEY or tgu is None:
+        return None
+    payload = {"user_id": tgu.id, "chat_id": tgu.id, "max_sponsors": 5}
+    if PIARFLOW_NO_TOKEN:
+        payload.update({"first_name": tgu.first_name, "username": tgu.username,
+                        "language_code": tgu.language_code, "bio": None})
+    code, data = await ext_post(f"{PIARFLOW_URL}/sponsors", _piar_headers(), payload)
+    if code != 200:
+        logging.info("piarflow sponsors: %s %s", code, data)
+        return None
+    for sp in data.get("sponsors") or []:
+        if sp.get("status") != "unsubscribed" or not sp.get("link"):
+            continue
+        row = await ext_get_or_create(tgu.id, "piarflow", sp["link"], sp["link"], guess_kind(sp["link"]))
+        if row:
+            return row
+    return None
+
+
+async def check_piarflow(uid: int, row):
+    code, data = await ext_post(f"{PIARFLOW_URL}/sponsors/check", _piar_headers(),
+                                {"user_id": uid, "links": [row["link"]]})
+    if code == 403:
+        return "no", ""
+    if code == 404:
+        return "gone", ""
+    if code != 200:
+        return "wait", ""
+    for it in data.get("sponsors") or []:
+        if it.get("link") == row["link"] or len(data.get("sponsors")) == 1:
+            st = it.get("status")
+            if st in ("subscribed", "not_counted"):
+                return "ok", ""
+            if st == "unsubscribed":
+                return "unsub", ""
+    return "wait", ""
+
+
+# ---------- Traffy ----------
+def _traffy_headers():
+    return {"x-publisher-api-key": TRAFFY_KEY, "Content-Type": "application/json"}
+
+
+async def next_traffy(tgu):
+    if not TRAFFY_KEY or tgu is None:
+        return None
+    payload = {"telegram_id": tgu.id, "limit": 5, "first_name": tgu.first_name or "",
+               "language_code": tgu.language_code or "ru"}
+    if tgu.username:
+        payload["username"] = tgu.username
+    code, data = await ext_post(f"{TRAFFY_URL}/tasks", _traffy_headers(), payload)
+    if code != 200 or not data.get("ok"):
+        logging.info("traffy tasks: %s %s", code, data)
+        return None
+    for t in data.get("tasks") or []:
+        if not t.get("assignment_id") or not t.get("target_link"):
+            continue
+        row = await ext_get_or_create(tgu.id, "traffy", t["assignment_id"], t["target_link"],
+                                      guess_kind(t["target_link"]))
+        if row:
+            return row
+    return None
+
+
+async def check_traffy(uid: int, row):
+    code, data = await ext_post(f"{TRAFFY_URL}/tasks/check", _traffy_headers(),
+                                {"telegram_id": uid, "assignment_ids": [row["ext_id"]]})
+    if code != 200 or not data.get("ok"):
+        return "wait", ""
+    res = (data.get("results") or [{}])[0]
+    st, reason = res.get("status"), res.get("reason")
+    if st == "completed":
+        return "ok", ""
+    if reason == "payout_cancelled":
+        return "unsub", ""
+    if st == "pending":
+        return "no", ""
+    if reason == "joined_via_other_link":
+        return "gone", "Подписка не засчитана: вы вступили не по ссылке из задания."
+    if st == "error":
+        return "wait", ""
+    return "gone", ""
+
+
+# порядок важен: сначала PiarFlow, потом Trafsly, потом Traffy
+EXT_NEXT = {"piarflow": next_piarflow, "trafsly": next_trafsly, "traffy": next_traffy}
+EXT_CHECK = {"trafsly": check_trafsly, "piarflow": check_piarflow, "traffy": check_traffy}
+
+
+async def next_ext_task(tgu):
+    for prov, fn in EXT_NEXT.items():
+        row = await fn(tgu)
+        if row:
+            return row
+    return None
+
+
+async def ext_task_text(et) -> str:
+    reward = await get_setting(f"{et['provider']}_reward")
+    link = html.escape(et["link"], quote=True)
+    if et["kind"] == "bot":
+        action = f'Запусти <a href="{link}">бота</a> и нажми «Подтвердить»'
     else:
-        redis_line = "настроен, но НЕ отвечает ❌ (проверьте URL и токен)"
-
-    lines = [
-        "🔧 ДИАГНОСТИКА",
-        f"BOT_TOKEN: {'задан' if BOT_TOKEN else 'НЕ ЗАДАН'}",
-        f"TGRASS_API_KEY: {key_status(TGRASS_API_KEY)}",
-        f"PIARFLOW_API_KEY: {key_status(PIARFLOW_API_KEY)}",
-        f"TRAFSLY_API_KEY: {key_status(TRAFSLY_API_KEY)}",
-        f"TRAFFY_API_KEY: {key_status(TRAFFY_API_KEY)}",
-        f"FLOWLY_API_KEY: {key_status(FLOWLY_API_KEY)}",
-        f"FLYER_API_KEY: {key_status(FLYER_API_KEY)} | "
-        f"{FLYER_API_KEY[:5]}…{FLYER_API_KEY[-4:]} | "
-        f"источник: {'переменная окружения Vercel' if os.environ.get('FLYER_API_KEY') else 'значение по умолчанию из кода'}",
-        f"REDIS: {redis_line}",
-        "",
-    ]
-
-    timeout = aiohttp.ClientTimeout(total=5)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        st, _, body = await api_post(
-            session, "tgrass", f"{TGRASS_API_URL}/offers",
-            {
-                "tg_user_id": int(user_id),
-                "tg_login": user.username,
-                "lang": user.language_code or "ru",
-                "is_premium": bool(user.is_premium),
-                "offers_limit": 3,
-            },
-            tgrass_headers(),
-        )
-        lines.append(f"TGRASS → HTTP {st}\n{body[:500]}\n")
-
-        st, _, body = await api_post(
-            session, "piarflow", f"{PIARFLOW_API_URL}/sponsors",
-            {"user_id": user_id, "chat_id": chat_id, "max_sponsors": 3},
-            piarflow_headers(),
-        )
-        lines.append(f"PIARFLOW → HTTP {st}\n{body[:500]}\n")
-
-        st, _, body = await api_post(
-            session, "trafsly", f"{TRAFSLY_API_URL}/api/v1/get-sponsors",
-            {
-                "user_id": user_id,
-                "chat_id": chat_id,
-                "first_name": user.first_name or "",
-                "username": user.username or "",
-                "language_code": user.language_code or "ru",
-                "is_premium": bool(user.is_premium),
-                "max_sponsors": 3,
-            },
-            trafsly_headers(),
-        )
-        lines.append(f"TRAFSLY → HTTP {st}\n{body[:500]}\n")
-
-        traffy_payload = {"telegram_id": user_id, "limit": 3}
-        if user.language_code:
-            traffy_payload["language_code"] = user.language_code
-        st, _, body = await api_post(
-            session, "traffy", f"{TRAFFY_API_URL}/tasks", traffy_payload, traffy_headers(),
-        )
-        lines.append(f"TRAFFY → HTTP {st}\n{body[:500]}\n")
-
-        # Flyer: тип ключа (для заданий нужен «tasks») и пробный запрос заданий
-        me_data = await flyer_post("get_me", {})
-        lines.append(f"FLYER get_me → {me_data}\n")
-        fl_payload = {"user_id": user_id, "language_code": user.language_code or "ru", "limit": FLYER_TASKS_LIMIT}
-        lines.append(f"FLYER get_tasks → {await flyer_post('get_tasks', fl_payload)}\n")
-
-        st, _, body = await api_post(
-            session, "flowly", f"{FLOWLY_API_URL}/offers",
-            {"tg_user_id": user_id, "lang": user.language_code or "ru",
-             "is_premium": bool(user.is_premium), "offers_limit": 3},
-            {"Auth": FLOWLY_API_KEY, "Content-Type": "application/json"},
-        )
-        lines.append(f"FLOWLY → HTTP {st}\n{body[:500]}\n")
-
-
-    try:
-        me_bot = await message.bot.me()
-        member = await message.bot.get_chat_member(OWN_CHANNEL_ID, me_bot.id)
-        st_own = _status_str(member)
-        ok = st_own in ("administrator", "creator")
-        lines.append(f"НАШ КАНАЛ: бот — {st_own} " + ("✅" if ok else "❌ сделайте бота администратором"))
-    except Exception as e:
-        lines.append(f"НАШ КАНАЛ: нет доступа ❌ {e!r}")
-
-    text = "\n".join(lines)
-    for i in range(0, len(text), 3900):
-        await message.answer(text[i:i + 3900])
-
-
-# ================= /resetme (только админ, для тестов) =================
-@router.message(Command("resetme"))
-async def resetme_handler(message: Message, state: FSMContext) -> None:
-    if message.from_user.id != ADMIN_ID:
-        return
-    await state.clear()
-    uid = message.from_user.id
-    await redis_cmd("SREM", "income_users", uid)
-    await redis_cmd("SREM", "passed_users", uid)
-    await redis_cmd("DEL", f"sp_total:{uid}")
-    await redis_cmd("DEL", f"sp_active:{uid}")
-    await redis_cmd("DEL", f"flyer_done:{uid}", f"flyer_skip:{uid}", f"flyer_cur:{uid}", f"flyer_dead:{uid}")
-    await redis_cmd("DEL", f"flowly_done:{uid}", f"flowly_skip:{uid}", f"flowly_cur:{uid}", f"flowly_dead:{uid}")
-    await redis_cmd("DEL", f"pending_ref:{uid}")
-    await redis_cmd("DEL", f"verify:{uid}")
-    await redis_cmd("DEL", f"verify_pending:{uid}")
-    await message.answer(
-        "✅ Ваш аккаунт сброшен для теста. Нажмите /start — снова пройдёте спонсоров и проверку номера."
+        action = f'Подпишись на <a href="{link}">канал</a> и нажми «Подтвердить»'
+    return (
+        f"{BULB} Получай Звёзды за простые задания! 👇\n\n"
+        f"{GREEN} {action}\n\n"
+        f"Вознаграждение: +{fmt(reward)}{STAR}"
     )
 
 
-# ================= /woot (только админ): полный сброс аккаунта =================
-@router.message(Command("woot"))
-async def woot_handler(message: Message, state: FSMContext) -> None:
-    if message.from_user.id not in WOOT_IDS:
-        return
-    await state.clear()
-    uid = message.from_user.id
-
-    invited = await redis_cmd("SMEMBERS", f"refs:{uid}") or []
-    promos = await redis_cmd("ZRANGE", "promos", 0, -1) or []
-
-    cmds: list = []
-    # у приглашённых этим аккаунтом убираем привязку, чтобы штрафы не шли на сброшенный аккаунт
-    for rid in invited:
-        cmds.append(["DEL", f"refby:{rid}"])
-    # можно снова активировать промокоды
-    for code in promos:
-        cmds.append(["SREM", f"promo_used:{code}", uid])
-    cmds.append([
-        "DEL", user_key(uid), f"refs:{uid}", f"refby:{uid}", f"pending_ref:{uid}",
-        f"sp_total:{uid}", f"sp_active:{uid}", f"watch:{uid}", f"penalized:{uid}",
-        f"user_done:{uid}", f"user_skip:{uid}", f"wd:{uid}", f"verify_pending:{uid}",
-        f"flyer_done:{uid}", f"flyer_skip:{uid}", f"flyer_cur:{uid}", f"flyer_dead:{uid}",
-        f"flowly_done:{uid}", f"flowly_skip:{uid}", f"flowly_cur:{uid}", f"flowly_dead:{uid}",
-    ])
-    cmds += [
-        ["SREM", "users", uid],
-        ["ZREM", "users_joined", uid],
-        ["ZREM", "top_refs", uid],
-        ["HDEL", "top_names", uid],
-        ["SREM", "income_users", uid],
-        ["SREM", "passed_users", uid],
-        ["ZREM", "watch_list", uid],
-    ]
-    await redis_pipeline(cmds)
-    await redis_cmd("DEL", f"verify:{uid}")
-    # тест-режим: после /woot бот всегда выдаёт 6 спонсоров (см. fill_test_sponsors)
-    await redis_cmd("SET", f"woot_test:{uid}", "1")
-
-    await message.answer(
-        "✅ Аккаунт полностью сброшен: баланс, рефералы, спонсоры, штрафы.\n"
-        "🧪 Тест-режим: вам всегда выдаётся 6 спонсоров, даже если вы уже подписаны на часть из них.\n\n"
-        "Теперь вы как новый пользователь: нажмите /start (спонсоры запросятся заново) "
-        "или перейдите по реферальной ссылке — реферал засчитается."
+def ext_task_kb(et) -> InlineKeyboardMarkup:
+    return kb(
+        [btn("🔎 Перейти", url=et["link"], style="primary"),
+         btn("✅ Подтвердить", cb=f"ec:{et['id']}", style="success")],
+        [btn("⏭️ Пропустить", cb=f"es:{et['id']}", style="danger")],
     )
 
 
-# ================= ЭТАП СПОНСОРОВ ЗАВЕРШЁН =================
-async def after_sponsors(bot: Bot, target, user, had_sponsors: bool, sponsors_count: int = 0) -> None:
-    """Этап спонсоров пройден (проверки номера больше нет): награда рефералу и меню."""
-    uid = user.id
-    # если человек застрял на старой проверке номера — берём исходное «были ли спонсоры»
-    pending = await redis_cmd("GETDEL", f"verify_pending:{uid}")
-    if pending is not None:
-        had_sponsors = pending == "1"
-        if not had_sponsors:
-            sponsors_count = 0
-    if had_sponsors:
-        await send_sponsors_done(target)
-    await reward_referrer_if_needed(bot, uid, had_sponsors, sponsors_count)
-    await send_main_menu(target, user)
+# ============================== FSM ==============================
+class PromoSt(StatesGroup):
+    code = State()
 
 
-class AccessMiddleware(BaseMiddleware):
-    """Проверки номера больше нет: только перепроверка подписки (штрафы) при заходе в бота."""
+class WdSt(StatesGroup):
+    username = State()
+    confirm = State()
 
+
+class TaskAdd(StatesGroup):
+    url = State()
+    chat = State()
+    reward = State()
+
+
+class PromoAdd(StatesGroup):
+    code = State()
+    reward = State()
+    uses = State()
+
+
+class Cast(StatesGroup):
+    msg = State()
+
+
+class UserAdm(StatesGroup):
+    find = State()
+    amount = State()
+
+
+class SetSt(StatesGroup):
+    value = State()
+
+
+class BanMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
-        user = getattr(event, "from_user", None)
-        if user is not None:
-            await maybe_check_watch(event)
+        u = data.get("event_from_user")
+        if u and u.id not in ADMIN_IDS:
+            row = await fetchone("SELECT banned FROM users WHERE id=?", (u.id,))
+            if row and row["banned"]:
+                return None
         return await handler(event, data)
 
 
-router.message.outer_middleware(AccessMiddleware())
-router.callback_query.outer_middleware(AccessMiddleware())
+# ============================== ПОЛЬЗОВАТЕЛЬСКИЕ ХЕНДЛЕРЫ ==============================
+user = Router()
+USERNAME_RE = re.compile(r"^@?([A-Za-z][A-Za-z0-9_]{4,31})$")
 
 
-# ================= КНОПКИ НИЖНЕЙ КЛАВИАТУРЫ =================
-@router.message(F.text == "⭐ Задание")
-async def reply_task_button(message: Message, state: FSMContext) -> None:
+@user.message(CommandStart())
+async def cmd_start(m: Message, command: CommandObject, state: FSMContext):
     await state.clear()
-    await ensure_user(message.from_user)
-    await send_start_task(message)
-
-
-@router.message(F.text == "👤 Профиль")
-async def reply_profile_button(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    stats = await ensure_user(message.from_user)
-    text = (
-        f"👤 Профиль: {message.from_user.first_name}\n"
-        f"🆔 ID: {message.from_user.id}\n"
-        f"💰 Баланс: {stats['balance']:.2f}⭐️\n"
-        f"👥 Приглашено друзей: {stats['referrals']}"
-    )
-    await message.answer(text, reply_markup=main_reply_keyboard(message.from_user.id))
-
-
-@router.message(F.text == "🎁 Промокод")
-async def reply_promocode_button(message: Message, state: FSMContext) -> None:
-    await state.set_state(PromocodeStates.waiting_for_activation_input)
-    await message.answer("🎟 Введите промокод:", reply_markup=main_reply_keyboard(message.from_user.id))
-
-
-@router.message(F.text == "👥 Рефералы")
-async def reply_referrals_button(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await send_referral_welcome(message)
-
-
-@router.message(F.text == "🏆 Топ")
-async def reply_top_button(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await ensure_user(message.from_user)
-    top = await get_top(5)
-    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-    lines = []
-    for i in range(5):
-        if i < len(top):
-            _, name, refs = top[i]
-            lines.append(f"{medals[i]} {name} — рефералов: {refs}")
-        else:
-            lines.append(f"{medals[i]} —")
-    my_refs, my_rank = await get_user_refs_and_rank(message.from_user.id)
-    if my_rank is not None and my_rank <= 5:
-        footer = f"🏆 Ты на {my_rank} месте! Рефералов: {my_refs}"
-    elif my_rank is not None:
-        footer = f"📍 Твоё место: {my_rank} | Рефералов: {my_refs}"
-    else:
-        footer = f"🚫 Ты не попал в топ! | {my_refs} рефералов."
-    await message.answer(
-        "🏆 Топ 5 по приглашениям:\n\n" + "\n".join(lines) + f"\n\n{footer}",
-        reply_markup=back_markup("back_to_main"),
-    )
-
-
-@router.message(F.text == "📥 Вывести звёзды")
-async def reply_withdraw_button(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="15 ⭐", callback_data="withdraw_15"), InlineKeyboardButton(text="25 ⭐", callback_data="withdraw_25")],
-        [InlineKeyboardButton(text="50 ⭐", callback_data="withdraw_50"), InlineKeyboardButton(text="100 ⭐", callback_data="withdraw_100")],
-        [InlineKeyboardButton(text="Другое количество", callback_data="withdraw_custom")],
-    ])
-    await message.answer("Выбери количество звёзд, которое хочешь вывести:", reply_markup=markup)
-
-
-@router.message(F.text == "👑 Админ панель")
-async def reply_admin_panel_button(message: Message, state: FSMContext) -> None:
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("Доступ запрещён.")
-        return
-    await state.clear()
-    now = time.time()
-    total_users = to_int(await redis_cmd("SCARD", "users"))
-    async def joined_since(seconds: int) -> int:
-        return to_int(await redis_cmd("ZCOUNT", "users_joined", now - seconds, "+inf"))
-    u_24h = await joined_since(24 * 3600)
-    u_7d = await joined_since(7 * 24 * 3600)
-    u_30d = await joined_since(30 * 24 * 3600)
-    sponsors_count = to_int(await redis_cmd("GET", "stat:sponsors_completed"))
-    total_sponsor_subs = await get_income_sponsors()
-    income_rub = total_sponsor_subs * INCOME_PER_SPONSOR
-    withdrawals = to_float(await redis_cmd("GET", "stat:withdrawals"))
-    text = (
-        "панель админа:\n"
-        f"всего пользователей: {total_users}\n"
-        f"пользователей за 24h: {u_24h}\n"
-        f"пользователей за 7 дней: {u_7d}\n"
-        f"пользователей за 30 дней: {u_30d}\n"
-        f"пользователей подписавшихся на спонсоров: {sponsors_count}\n"
-        f"подписок на спонсоров всего: {total_sponsor_subs}\n"
-        f"доход: {income_rub:g} руб\n"
-        f"выводы: {withdrawals:g} звёзд"
-    )
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 Рассылка", callback_data="admin_broadcast"), InlineKeyboardButton(text="⭐ Задание", callback_data="admin_tasks_menu")],
-        [InlineKeyboardButton(text="🎁 Промокоды", callback_data="admin_promo_menu"), InlineKeyboardButton(text="✨ Вознаграждение", callback_data="admin_reward_menu")],
-        [InlineKeyboardButton(text="💸 Выводы", callback_data="admin_wdlist_0")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
-    ])
-    await message.answer(text, reply_markup=markup)
-
-
-# ================= ВВОД ТЕКСТА (по состояниям) =================
-@router.message()
-async def any_message_handler(message: Message, state: FSMContext) -> None:
-    current_state = await state.get_state()
-    user_id = message.from_user.id
-    text_msg = message.text.strip() if message.text else ""
-    await ensure_user(message.from_user)
-
-    # ----- вывод: своя сумма -----
-    if current_state == WithdrawStates.waiting_for_custom_amount.state:
-        if not text_msg.isdigit():
-            await message.answer("❌ Пожалуйста, введите корректное целое число.")
-            return
-        amount = int(text_msg)
-        if amount < 50:
-            await message.answer("❌ Минимальная сумма для вывода: 50 ⭐. Введите число от 50:")
-            return
-
-        await set_wd(user_id, {"amount": amount})
-        await state.set_state(WithdrawStates.waiting_for_username)
-        await message.answer("Введите @username получателя:", reply_markup=back_markup("menu_withdraw"))
-        return
-
-    # ----- вывод: username -----
-    if current_state == WithdrawStates.waiting_for_username.state:
-        username = text_msg
-        if not username.startswith("@"):
-            username = "@" + username
-
-        wd = await get_wd(user_id)
-        wd["username"] = username
-        await set_wd(user_id, wd)
-
-        amount = wd.get("amount", 0)
-        await state.set_state(WithdrawStates.waiting_for_confirmation)
-
-        text = (
-            f"Получатель: {username}\n"
-            f"Количество: {amount} ⭐\n\n"
-            f"Если данные верны нажми да 👇"
-        )
-        markup = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="Да", callback_data="confirm_withdraw"),
-                    InlineKeyboardButton(text="Назад", callback_data="menu_withdraw"),
-                ]
-            ]
-        )
-        await message.answer(text, reply_markup=markup)
-        return
-
-    # ----- активация промокода -----
-    if current_state == PromocodeStates.waiting_for_activation_input.state:
-        code = text_msg
-        markup = back_markup("back_to_main")
-        invalid_text = "промокод использован или недействителен"
-
-        promo = await get_promo(code) if code else None
-        if not promo:
-            await message.answer(invalid_text, reply_markup=markup)
-            return
-
-        # SADD вернёт 0, если этот пользователь уже активировал промокод
-        first_use = await redis_cmd("SADD", f"promo_used:{code}", user_id)
-        if to_int(first_use) == 0:
-            await message.answer("промокод уже был вами использован ❗", reply_markup=markup)
-            return
-
-        left = await redis_cmd("HINCRBY", f"promo:{code}", "activations", -1)
-        if left is None or to_int(left) < 0:
-            # активации закончились — откатываем
-            await redis_cmd("HINCRBY", f"promo:{code}", "activations", 1)
-            await redis_cmd("SREM", f"promo_used:{code}", user_id)
-            await message.answer(invalid_text, reply_markup=markup)
-            return
-
-        await add_balance(user_id, promo["price"])
-        if to_int(left) <= 0:
-            await delete_promo(code)
-
-        await state.clear()
-        await message.answer(f"на ваш баланс зачислено {promo['price']} ⭐", reply_markup=markup)
-        return
-
-    # ===== ниже только для админа =====
-    if user_id != ADMIN_ID:
-        return
-
-    # ----- рассылка -----
-    if current_state == AdminBroadcastStates.waiting_for_text.state:
-        await state.update_data(broadcast_text=text_msg)
-        await state.set_state(AdminBroadcastStates.confirm)
-
-        count_users = to_int(await redis_cmd("SCARD", "users"))
-        text_out = f"пользователей увидят рассылку: {count_users}\n\nтекст рассылки:\n\n{text_msg}"
-        markup = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="да, отправить✅", callback_data="admin_bc_send"),
-                    InlineKeyboardButton(text="изменить", callback_data="admin_bc_edit"),
-                ],
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")],
-            ]
-        )
-        await message.answer(text_out, reply_markup=markup)
-        return
-
-    # ----- создание задания -----
-    if current_state == AdminTaskStates.text.state:
-        await state.update_data(task_text=text_msg)
-        await state.set_state(AdminTaskStates.link)
-        await message.answer("введите ссылку на канал:", reply_markup=back_markup("admin_panel"))
-        return
-
-    if current_state == AdminTaskStates.link.state:
-        link = normalize_task_link(text_msg)
-        if not link:
-            await message.answer(
-                "❌ Введите ссылку вида https://t.me/channel или @channel",
-                reply_markup=back_markup("admin_panel"),
-            )
-            return
-
-        chat_ref = chat_ref_from_link(link)
-        if chat_ref is None:
-            # закрытая ссылка-приглашение: по ней канал не определить, нужен его ID
-            await state.update_data(task_link=link)
-            await state.set_state(AdminTaskStates.chat_id)
-            await message.answer(
-                "🔒 Это закрытая ссылка. Чтобы проверять подписки, пришлите ID канала "
-                "(выглядит как -1001234567890).\n\n"
-                "ID можно узнать, переслав любой пост из канала боту @getidsbot. "
-                "Бот должен быть администратором канала.",
-                reply_markup=back_markup("admin_panel"),
-            )
-            return
-
-        chat_id, title, err = await validate_task_chat(message.bot, chat_ref)
-        if err:
-            await message.answer(err, reply_markup=back_markup("admin_panel"))
-            return
-
-        await state.update_data(task_link=link, task_chat=chat_id, task_chat_title=title)
-        await state.set_state(AdminTaskStates.reward)
-        await message.answer("введите награду (⭐) за задание:", reply_markup=back_markup("admin_panel"))
-        return
-
-    if current_state == AdminTaskStates.chat_id.state:
-        if not re.fullmatch(r"-100\d{5,}", text_msg):
-            await message.answer(
-                "❌ ID должен выглядеть как -1001234567890. Попробуйте ещё раз.",
-                reply_markup=back_markup("admin_panel"),
-            )
-            return
-        chat_id, title, err = await validate_task_chat(message.bot, int(text_msg))
-        if err:
-            await message.answer(err, reply_markup=back_markup("admin_panel"))
-            return
-        await state.update_data(task_chat=chat_id, task_chat_title=title)
-        await state.set_state(AdminTaskStates.reward)
-        await message.answer("введите награду (⭐) за задание:", reply_markup=back_markup("admin_panel"))
-        return
-
-    if current_state == AdminTaskStates.reward.state:
+    u, is_new = await get_or_create_user(m.from_user, command.args)
+    if not is_new and command.args and u["fresh"] and not u["referrer_id"]:
+        # аккаунт был сброшен командой /e — переход по ссылке снова делает его рефералом
+        r = await fetchone("SELECT id FROM users WHERE ref_code=?", (command.args,))
+        if r and r["id"] != u["id"]:
+            await run("UPDATE users SET referrer_id=?, fresh=0 WHERE id=?", (r["id"], u["id"]))
+            u, is_new = await get_user(u["id"]), True
+    if is_new and u["referrer_id"]:
+        need = int(await get_setting("ref_tasks"))
+        rr = fmt(await get_setting("ref_reward"))
         try:
-            reward = float(text_msg.replace(",", "."))
-        except ValueError:
-            await message.answer("❌ Введите число.")
-            return
-        await state.update_data(task_reward=reward)
-        await state.set_state(AdminTaskStates.max_completions)
-        await message.answer("введите максимальное количество выполнений:", reply_markup=back_markup("admin_panel"))
-        return
-
-    if current_state == AdminTaskStates.max_completions.state:
-        if not text_msg.isdigit() or int(text_msg) <= 0:
-            await message.answer("❌ Введите целое число больше нуля.")
-            return
-        await state.update_data(task_max_completions=int(text_msg))
-        data = await state.get_data()
-        await state.set_state(AdminTaskStates.preview)
-
-        text = (
-            "предпросмотр задания:\n\n"
-            f"текст: {data.get('task_text')}\n"
-            f"ссылка: {data.get('task_link')}\n"
-            f"канал: {data.get('task_chat_title')}\n"
-            f"награда: {data.get('task_reward')}⭐\n"
-            f"макс. выполнений: {data.get('task_max_completions')}"
-        )
-        markup = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Опубликовать", callback_data="admin_task_pub")],
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")],
-            ]
-        )
-        await message.answer(text, reply_markup=markup, **no_preview())
-        return
-
-    # ----- создание промокода -----
-    if current_state == PromocodeStates.admin_name.state:
-        await state.update_data(promo_name=text_msg)
-        await state.set_state(PromocodeStates.admin_activations)
-        await message.answer("введите количество активаций:", reply_markup=back_markup("admin_panel", "Назад"))
-        return
-
-    if current_state == PromocodeStates.admin_activations.state:
-        if not text_msg.isdigit() or int(text_msg) <= 0:
-            await message.answer("❌ Введите целое число больше нуля.")
-            return
-        await state.update_data(promo_activations=int(text_msg))
-        await state.set_state(PromocodeStates.admin_price)
-        await message.answer("введите цену промокода (⭐):", reply_markup=back_markup("admin_panel", "Назад"))
-        return
-
-    if current_state == PromocodeStates.admin_price.state:
-        try:
-            price = float(text_msg.replace(",", "."))
-        except ValueError:
-            await message.answer("❌ Введите число.")
-            return
-        data = await state.get_data()
-        name = data.get("promo_name")
-        await create_promo(name, data.get("promo_activations", 1), price)
-        await state.clear()
-        await message.answer(
-            f"✅ Промокод {name} создан",
-            reply_markup=back_markup("admin_promo_menu", "Назад"),
-        )
-        return
-
-    # ----- награда за реферала -----
-    if current_state == AdminRewardStates.waiting_for_new_value.state:
-        try:
-            new_val = float(text_msg.replace(",", "."))
-        except ValueError:
-            await message.answer("❌ Введите число.")
-            return
-        await state.update_data(new_reward=new_val)
-        await state.set_state(AdminRewardStates.confirm)
-        markup = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="применить ✅", callback_data="admin_reward_apply"),
-                    InlineKeyboardButton(text="назад", callback_data="admin_panel"),
-                ]
-            ]
-        )
-        await message.answer(f"новая цена за реферала: {new_val} ⭐", reply_markup=markup)
-        return
-
-
-# ================= СПОНСОРЫ =================
-def build_sponsor_markup(all_links: list[str]) -> InlineKeyboardMarkup:
-    buttons = []
-    temp_row = []
-    for link in all_links[:TARGET_COUNT]:
-        temp_row.append(InlineKeyboardButton(text="✉️ Подписаться", url=link))
-        if len(temp_row) == 2:
-            buttons.append(temp_row)
-            temp_row = []
-    if temp_row:
-        buttons.append(temp_row)
-    buttons.append([InlineKeyboardButton(text="Проверить подписку", callback_data="check_all_tasks")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-async def reward_referrer_if_needed(
-    bot: Bot, user_id: int, had_sponsors: bool = True, sponsors_count: int = 0
-) -> None:
-    """Реферальную награду не выдаём на этапе спонсоров.
-
-    Награда выдаётся только функцией maybe_reward_referrer_after_tasks,
-    когда реферал выполнит 7 успешно подтверждённых заданий.
-    pending_ref здесь не удаляем, иначе реферал потеряет возможность получить награду.
-    """
-    return
-
-
-async def show_sponsors(message: Message, user=None):
-    user = user or message.from_user
-    user_id = user.id
-    chat_id = message.chat.id
-    user_data = {
-        "first_name": user.first_name,
-        "username": user.username,
-        "language_code": user.language_code,
-        "is_premium": user.is_premium,
-    }
-
-    collected: dict[str, list] = {name: [] for name in SERVICES}
-
-    try:
-        timeout = aiohttp.ClientTimeout(total=5)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            # Все сервисы опрашиваются одновременно (быстрее для Vercel),
-            # затем из ответов набирается до EXTERNAL_LIMIT спонсоров по приоритету
-            results = await asyncio.gather(
-                fetch_tgrass(session, user_id, user_data, EXTERNAL_LIMIT),
-                fetch_traffy(session, user_id, user_data, EXTERNAL_LIMIT),
-                fetch_piarflow(session, user_id, chat_id, EXTERNAL_LIMIT),
-                fetch_trafsly(session, user_id, chat_id, user_data, EXTERNAL_LIMIT),
-                return_exceptions=True,
-            )
-        collected = pick_sponsors(results)           # до 5 спонсоров по приоритету
-        collected["own"] = await fetch_own(message.bot, user_id)  # + наш канал
-        collected = limit_sponsors(collected)
-    except Exception as e:
-        print(f"show_sponsors error: {e!r}")
-
-    # тест-режим после /woot: всегда ровно 6 спонсоров
-    if await redis_cmd("GET", f"woot_test:{user_id}"):
-        collected = limit_sponsors(fill_test_sponsors(collected))
-
-    print(f"[sponsors] user={user_id} " + " ".join(f"{n}={len(collected[n])}" for n in SERVICES))
-
-    all_links = links_of(collected)
-
-    if all_links:
-        await set_active(user_id, {
-            "v": 2,
-            **collected,
-            "total_count": len(all_links),
-            "all": {n: list(collected[n]) for n in SERVICES},
-        })
-        # NX: не перезаписываем, чтобы сохранилось исходное число спонсоров
-        await redis_cmd("SET", f"sp_total:{user_id}", len(all_links), "NX", "EX", 604800)
-    else:
-        await del_active(user_id)
-        # Спонсоров сейчас нет. Если раньше они были показаны (число хранится в Redis) —
-        # значит, пользователь на них уже подписался.
-        done_count = await pop_sponsor_total(user_id)
-        await add_income(user_id, done_count)
-        await record_sponsors(user_id, done_count)
-        if await mark_passed(user_id):
-            await start_watch(user_id, {})
-        await after_sponsors(message.bot, message, user, had_sponsors=done_count > 0, sponsors_count=done_count)
-        return
-
-    markup = build_sponsor_markup(all_links)
-    text = (
-        "🤖 Для использования бота подпишись на каналы ниже\n\n"
-        "🔻 После подписки нажимай на кнопку \"Проверить подписку\""
-    )
-    # Без картинки — только текст и кнопки
-    await message.answer(text, reply_markup=markup)
-
-
-# ================= ГЛАВНОЕ МЕНЮ =================
-async def send_main_menu(message_or_callback, user=None):
-    if isinstance(message_or_callback, CallbackQuery):
-        message = message_or_callback.message
-        user = message_or_callback.from_user
-    else:
-        message = message_or_callback
-        user = user or message.from_user
-
-    stats = await ensure_user(user)
-
-    text = (
-        f"🥑 Добро пожаловать в AvoStars!\n\n"
-        f"Привет, {user.first_name}! Зарабатывай Звёздочки за подписки.\n\n"
-        f"⭐ Баланс: {stats['balance']:.2f} звёздочек\n"
-        f"👥 Рефералов: {stats['referrals']}\n\n"
-        f"Выбери раздел:"
-    )
-
-    rows = [
-        [
-            InlineKeyboardButton(text="👥 Рефералы", callback_data="menu_referrals"),
-            InlineKeyboardButton(text="🏆 Топ", callback_data="menu_top"),
-        ],
-        [InlineKeyboardButton(text="📥 Вывести звёзды", callback_data="menu_withdraw")],
-    ]
-    if user.id == ADMIN_ID:
-        rows.append([InlineKeyboardButton(text="👑 Админ панель", callback_data="admin_panel")])
-
-    markup = InlineKeyboardMarkup(inline_keyboard=rows)
-
-    try:
-        try:
-            await message.answer_photo(photo=PHOTO_URL, caption=text, reply_markup=markup)
+            await m.bot.send_message(
+                u["referrer_id"],
+                f"{BOLT} Пользователь {uref(u)} присоединился по твоей ссылке!\n\n"
+                f"Ты получишь {rr} {STAR}, как только он выполнит {need} заданий")
         except Exception:
-            await message.answer(text, reply_markup=markup)
-        # Отдельное сообщение нужно потому, что Telegram не позволяет одновременно
-        # поставить ReplyKeyboard и InlineKeyboard под одним сообщением.
-        await message.answer("Быстрые кнопки меню — внизу 👇", reply_markup=main_reply_keyboard(user.id))
-        if isinstance(message_or_callback, CallbackQuery):
-            try:
-                await message_or_callback.message.delete()
-            except Exception:
-                pass
-    except Exception as ex:
-        print(f"Критическая ошибка главного меню: {ex}")
+            pass
+    await set_menu(m)
+    await m.answer(await ref_text(u), reply_markup=ref_kb(u))
+    await send_task(m, u["id"], lang=m.from_user.language_code, tgu=m.from_user)
 
 
-# ================= ЗАДАНИЯ =================
-NO_TASKS_TEXT = "Сейчас нет доступных заданий"
-
-
-async def show_task(callback: CallbackQuery, repeat: bool = True) -> bool:
-    """Источники по порядку: задания админа -> Flyer -> Flowly.
-    Сначала ищем непропущенное задание в любом источнике (так «пропустить» реально переходит к другому),
-    и только если всё пропущено — показываем пропущенные заново."""
-    uid = callback.from_user.id
-    for reset in ((False, True) if repeat else (False,)):
-        try:
-            task = await pick_task(uid, reset)
-            if task and await send_admin_task(callback, task):
-                return True
-        except Exception as e:
-            print(f"[tasks] admin source error: {e!r}")
-        try:
-            if await show_flyer_task(callback, reset):
-                return True
-        except Exception as e:
-            print(f"[tasks] flyer source error: {e!r}")
-        try:
-            if await show_flowly_task(callback, reset):
-                return True
-        except Exception as e:
-            print(f"[tasks] flowly source error: {e!r}")
-    text = NO_TASKS_TEXT
-    await replace_message(callback, text, back_markup("back_to_main"))
-    return False
-
-
-async def send_admin_task(callback: CallbackQuery, task: dict) -> bool:
-    task_id = task["id"]
-    link = html.escape(str(task["link"]))
-    reward = html.escape(str(task["reward"]))
-    number = await task_number(callback.from_user.id)
-    task_type = str(task.get("type") or task.get("task_type") or "").lower()
-    text = task_message_text(number, str(task["link"]), to_float(task["reward"]), task_type)
-    markup = task_keyboard(str(task["link"]), f"done_task_{task_id}", f"skip_task_{task_id}")
-    return await replace_message(callback, text, markup, parse_mode="HTML", disable_preview=True)
-
-
-@router.callback_query(F.data == "menu_task")
-async def task_menu_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    await safe_answer(callback)
+@user.message(Command("e"))
+async def cmd_reset(m: Message, state: FSMContext):
+    if m.from_user.id not in RESET_IDS:
+        return
     await state.clear()
-    await ensure_user(callback.from_user)
-    await show_task(callback)
+    u, _ = await get_or_create_user(m.from_user)
+    uid = u["id"]
+    await db.execute("UPDATE users SET balance=0, earned=0, withdrawn=0, referrer_id=NULL, ref_paid=0, "
+                     "ref_penalized=0, fresh=1 WHERE id=?", (uid,))
+    for table in ("user_tasks", "flyer_tasks", "tgrass_tasks", "ext_tasks", "promo_uses"):
+        await db.execute(f"DELETE FROM {table} WHERE user_id=?", (uid,))
+    await db.commit()
+    await m.answer("♻️ Аккаунт сброшен: заработок, задания и привязка к рефереру обнулены.\n"
+                   "Теперь перейди по реферальной ссылке — и ты снова будешь считаться рефералом.")
 
 
-@router.callback_query(F.data.startswith("done_task_"))
-async def done_task_handler(callback: CallbackQuery) -> None:
-    task_id = int(callback.data.split("_")[2])
-    user_id = callback.from_user.id
-    await ensure_user(callback.from_user)
-
-    tasks = await load_tasks()
-    task = next((t for t in tasks if t["id"] == task_id), None)
-    if not task:
-        await safe_answer(callback, "Задание не найдено.")
+@user.chat_member()
+async def on_chat_member(ev: ChatMemberUpdated):
+    """Мгновенный штраф, если реферал вышел из канала, где бот — админ (задания, добавленные админом)."""
+    if ev.new_chat_member.status not in ("left", "kicked"):
         return
+    uid = ev.new_chat_member.user.id
+    ids = [str(ev.chat.id)]
+    if ev.chat.username:
+        ids += ["@" + ev.chat.username, ev.chat.username]
+    days = int(await get_setting("unsub_days"))
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    q = ",".join("?" * len(ids))
+    rows = await fetchall(
+        "SELECT ut.task_id, t.url, t.chat_id FROM user_tasks ut JOIN tasks t ON t.id=ut.task_id "
+        "JOIN users u ON u.id=ut.user_id WHERE ut.user_id=? AND ut.status='done' AND ut.penalized=0 "
+        f"AND t.kind='channel' AND u.referrer_id IS NOT NULL AND ut.day>=? AND t.chat_id IN ({q})",
+        (uid, cutoff, *ids))
+    for r in rows:
+        await apply_unsub_penalty(ev.bot, uid, r["url"] or str(r["chat_id"]),
+                                  "user_tasks", "user_id=? AND task_id=?", (uid, r["task_id"]))
 
-    # Реальная проверка подписки через get_chat_member
-    chat_ref = task.get("chat_id") or chat_ref_from_link(task.get("link", ""))
-    if chat_ref is None:
-        await safe_answer(
-            callback,
-            "⚠️ Это задание настроено неверно, проверить подписку нельзя. Сообщите администратору.",
-            show_alert=True,
-        )
+
+@user.message(Command("unsub"))
+async def cmd_unsub(m: Message):
+    if m.from_user.id not in ADMIN_IDS and m.from_user.id not in RESET_IDS:
         return
-
-    subscribed = await check_subscription(callback.bot, chat_ref, user_id)
-    if subscribed is None:
-        await safe_answer(
-            callback,
-            "⚠️ Не удалось проверить подписку. Попробуйте чуть позже.",
-            show_alert=True,
-        )
-        return
-    if not subscribed:
-        await safe_answer(callback, "вы не подписались на канал ❗", show_alert=True)
-        return
-
-    added = await redis_cmd("SADD", f"user_done:{user_id}", task_id)
-    if to_int(added) == 0:
-        await safe_answer(callback, "Вы уже выполнили это задание!")
-        return
-
-    await add_balance(user_id, to_float(task["reward"]))
-    await maybe_reward_referrer_after_tasks(callback.bot, user_id)
-
-    count = to_int(await redis_cmd("INCR", f"task_cnt:{task_id}"))
-    if count >= to_int(task.get("max_completions"), 1):
-        fresh = await load_tasks()
-        await save_tasks([t for t in fresh if t["id"] != task_id])
-        await redis_cmd("DEL", f"task_cnt:{task_id}")
-
-    await safe_answer(callback)
-
-    text = f"✅ На ваш баланс было зачислено {task['reward']}⭐"
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="следующее задание", callback_data="menu_task")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
-        ]
-    )
-    await replace_message(callback, text, markup)
+    await m.answer("⏳ Проверяю отписки рефералов…")
+    rep_ = await check_unsubs(m.bot)
+    days = int(await get_setting("unsub_days"))
+    await m.answer("🔎 <b>Проверка отписок</b> (задания за последние "
+                   f"{days} дн., только рефералы)\n\n" + "\n".join(esc(x) for x in rep_))
 
 
-@router.callback_query(F.data.startswith("skip_task_"))
-async def skip_task_handler(callback: CallbackQuery) -> None:
-    task_id = int(callback.data.split("_")[2])
-    user_id = callback.from_user.id
-    # пропуск действует только для этого пользователя
-    await redis_cmd("SADD", f"user_skip:{user_id}", task_id)
-    await redis_cmd("EXPIRE", f"user_skip:{user_id}", 86400)
-    # если других заданий нет, show_task сам заменит сообщение на «Сейчас нет доступных заданий»
-    await show_task(callback, repeat=False)
-    await safe_answer(callback, "⏭ Задание пропущено")
+@user.message(F.text == B_EARN)
+async def earn(m: Message, state: FSMContext):
+    await state.clear()
+    u, _ = await get_or_create_user(m.from_user)
+    await m.answer(await ref_text(u), reply_markup=ref_kb(u))
+    await send_task(m, u["id"], lang=m.from_user.language_code, tgu=m.from_user)
 
 
-# ================= НОМЕР ЗАДАНИЯ =================
-async def task_number(uid: int) -> int:
-    """Порядковый номер задания для пользователя: сколько он уже выполнил + 1.
-    Считаются задания админа, Flyer и Flowly, поэтому нумерация идёт подряд (№1, №2, №3...),
-    а новое задание после выполненных получает следующий номер."""
-    done = 0
-    for key in (f"user_done:{uid}", f"flyer_done:{uid}", f"flowly_done:{uid}"):
-        done += to_int(await redis_cmd("SCARD", key))
-    return done + 1
+@user.message(F.text == B_TASK)
+async def task_btn(m: Message, state: FSMContext):
+    await state.clear()
+    await get_or_create_user(m.from_user)
+    await send_task(m, m.from_user.id, lang=m.from_user.language_code, tgu=m.from_user)
 
 
-# ================= ЗАДАНИЯ FLYER =================
-# API: POST /get_tasks (список заданий пользователя) и POST /check_task (статус по signature).
-# Ключ должен быть типа «tasks» (см. POST /get_me), иначе будет ошибка "Prohibited method for a bot type".
-FLYER_TASK_TEXT = {
-    "start bot": "Запустите бота",
-    "subscribe channel": "Подпишитесь на канал",
-    "give boost": "Отдайте буст каналу",
-    "follow link": "Перейдите по ссылке",
-    "perform action": "Выполните действие",
-    "view posts": "Посмотрите посты",
-}
+async def show_done(c: CallbackQuery, reward, is_channel: bool):
+    """Заменяет сообщение с заданием на «Задание выполнено!» и присылает следующее задание новым сообщением."""
+    text = f"{CHECK_E} Задание выполнено!\nПолучено: +{fmt(reward)} {STAR}"
+    if is_channel:
+        days = int(await get_setting("unsub_days"))
+        text += (f"\n\n{WARN_E} Не отписывайся от канала в течение как минимум {days} дней. "
+                 f"В противном случае, ты получишь штраф или блокировку аккаунта.")
+    try:
+        await c.message.edit_text(text, reply_markup=None)
+    except TelegramBadRequest:
+        await c.message.answer(text)
+    await send_task(c.message, c.from_user.id, lang=c.from_user.language_code, tgu=c.from_user)
 
 
-async def flyer_post(method: str, payload: dict, key: Optional[str] = None) -> Optional[dict]:
-    """POST к Flyer API. Возвращает JSON-словарь или None при сбое."""
-    body = {"key": key or FLYER_API_KEY, **payload}
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6)) as session:
-        _, data, _ = await api_post(
-            session, f"flyer-{method}", f"{FLYER_API_URL}/{method}", body,
-            {"Content-Type": "application/json"},
-        )
-    return data if isinstance(data, dict) else None
+@user.callback_query(F.data.startswith("tc:"))
+async def task_confirm(c: CallbackQuery):
+    t = await fetchone("SELECT * FROM tasks WHERE id=?", (int(c.data[3:]),))
+    if not t or not t["active"]:
+        await c.answer("Это задание уже недоступно")
+        return await send_task(c.message, c.from_user.id, edit=True, lang=c.from_user.language_code, tgu=c.from_user)
+    if await fetchone("SELECT 1 FROM user_tasks WHERE user_id=? AND task_id=?", (c.from_user.id, t["id"])):
+        await c.answer()
+        return await send_task(c.message, c.from_user.id, edit=True, lang=c.from_user.language_code, tgu=c.from_user)
+    if not await check_task(c.bot, c.from_user.id, t):
+        txt = "❌ Ты не запустил бота, которого требует задание" if t["kind"] == "bot" \
+            else "❌ Ты не подписался на канал, которого требует задание"
+        return await c.answer(txt, show_alert=True)
+    await complete_task(c.bot, c.from_user.id, t)
+    await c.answer()
+    await show_done(c, t["reward"], t["kind"] == "channel")
 
 
-async def pick_flyer_task(user, reset: bool = True) -> Optional[dict]:
-    """Первое задание Flyer, которое пользователь ещё не выполнял и не пропускал."""
-    if not key_filled(FLYER_API_KEY):
-        return None
-    payload = {"user_id": user.id, "language_code": user.language_code or "ru", "limit": FLYER_TASKS_LIMIT}
-    data = await flyer_post("get_tasks", payload)
-    if not data:
-        return None
-    if data.get("error"):
-        print(f"[flyer] get_tasks error: {data.get('error')}")
-        return None
-    tasks = data.get("result")
-    if not isinstance(tasks, list):
-        return None
-
-    done = {str(x) for x in (await redis_cmd("SMEMBERS", f"flyer_done:{user.id}") or [])}
-    done |= {str(x) for x in (await redis_cmd("SMEMBERS", f"flyer_dead:{user.id}") or [])}
-    candidates = [
-        t for t in tasks
-        if isinstance(t, dict)
-        and t.get("signature")
-        and t.get("links")
-        and t.get("status") not in ("complete", "waiting", "unavailable")
-        and str(t["signature"]) not in done
-    ]
-    if not candidates:
-        return None
-    skipped = {str(x) for x in (await redis_cmd("SMEMBERS", f"flyer_skip:{user.id}") or [])}
-    fresh = [t for t in candidates if str(t["signature"]) not in skipped]
-    if not fresh:
-        if not reset:
-            return None
-        await redis_cmd("DEL", f"flyer_skip:{user.id}")
-        fresh = candidates
-    # Показываем то, что отдал Flyer. Если при проверке окажется unavailable —
-    # задание помечается «мёртвым» (flyer_dead) и больше не показывается.
-    return fresh[0]
+@user.callback_query(F.data.startswith("ts:"))
+async def task_skip(c: CallbackQuery):
+    await run("INSERT OR IGNORE INTO user_tasks(user_id,task_id,status,day) VALUES(?,?,?,?)",
+              (c.from_user.id, int(c.data[3:]), "skip", today()))
+    await c.answer("Задание пропущено")
+    await send_task(c.message, c.from_user.id, edit=True, lang=c.from_user.language_code, tgu=c.from_user)
 
 
-def flyer_button_url(raw) -> Optional[str]:
-    """Приводит ссылку Flyer к виду, который принимает Telegram для url-кнопки."""
-    link = str(raw or "").strip()
-    if link.startswith(("https://", "http://", "tg://")):
-        return link
-    if re.match(r"^(?:t|telegram)\.me/", link, re.I):
-        return "https://" + link
-    return None
-
-
-async def show_flyer_task(callback: CallbackQuery, reset: bool = True) -> bool:
-    """Показывает следующее задание Flyer. False — заданий нет."""
-    user = callback.from_user
-    task = await pick_flyer_task(user, reset)
-    if not task:
-        return False
-    link = flyer_button_url(task["links"][0])
-    if not link:
-        print(f"[flyer] неподходящая ссылка у задания {task.get('signature')}: {task['links'][0]!r}")
-        await redis_cmd("SADD", f"flyer_skip:{user.id}", str(task["signature"]))
-        return False
-    # signature не влезает в callback_data надёжно — храним текущее задание в Redis
-    await redis_cmd("SET", f"flyer_cur:{user.id}", str(task["signature"]), "EX", 86400)
-    action = FLYER_TASK_TEXT.get(task.get("task"), "Выполните задание")
-    number = await task_number(user.id)
-    raw_type = str(task.get("task") or "channel").lower()
-    task_type = "bot" if "bot" in raw_type else "channel"
-    text = task_message_text(number, link, FLYER_REWARD, task_type)
-    markup = task_keyboard(link, "fl_done", "fl_skip")
-    if not await replace_message(callback, text, markup, parse_mode="HTML", disable_preview=True):
-        # Telegram не принял сообщение — не зацикливаемся на нём, переходим к следующему
-        await redis_cmd("SADD", f"flyer_skip:{user.id}", str(task["signature"]))
-        return False
-    return True
-
-
-@router.callback_query(F.data == "fl_done")
-async def flyer_done_handler(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
-    await ensure_user(callback.from_user)
-    signature = await redis_cmd("GET", f"flyer_cur:{user_id}")
-    if not signature:
-        await safe_answer(callback, "Задание устарело. Откройте раздел заданий заново.", show_alert=True)
-        return
-    signature = str(signature)
-
-    if to_int(await redis_cmd("SISMEMBER", f"flyer_done:{user_id}", signature)):
-        await safe_answer(callback, "Вы уже выполнили это задание!")
-        return
-
-    data = await flyer_post("check_task", {"signature": signature})
-    status = data.get("result") if data and not data.get("error") else None
-    if status is None:
-        await safe_answer(callback, "⚠️ Не удалось проверить задание. Попробуйте чуть позже.", show_alert=True)
-        return
+# ---------- Задания Flyer ----------
+@user.callback_query(F.data.startswith("fc:"))
+async def flyer_confirm(c: CallbackQuery):
+    lang = c.from_user.language_code
+    row = await fetchone("SELECT * FROM flyer_tasks WHERE id=? AND user_id=?", (int(c.data[3:]), c.from_user.id))
+    if not row or row["status"] != "shown":
+        await c.answer()
+        return await send_task(c.message, c.from_user.id, edit=True, lang=lang, tgu=c.from_user)
+    res = await flyer_call("check_task", {"signature": row["signature"]})
+    status = res.get("result")
+    if status in ("complete", "waiting"):
+        cur = await db.execute("UPDATE flyer_tasks SET status='done', day=? WHERE id=? AND status='shown'",
+                               (today(), row["id"]))
+        await db.commit()
+        if cur.rowcount:
+            reward = await get_setting("flyer_reward")
+            await after_task_done(c.bot, c.from_user.id, reward)
+            await c.answer()
+            return await show_done(c, reward, row["task"] == "subscribe channel")
+        await c.answer()
+        return await send_task(c.message, c.from_user.id, edit=True, lang=lang, tgu=c.from_user)
     if status == "unavailable":
-        await redis_cmd("SADD", f"flyer_dead:{user_id}", signature)
-        await redis_cmd("EXPIRE", f"flyer_dead:{user_id}", 21600)
-        await safe_answer(callback, "Это задание больше не актуально, показываю другое.", show_alert=True)
-        await show_task(callback)
-        return
-    # complete — выполнено и оплачено, waiting — выполнено, оплата Flyer придёт в течение 24 ч
-    if status not in ("complete", "waiting"):
-        await safe_answer(callback, "вы не выполнили задание ❗", show_alert=True)
-        return
-
-    # SADD атомарно: награда выдаётся только один раз за задание
-    if to_int(await redis_cmd("SADD", f"flyer_done:{user_id}", signature)) == 0:
-        await safe_answer(callback, "Вы уже выполнили это задание!")
-        return
-    await redis_cmd("DEL", f"flyer_cur:{user_id}")
-    await add_balance(user_id, FLYER_REWARD)
-    await maybe_reward_referrer_after_tasks(callback.bot, user_id)
-
-    await safe_answer(callback)
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="следующее задание", callback_data="menu_task")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
-        ]
-    )
-    await replace_message(callback, f"✅ На ваш баланс было зачислено {FLYER_REWARD:g}⭐", markup)
+        await run("UPDATE flyer_tasks SET status='skip', day=? WHERE id=?", (today(), row["id"]))
+        await c.answer("Это задание больше не актуально")
+        return await send_task(c.message, c.from_user.id, edit=True, lang=lang, tgu=c.from_user)
+    if status in ("incomplete", "abort"):
+        txt = {"start bot": "❌ Ты не запустил бота, которого требует задание",
+               "subscribe channel": "❌ Ты не подписался на канал, которого требует задание"}.get(
+            row["task"], "❌ Задание ещё не выполнено")
+        return await c.answer(txt, show_alert=True)
+    logging.warning("flyer check_task: %s", res)
+    await c.answer("⚠️ Не удалось проверить задание, попробуй через минуту", show_alert=True)
 
 
-@router.callback_query(F.data == "fl_skip")
-async def flyer_skip_handler(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
-    signature = await redis_cmd("GET", f"flyer_cur:{user_id}")
-    if signature:
-        await redis_cmd("SADD", f"flyer_skip:{user_id}", str(signature))
-        await redis_cmd("EXPIRE", f"flyer_skip:{user_id}", 86400)
-    # если других заданий нет, show_task сам заменит сообщение на «Сейчас нет доступных заданий»
-    await show_task(callback, repeat=False)
-    await safe_answer(callback, "⏭ Задание пропущено")
+@user.callback_query(F.data.startswith("fs:"))
+async def flyer_skip(c: CallbackQuery):
+    await run("UPDATE flyer_tasks SET status='skip', day=? WHERE id=? AND user_id=? AND status='shown'",
+              (today(), int(c.data[3:]), c.from_user.id))
+    await c.answer("Задание пропущено")
+    await send_task(c.message, c.from_user.id, edit=True, lang=c.from_user.language_code, tgu=c.from_user)
 
 
-# ================= ЗАДАНИЯ FLOWLY =================
-# API: POST /offers (получить задания), POST /check (проверить одно задание). Заголовок Auth: <ключ>.
-FLOWLY_TASK_TEXT = {
-    "channel": "Подпишитесь на канал",
-    "bot": "Запустите бота",
-    "resource": "Перейдите по ссылке",
-}
+# ---------- Задания TGrass ----------
+@user.callback_query(F.data.startswith("gc:"))
+async def tgrass_confirm(c: CallbackQuery):
+    lang = c.from_user.language_code
+    row = await fetchone("SELECT * FROM tgrass_tasks WHERE id=? AND user_id=?", (int(c.data[3:]), c.from_user.id))
+    if not row or row["status"] != "shown":
+        await c.answer()
+        return await send_task(c.message, c.from_user.id, edit=True, lang=lang, tgu=c.from_user)
+    res = await tgrass_call("check", {"tg_user_id": c.from_user.id, "offer_id": row["offer_id"]})
+    status = res.get("status")
+    if status == "subscribed":
+        if res.get("is_fake"):
+            await run("UPDATE tgrass_tasks SET status='skip', day=? WHERE id=?", (today(), row["id"]))
+            return await c.answer("❌ Задание не засчитано", show_alert=True)
+        cur = await db.execute("UPDATE tgrass_tasks SET status='done', day=? WHERE id=? AND status='shown'",
+                               (today(), row["id"]))
+        await db.commit()
+        if cur.rowcount:
+            reward = await get_setting("tgrass_reward")
+            await after_task_done(c.bot, c.from_user.id, reward)
+            await c.answer()
+            return await show_done(c, reward, row["kind"] == "channel")
+        await c.answer()
+        return await send_task(c.message, c.from_user.id, edit=True, lang=lang, tgu=c.from_user)
+    if status in ("offer_expired", "offer_not_found"):
+        await run("UPDATE tgrass_tasks SET status='skip', day=? WHERE id=?", (today(), row["id"]))
+        await c.answer("Это задание больше не актуально")
+        return await send_task(c.message, c.from_user.id, edit=True, lang=lang, tgu=c.from_user)
+    if status == "not_subscribed":
+        txt = {"channel": "❌ Ты не подписался на канал, которого требует задание",
+               "bot": "❌ Ты не запустил бота, которого требует задание"}.get(
+            row["kind"], "❌ Задание ещё не выполнено")
+        return await c.answer(txt, show_alert=True)
+    logging.warning("tgrass check: %s", res)
+    await c.answer("⚠️ Не удалось проверить задание, попробуй через минуту", show_alert=True)
 
 
-async def flowly_post(path: str, payload: dict) -> Optional[dict]:
-    """POST к Flowly API. Возвращает JSON-словарь или None при сбое/не-200."""
-    headers = {"Auth": FLOWLY_API_KEY, "Content-Type": "application/json"}
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
-        status, data, _ = await api_post(session, f"flowly{path}", f"{FLOWLY_API_URL}{path}", payload, headers)
-    if status != 200 or not isinstance(data, dict):
-        return None
-    return data
+@user.callback_query(F.data.startswith("gs:"))
+async def tgrass_skip(c: CallbackQuery):
+    await run("UPDATE tgrass_tasks SET status='skip', day=? WHERE id=? AND user_id=? AND status='shown'",
+              (today(), int(c.data[3:]), c.from_user.id))
+    await c.answer("Задание пропущено")
+    await send_task(c.message, c.from_user.id, edit=True, lang=c.from_user.language_code, tgu=c.from_user)
 
 
-async def pick_flowly_task(user, reset: bool = True) -> Optional[dict]:
-    """Первое задание Flowly, которое пользователь ещё не выполнял и не пропускал."""
-    if not key_filled(FLOWLY_API_KEY):
-        return None
-    data = await flowly_post("/offers", {
-        "tg_user_id": user.id,
-        "lang": user.language_code or "ru",
-        "is_premium": bool(getattr(user, "is_premium", False)),
-        "offers_limit": FLOWLY_OFFERS_LIMIT,
-    })
-    if not data or data.get("status") != "not_ok":
-        return None
-    offers = data.get("offers")
-    if not isinstance(offers, list):
-        return None
-
-    done = {str(x) for x in (await redis_cmd("SMEMBERS", f"flowly_done:{user.id}") or [])}
-    done |= {str(x) for x in (await redis_cmd("SMEMBERS", f"flowly_dead:{user.id}") or [])}
-    candidates = [
-        o for o in offers
-        if isinstance(o, dict)
-        and o.get("offer_id") is not None
-        and flyer_button_url(o.get("link"))
-        and not o.get("subscribed")
-        and str(o["offer_id"]) not in done
-    ]
-    if not candidates:
-        return None
-    skipped = {str(x) for x in (await redis_cmd("SMEMBERS", f"flowly_skip:{user.id}") or [])}
-    fresh = [o for o in candidates if str(o["offer_id"]) not in skipped]
-    if not fresh:
-        if not reset:
-            return None
-        await redis_cmd("DEL", f"flowly_skip:{user.id}")
-        fresh = candidates
-    return fresh[0]
+# ---------- Задания Trafsly / PiarFlow / Traffy ----------
+@user.callback_query(F.data.startswith("ec:"))
+async def ext_confirm(c: CallbackQuery):
+    lang = c.from_user.language_code
+    row = await fetchone("SELECT * FROM ext_tasks WHERE id=? AND user_id=?", (int(c.data[3:]), c.from_user.id))
+    if not row or row["status"] != "shown":
+        await c.answer()
+        return await send_task(c.message, c.from_user.id, edit=True, lang=lang, tgu=c.from_user)
+    state, msg = await EXT_CHECK[row["provider"]](c.from_user.id, row)
+    if state == "ok":
+        cur = await db.execute("UPDATE ext_tasks SET status='done', day=? WHERE id=? AND status='shown'",
+                               (today(), row["id"]))
+        await db.commit()
+        if cur.rowcount:
+            reward = await get_setting(f"{row['provider']}_reward")
+            await after_task_done(c.bot, c.from_user.id, reward)
+            await c.answer()
+            return await show_done(c, reward, row["kind"] == "channel")
+        await c.answer()
+        return await send_task(c.message, c.from_user.id, edit=True, lang=lang, tgu=c.from_user)
+    if state in ("no", "unsub"):
+        txt = "❌ Ты не запустил бота, которого требует задание" if row["kind"] == "bot" \
+            else "❌ Ты не подписался на канал, которого требует задание"
+        return await c.answer(txt, show_alert=True)
+    if state == "refresh":
+        await c.answer("Обновляю задание…")
+        return await send_task(c.message, c.from_user.id, edit=True, lang=lang, tgu=c.from_user)
+    if state == "gone":
+        await run("UPDATE ext_tasks SET status='skip', day=? WHERE id=?", (today(), row["id"]))
+        await c.answer(msg or "Это задание больше не актуально", show_alert=bool(msg))
+        return await send_task(c.message, c.from_user.id, edit=True, lang=lang, tgu=c.from_user)
+    await c.answer("⚠️ Не удалось проверить задание, попробуй через минуту", show_alert=True)
 
 
-async def show_flowly_task(callback: CallbackQuery, reset: bool = True) -> bool:
-    """Показывает следующее задание Flowly. False — заданий нет."""
-    user = callback.from_user
-    offer = await pick_flowly_task(user, reset)
-    if not offer:
-        return False
-    offer_id = str(offer["offer_id"])
-    await redis_cmd("SET", f"flowly_cur:{user.id}", offer_id, "EX", 86400)
-    action = FLOWLY_TASK_TEXT.get(offer.get("type"), "Выполните задание")
-    number = await task_number(user.id)
-    link = flyer_button_url(offer["link"])
-    task_type = str(offer.get("type") or "channel").lower()
-    text = task_message_text(number, link, FLOWLY_REWARD, task_type)
-    markup = task_keyboard(link, "flw_done", "flw_skip")
-    if not await replace_message(callback, text, markup, parse_mode="HTML", disable_preview=True):
-        await redis_cmd("SADD", f"flowly_skip:{user.id}", offer_id)
-        return False
-    return True
+@user.callback_query(F.data.startswith("es:"))
+async def ext_skip(c: CallbackQuery):
+    await run("UPDATE ext_tasks SET status='skip', day=? WHERE id=? AND user_id=? AND status='shown'",
+              (today(), int(c.data[3:]), c.from_user.id))
+    await c.answer("Задание пропущено")
+    await send_task(c.message, c.from_user.id, edit=True, lang=c.from_user.language_code, tgu=c.from_user)
 
 
-@router.callback_query(F.data == "flw_done")
-async def flowly_done_handler(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
-    await ensure_user(callback.from_user)
-    offer_id = await redis_cmd("GET", f"flowly_cur:{user_id}")
-    if not offer_id:
-        await safe_answer(callback, "Задание устарело. Откройте раздел заданий заново.", show_alert=True)
-        return
-    offer_id = str(offer_id)
-
-    if to_int(await redis_cmd("SISMEMBER", f"flowly_done:{user_id}", offer_id)):
-        await safe_answer(callback, "Вы уже выполнили это задание!")
-        return
-
-    data = await flowly_post("/check", {"tg_user_id": user_id, "offer_id": to_int(offer_id)})
-    status = data.get("status") if data else None
-    if status is None:
-        await safe_answer(callback, "⚠️ Не удалось проверить задание. Попробуйте чуть позже.", show_alert=True)
-        return
-    if status == "offer_unavailable":
-        await redis_cmd("SADD", f"flowly_dead:{user_id}", offer_id)
-        await redis_cmd("EXPIRE", f"flowly_dead:{user_id}", 21600)
-        await safe_answer(callback, "Это задание больше не актуально, показываю другое.", show_alert=True)
-        await show_task(callback)
-        return
-    if status != "subscribed":
-        await safe_answer(callback, "вы не выполнили задание ❗", show_alert=True)
-        return
-
-    # SADD атомарно: награда выдаётся только один раз за задание
-    if to_int(await redis_cmd("SADD", f"flowly_done:{user_id}", offer_id)) == 0:
-        await safe_answer(callback, "Вы уже выполнили это задание!")
-        return
-    await redis_cmd("DEL", f"flowly_cur:{user_id}")
-    await add_balance(user_id, FLOWLY_REWARD)
-    await maybe_reward_referrer_after_tasks(callback.bot, user_id)
-
-    await safe_answer(callback)
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="следующее задание", callback_data="menu_task")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
-        ]
-    )
-    await replace_message(callback, f"✅ На ваш баланс было зачислено {FLOWLY_REWARD:g}⭐", markup)
+# ---------- Профиль / Топ ----------
+@user.message(F.text == B_PROFILE)
+async def profile(m: Message, state: FSMContext):
+    await state.clear()
+    await get_or_create_user(m.from_user)
+    await m.answer(await profile_text(m.from_user.id))
 
 
-@router.callback_query(F.data == "flw_skip")
-async def flowly_skip_handler(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
-    offer_id = await redis_cmd("GET", f"flowly_cur:{user_id}")
-    if offer_id:
-        await redis_cmd("SADD", f"flowly_skip:{user_id}", str(offer_id))
-        await redis_cmd("EXPIRE", f"flowly_skip:{user_id}", 86400)
-    # если других заданий нет, show_task сам заменит сообщение на «Сейчас нет доступных заданий»
-    await show_task(callback, repeat=False)
-    await safe_answer(callback, "⏭ Задание пропущено")
+@user.message(F.text == B_TOP)
+async def top(m: Message, state: FSMContext):
+    await state.clear()
+    await get_or_create_user(m.from_user)
+    rows = await fetchall(
+        "SELECT r.referrer_id AS id, COUNT(*) AS cnt, u.full_name AS name FROM users r "
+        "LEFT JOIN users u ON u.id=r.referrer_id WHERE r.referrer_id IS NOT NULL "
+        "GROUP BY r.referrer_id ORDER BY cnt DESC, r.referrer_id ASC LIMIT 5")
+    lines = [f"{TROPHY} <b>Топ 5 по приглашениям:</b>\n"]
+    for i, r in enumerate(rows):
+        lines.append(f"{MEDALS[i]} {esc(r['name'])} — рефералов: {r['cnt']}")
+    mine = await ref_count(m.from_user.id)
+    place = (await fetchone(
+        "SELECT COUNT(*) c FROM (SELECT referrer_id FROM users WHERE referrer_id IS NOT NULL "
+        "GROUP BY referrer_id HAVING COUNT(*) > ?)", (mine,)))["c"] + 1
+    lines.append(f"\n{TROPHY} Ты на {place} месте! Рефералов: {mine}")
+    await m.answer("\n".join(lines))
 
 
-@router.message(Command("taskdiag"))
-async def taskdiag_handler(message: Message) -> None:
-    """Для админов: откуда берутся задания и что у вас выполнено/пропущено."""
-    if message.from_user.id not in WOOT_IDS:
-        return
-    uid = message.from_user.id
-    tasks = await load_tasks()
-    lines = ["🔧 ЗАДАНИЯ", ""]
-    lines.append(f"АДМИН: всего {len(tasks)}, выполнено {to_int(await redis_cmd('SCARD', f'user_done:{uid}'))}, "
-                 f"пропущено {to_int(await redis_cmd('SCARD', f'user_skip:{uid}'))}")
-    lines.append(f"FLYER: выполнено {to_int(await redis_cmd('SCARD', f'flyer_done:{uid}'))}, "
-                 f"пропущено {to_int(await redis_cmd('SCARD', f'flyer_skip:{uid}'))}")
-    payload = {"user_id": uid, "limit": FLYER_TASKS_LIMIT}
-    if message.from_user.language_code:
-        payload["language_code"] = message.from_user.language_code
-    data = await flyer_post("get_tasks", payload)
-    if not data:
-        lines.append("FLYER get_tasks: нет ответа")
-    elif data.get("error"):
-        lines.append(f"FLYER get_tasks ошибка: {data.get('error')}")
-    else:
-        for t in (data.get("result") or []):
-            if isinstance(t, dict):
-                chk = await flyer_post("check_task", {"signature": t.get("signature")})
-                lines.append(
-                    f"FLYER: {t.get('task')} | get_tasks={t.get('status')} | check_task={(chk or {}).get('result') or (chk or {}).get('error')} "
-                    f"| {t.get('links')}"
-                )
-        if not data.get("result"):
-            lines.append("FLYER get_tasks: заданий для вас нет")
-    nxt = await pick_task(uid, False)
-    lines.append(f"Следующее админское: {nxt['id'] if nxt else 'нет'}")
-    await message.answer("\n".join(lines)[:3900], **no_preview())
+# ---------- Промокод ----------
+PROMO_PROMPT = "🎟 Введите промокод:"
+PROMO_BACK = kb([btn("◀️ Назад", cb="promo_back", style="primary")])
 
 
-# ================= ПРОФИЛЬ =================
-@router.callback_query(F.data == "menu_profile")
-async def profile_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    await safe_answer(callback)
+@user.message(F.text == B_PROMO)
+async def promo_start(m: Message, state: FSMContext):
+    await get_or_create_user(m.from_user)
+    await state.set_state(PromoSt.code)
+    await m.answer(PROMO_PROMPT)
+
+
+@user.callback_query(F.data == "promo_back")
+async def promo_back(c: CallbackQuery, state: FSMContext):
+    await state.set_state(PromoSt.code)
+    await c.message.edit_text(PROMO_PROMPT)
+    await c.answer()
+
+
+@user.message(PromoSt.code, F.text)
+async def promo_enter(m: Message, state: FSMContext):
+    code = m.text.strip().upper()
+    p = await fetchone("SELECT * FROM promos WHERE code=?", (code,))
+    if not p:
+        return await m.answer("❌ Промокод использован или недействителен", reply_markup=PROMO_BACK)
+    if await fetchone("SELECT 1 FROM promo_uses WHERE user_id=? AND code=?", (m.from_user.id, code)):
+        return await m.answer("Промокод уже был вами использован ❗", reply_markup=PROMO_BACK)
+    cur = await db.execute(
+        "UPDATE promos SET uses=uses+1 WHERE code=? AND (max_uses=0 OR uses<max_uses)", (code,))
+    if cur.rowcount == 0:
+        await db.commit()
+        return await m.answer("❌ Промокод использован или недействителен", reply_markup=PROMO_BACK)
+    await db.execute("INSERT INTO promo_uses(user_id,code) VALUES(?,?)", (m.from_user.id, code))
+    await db.execute("UPDATE users SET balance=balance+?, earned=earned+? WHERE id=?",
+                     (p["reward"], p["reward"], m.from_user.id))
+    await db.commit()
+    await state.clear()
+    await m.answer(f"✅ Промокод успешно активирован: ваш баланс пополнен на {fmt(p['reward'])} {STAR}")
+
+
+# ---------- Вывод ----------
+USERNAME_PROMPT = "Введите @username получателя:"
+USERNAME_BACK = kb([btn("◀️ Назад", cb="wd_menu", style="primary")])
+
+
+@user.message(F.text == B_WD)
+async def wd_open(m: Message, state: FSMContext):
+    await state.clear()
+    await get_or_create_user(m.from_user)
+    await m.answer(await wd_menu_text(m.from_user.id), reply_markup=wd_menu_kb())
+
+
+@user.callback_query(F.data == "wd_menu")
+async def wd_menu(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.message.edit_text(await wd_menu_text(c.from_user.id), reply_markup=wd_menu_kb())
+    await c.answer()
+
+
+@user.callback_query(F.data.startswith("wd:"))
+async def wd_pick(c: CallbackQuery, state: FSMContext):
+    idx = int(c.data[3:])
+    amt = GIFTS[idx][0]
+    u = await get_user(c.from_user.id)
+    if u["balance"] + 1e-9 < amt:
+        return await c.answer(f"❌ Недостаточно звёзд. Нужно {amt}, у тебя {fmt(u['balance'])}", show_alert=True)
+    await state.set_state(WdSt.username)
+    await state.update_data(gift=idx)
+    await c.message.edit_text(USERNAME_PROMPT, reply_markup=USERNAME_BACK)
+    await c.answer()
+
+
+@user.callback_query(F.data == "wd_name")
+async def wd_name(c: CallbackQuery, state: FSMContext):
+    await state.set_state(WdSt.username)
+    await c.message.edit_text(USERNAME_PROMPT, reply_markup=USERNAME_BACK)
+    await c.answer()
+
+
+@user.message(WdSt.username, F.text)
+async def wd_username(m: Message, state: FSMContext):
+    mt = USERNAME_RE.match(m.text.strip())
+    if not mt:
+        return await m.answer("❌ Неверный формат username.\n\n" + USERNAME_PROMPT, reply_markup=USERNAME_BACK)
+    uname = "@" + mt.group(1)
+    data = await state.get_data()
+    await state.update_data(recipient=uname)
+    await state.set_state(WdSt.confirm)
+    await m.answer(
+        f"Получатель: {uname}\n"
+        f"Количество: {gift_label(data['gift'])}\n\n"
+        f"Если данные верны нажми да 👇",
+        reply_markup=kb([btn("✅ Да, верны", cb="wd_yes", style="success"),
+                         btn("◀️ Назад", cb="wd_name", style="primary")]))
+
+
+def wd_admin_kb(wid: int) -> InlineKeyboardMarkup:
+    return kb([btn("Выплатил ✅", cb=f"wp:{wid}", style="success"),
+               btn("Не одобрена ❌", cb=f"wr:{wid}", style="danger")])
+
+
+async def wd_admin_text(w, status: str = "") -> str:
+    u = await get_user(w["user_id"])
+    invited = await ref_count(w["user_id"])
+    done = await ref_tasks_done(w["user_id"])
+    uname = f"@{u['username']}" if u["username"] else "—"
+    text = (f"📥 <b>Заявка на вывод #{w['id']}</b>\n"
+            f"Пользователь: {esc(u['full_name'])} ({esc(uname)})\n"
+            f"Получатель: {esc(w['recipient'])}\n"
+            f"Количество: {esc(w['gift'])}\n"
+            f"Приглашено: {invited} · выполнено заданий: {done}")
+    if status:
+        text += f"\n\n<b>Статус:</b> {status}"
+    return text
+
+
+@user.callback_query(F.data == "wd_yes", WdSt.confirm)
+async def wd_yes(c: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    idx, recipient = data.get("gift"), data.get("recipient")
+    if idx is None or not recipient:
+        await state.clear()
+        return await c.answer("Сессия устарела, начни заново", show_alert=True)
+    amt = GIFTS[idx][0]
+    cur = await db.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
+                           (amt, c.from_user.id, amt))
+    if cur.rowcount == 0:
+        await db.commit()
+        await state.clear()
+        return await c.answer("❌ Недостаточно звёзд", show_alert=True)
+    cur = await db.execute(
+        "INSERT INTO withdrawals(user_id,recipient,amount,gift,created_at) VALUES(?,?,?,?,?)",
+        (c.from_user.id, recipient, amt, gift_label(idx), now()))
+    await db.commit()
+    wid = cur.lastrowid
+    await state.clear()
+    await c.message.edit_text(
+        f"<b>Заявка на вывод #{wid}</b>\n{gift_label(idx)}\nуспешно создана",
+        reply_markup=kb([btn("◀️ Назад", cb="wd_menu", style="primary")]))
+    await c.answer()
+    w = await fetchone("SELECT * FROM withdrawals WHERE id=?", (wid,))
+    text = await wd_admin_text(w)
+    for aid in ADMIN_IDS:
+        try:
+            await c.bot.send_message(aid, text, reply_markup=wd_admin_kb(wid))
+        except Exception as ex:
+            logging.warning("admin notify failed: %s", ex)
+
+
+# ============================== АДМИН-ПАНЕЛЬ ==============================
+admin = Router()
+admin.message.filter(F.from_user.id.in_(ADMIN_IDS))
+admin.callback_query.filter(F.from_user.id.in_(ADMIN_IDS))
+
+A_BACK = [btn("◀️ Назад", cb="a:menu", style="primary")]
+
+
+async def edit(c: CallbackQuery, text: str, markup=None):
+    try:
+        await c.message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest as ex:
+        if "not modified" not in str(ex):
+            await c.message.answer(text, reply_markup=markup)
+
+
+def admin_menu():
+    return ("⚙️ <b>Админ-панель</b>\n\nВыбери раздел 👇",
+            kb([btn("📊 Статистика", cb="a:stats", style="primary"),
+                btn("👥 Пользователи", cb="a:users", style="primary")],
+               [btn("📋 Задания", cb="a:tasks", style="success"),
+                btn("🎟 Промокоды", cb="a:promos", style="success")],
+               [btn("📥 Заявки на вывод", cb="a:wd", style="primary"),
+                btn("📨 Рассылка", cb="a:cast", style="danger")],
+               [btn("⚙️ Настройки", cb="a:set")],
+               [btn("✖️ Закрыть", cb="a:close")]))
+
+
+@admin.message(Command("admin"))
+@admin.message(F.text == B_ADMIN)
+async def admin_open(m: Message, state: FSMContext):
+    await state.clear()
+    text, markup = admin_menu()
+    await m.answer(text, reply_markup=markup)
+
+
+@admin.callback_query(F.data == "a:menu")
+async def a_menu(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    text, markup = admin_menu()
+    await edit(c, text, markup)
+    await c.answer()
+
+
+@admin.callback_query(F.data == "a:close")
+async def a_close(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.message.delete()
+    await c.answer()
+
+
+# ---------- Диагностика Flyer ----------
+@admin.message(Command("flyer"))
+async def a_flyer(m: Message):
+    if not FLYER_KEY:
+        return await m.answer("❌ <b>FLYER_KEY не задан.</b>\nУстанови переменную в том же терминале, где запускаешь бота:\n"
+                              "<code>$env:FLYER_KEY=\"FL-...\"</code>")
+    me = await flyer_call("get_me", {})
+    tasks = await flyer_call("get_tasks", {"user_id": m.from_user.id,
+                                           "language_code": m.from_user.language_code or "ru",
+                                           "limit": FLYER_LIMIT})
+
+    def dump(x):
+        return html.escape(json.dumps(x, ensure_ascii=False, indent=1)[:1500])
+
+    await m.answer(f"🛰 <b>Flyer get_me</b>\n<pre>{dump(me)}</pre>\n\n"
+                   f"🛰 <b>Flyer get_tasks (для тебя)</b>\n<pre>{dump(tasks)}</pre>")
+
+
+@admin.message(Command("tgrass"))
+async def a_tgrass(m: Message):
+    if not TGRASS_KEY:
+        return await m.answer("❌ <b>TGRASS_KEY не задан.</b>\nУстанови переменную в том же терминале, где запускаешь бота:\n"
+                              "<code>$env:TGRASS_KEY=\"ключ\"</code>")
+    data = await tgrass_offers(m.from_user)
+    text = html.escape(json.dumps(data, ensure_ascii=False, indent=1)[:2500])
+    await m.answer(f"🌿 <b>TGrass /{TGRASS_ENDPOINT} (для тебя)</b>\n<pre>{text}</pre>")
+
+
+# ---------- Статистика ----------
+@admin.callback_query(F.data == "a:stats")
+async def a_stats(c: CallbackQuery, state: FSMContext):
     await state.clear()
 
-    user = callback.from_user
-    stats = await ensure_user(user)
+    async def one(sql, args=()):
+        return (await fetchone(sql, args))[0] or 0
 
+    d = today()
+    total = await one("SELECT COUNT(*) FROM users")
+    new_today = await one("SELECT COUNT(*) FROM users WHERE created_at LIKE ?", (d + "%",))
+    refs = await one("SELECT COUNT(*) FROM users WHERE referrer_id IS NOT NULL")
+    refs_paid = await one("SELECT COUNT(*) FROM users WHERE ref_paid=1")
+    done = await one("SELECT COUNT(*) FROM done_tasks")
+    done_today = await one("SELECT COUNT(*) FROM done_tasks WHERE day=?", (d,))
+    fl = await one("SELECT COUNT(*) FROM flyer_tasks WHERE status='done'")
+    tg = await one("SELECT COUNT(*) FROM tgrass_tasks WHERE status='done'")
+    bal = await one("SELECT SUM(balance) FROM users")
+    wd_p = await one("SELECT COUNT(*) FROM withdrawals WHERE status='pending'")
+    wd_ok = await one("SELECT COUNT(*) FROM withdrawals WHERE status='paid'")
+    wd_no = await one("SELECT COUNT(*) FROM withdrawals WHERE status='rejected'")
+    wd_sum = await one("SELECT SUM(amount) FROM withdrawals WHERE status='paid'")
+    tasks = await one("SELECT COUNT(*) FROM tasks WHERE active=1")
+    promos = await one("SELECT COUNT(*) FROM promos")
     text = (
-        f"👤 Имя: {user.first_name}\n"
-        f"🆔 ID: {user.id}\n"
-        f"💰 Баланс: {stats['balance']:.2f}⭐️\n"
-        f"👥 Приглашено друзей: {stats['referrals']}"
+        "📊 <b>Статистика</b>\n\n"
+        f"👥 Пользователей: <b>{total}</b> (сегодня +{new_today})\n"
+        f"🔗 Пришло по рефералкам: <b>{refs}</b> (награда выдана: {refs_paid})\n\n"
+        f"📋 Активных заданий: <b>{tasks}</b>\n"
+        f"✅ Выполнено заданий: <b>{done}</b> (сегодня {done_today}), из них Flyer: {fl}, TGrass: {tg}\n"
+        f"🎟 Промокодов: <b>{promos}</b>\n\n"
+        f"💰 Сумма балансов: <b>{fmt(bal)}</b> ⭐\n"
+        f"📥 Заявки: ожидают <b>{wd_p}</b> · выплачено <b>{wd_ok}</b> · отклонено <b>{wd_no}</b>\n"
+        f"🎁 Выплачено всего: <b>{fmt(wd_sum)}</b> ⭐"
     )
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🆘 Поддержка", url="https://t.me/durovsor")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
-        ]
-    )
-    await replace_with_photo(callback, PROFILE_PHOTO_URL, text, markup)
+    await edit(c, text, kb([btn("🔄 Обновить", cb="a:stats", style="success")], A_BACK))
+    await c.answer()
 
 
-# ================= РЕФЕРАЛЫ =================
-@router.callback_query(F.data == "menu_referrals")
-async def referrals_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    await safe_answer(callback)
+# ---------- Заявки на вывод ----------
+@admin.callback_query(F.data == "a:wd")
+async def a_wd(c: CallbackQuery, state: FSMContext):
     await state.clear()
-
-    bot_info = await callback.bot.get_me()
-    user_id = callback.from_user.id
-    referral_link = f"https://t.me/{bot_info.username}?start=ref_{user_id}"
-    reward = await get_referral_reward()
-    user_data = await ensure_user(callback.from_user)
-    share_url = "https://t.me/share/url?url=" + quote(referral_link, safe="") + "&text=" + quote("Присоединяйся и зарабатывай ⭐️", safe="")
-    text = (
-        f"Получай +{DEFAULT_REFERRAL_REWARD:g} ⭐️ за каждого приглашенного друга!\n"
-        f"🔗 Твоя реферальная ссылка:\n{html.escape(referral_link)}\n\n"
-        f"Приглашено тобой: {user_data['referrals']} 👤\n\n"
-        "❤️ Как это работает:\n"
-        "╠ Отправь свою ссылку другу\n"
-        f"╠ Друг заходит и выполняет {REFERRAL_TASKS_REQUIRED} заданий\n"
-        f"╚ Ты получаешь {DEFAULT_REFERRAL_REWARD:g}⭐️ сразу же!"
-    )
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📋 Скопировать ссылку", copy_text=CopyTextButton(text=referral_link))],
-        [InlineKeyboardButton(text="📨 Отправить другу", url=share_url)],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
-    ])
-    await replace_message(callback, text, markup, disable_preview=True)
+    rows = await fetchall("SELECT * FROM withdrawals WHERE status='pending' ORDER BY id DESC LIMIT 20")
+    btns = [[btn(f"#{w['id']} · {w['recipient']} · {w['gift']}", cb=f"a:wdv:{w['id']}")] for w in rows]
+    text = f"📥 <b>Заявки на вывод</b>\n\nОжидают: {len(rows)}" if rows else "📥 <b>Заявки на вывод</b>\n\nНет заявок в ожидании 🎉"
+    await edit(c, text, kb(*btns, A_BACK))
+    await c.answer()
 
 
-# ================= ТОП =================
-@router.callback_query(F.data == "menu_top")
-async def top_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    await safe_answer(callback)
+@admin.callback_query(F.data.startswith("a:wdv:"))
+async def a_wd_view(c: CallbackQuery):
+    w = await fetchone("SELECT * FROM withdrawals WHERE id=?", (int(c.data.split(":")[2]),))
+    if not w:
+        return await c.answer("Не найдена")
+    markup = wd_admin_kb(w["id"]).inline_keyboard
+    await edit(c, await wd_admin_text(w), kb(*markup, [btn("◀️ К заявкам", cb="a:wd", style="primary")]))
+    await c.answer()
+
+
+@admin.callback_query(F.data.startswith("wp:"))
+async def wd_paid(c: CallbackQuery):
+    w = await fetchone("SELECT * FROM withdrawals WHERE id=?", (int(c.data[3:]),))
+    if not w or w["status"] != "pending":
+        return await c.answer("Заявка уже обработана", show_alert=True)
+    await db.execute("UPDATE withdrawals SET status='paid' WHERE id=?", (w["id"],))
+    await db.execute("UPDATE users SET withdrawn=withdrawn+? WHERE id=?", (w["amount"], w["user_id"]))
+    await db.commit()
+    await edit(c, await wd_admin_text(w, "✅ Выплата отмечена как выполненная."))
+    await c.answer("Готово ✅")
+    try:
+        await c.bot.send_message(
+            w["user_id"],
+            f"📥 <b>Заявка на вывод #{w['id']}</b>\nПолучатель: {esc(w['recipient'])}\n"
+            f"Количество: {esc(w['gift'])}\n\nСтатус: ✅ Выплата одобрена")
+    except Exception:
+        pass
+    if POST_PAYOUTS_TO_CHANNEL:
+        try:
+            await c.bot.send_message(
+                WITHDRAW_CHANNEL,
+                f"✅ <b>Выплата #{w['id']}</b>\n{esc(w['gift'])}\nПолучатель: {esc(w['recipient'])}")
+        except Exception as ex:
+            logging.warning("channel post failed: %s", ex)
+
+
+@admin.callback_query(F.data.startswith("wr:"))
+async def wd_reject(c: CallbackQuery):
+    w = await fetchone("SELECT * FROM withdrawals WHERE id=?", (int(c.data[3:]),))
+    if not w or w["status"] != "pending":
+        return await c.answer("Заявка уже обработана", show_alert=True)
+    await db.execute("UPDATE withdrawals SET status='rejected' WHERE id=?", (w["id"],))
+    await db.execute("UPDATE users SET balance=balance+? WHERE id=?", (w["amount"], w["user_id"]))  # возврат
+    await db.commit()
+    await edit(c, await wd_admin_text(w, "❌ Заявка отклонена."))
+    await c.answer("Отклонено ❌")
+    try:
+        await c.bot.send_message(
+            w["user_id"],
+            f"📥 <b>Заявка на вывод #{w['id']}</b>\nПолучатель: {esc(w['recipient'])}\n"
+            f"Количество: {esc(w['gift'])}\n\nСтатус: ❌ Заявка отклонена.\n"
+            f"Звёзды возвращены на баланс.")
+    except Exception:
+        pass
+
+
+# ---------- Задания ----------
+async def tasks_view():
+    rows = await fetchall("SELECT * FROM tasks ORDER BY id")
+    btns = []
+    for t in rows:
+        done = (await fetchone("SELECT COUNT(*) c FROM user_tasks WHERE task_id=? AND status='done'", (t["id"],)))["c"]
+        icon = "🟢" if t["active"] else "⚪"
+        kind = "📢" if t["kind"] == "channel" else "🤖"
+        btns.append([btn(f"{icon} #{t['id']} {kind} +{fmt(t['reward'])}⭐ · выполнили: {done}", cb=f"a:tv:{t['id']}")])
+    text = "📋 <b>Задания</b>\n\n" + (f"Всего своих: {len(rows)}. Нажми на задание, чтобы управлять 👇" if rows else "Своих заданий пока нет.") + \
+        f"\n\n🛰 Flyer: {'подключён ✅ (задания приходят автоматически)' if FLYER_KEY else 'не подключён (нет FLYER_KEY)'}" + \
+        f"\n🌿 TGrass: {'подключён ✅' if TGRASS_KEY else 'не подключён (нет TGRASS_KEY)'}"
+    btns.append([btn("➕ Добавить задание", cb="a:task_add", style="success")])
+    btns.append(A_BACK)
+    return text, kb(*btns)
+
+
+@admin.callback_query(F.data == "a:tasks")
+async def a_tasks(c: CallbackQuery, state: FSMContext):
     await state.clear()
+    text, markup = await tasks_view()
+    await edit(c, text, markup)
+    await c.answer()
 
-    user_id = callback.from_user.id
-    await ensure_user(callback.from_user)
 
-    top = await get_top(5)
-    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+@admin.callback_query(F.data.startswith("a:tv:"))
+async def a_task_view(c: CallbackQuery):
+    t = await fetchone("SELECT * FROM tasks WHERE id=?", (int(c.data.split(":")[2]),))
+    if not t:
+        return await c.answer("Не найдено")
+    skip = (await fetchone("SELECT COUNT(*) c FROM user_tasks WHERE task_id=? AND status='skip'", (t["id"],)))["c"]
+    done = (await fetchone("SELECT COUNT(*) c FROM user_tasks WHERE task_id=? AND status='done'", (t["id"],)))["c"]
+    text = (f"📋 <b>Задание #{t['id']}</b>\n\n"
+            f"Тип: {'📢 Канал' if t['kind'] == 'channel' else '🤖 Бот'}\n"
+            f"Ссылка: {esc(t['url'])}\n"
+            f"Проверка: {esc(t['chat_id']) if t['chat_id'] else '— (без проверки)'}\n"
+            f"Награда: +{fmt(t['reward'])} ⭐\n"
+            f"Статус: {'🟢 включено' if t['active'] else '⚪ выключено'}\n\n"
+            f"✅ Выполнили: {done} · ⏭ Пропустили: {skip}")
+    await edit(c, text, kb(
+        [btn("⚪ Выключить" if t["active"] else "🟢 Включить", cb=f"a:tt:{t['id']}", style="primary"),
+         btn("🗑 Удалить", cb=f"a:td:{t['id']}", style="danger")],
+        [btn("◀️ Назад", cb="a:tasks")]))
+    await c.answer()
 
-    lines = []
-    for i in range(5):
-        if i < len(top):
-            _, name, refs = top[i]
-            lines.append(f"{medals[i]} {name} — рефералов: {refs}")
+
+@admin.callback_query(F.data.startswith("a:tt:"))
+async def a_task_toggle(c: CallbackQuery):
+    await run("UPDATE tasks SET active=1-active WHERE id=?", (int(c.data.split(":")[2]),))
+    await a_task_view(c)
+
+
+@admin.callback_query(F.data.startswith("a:td:"))
+async def a_task_delete(c: CallbackQuery):
+    await run("DELETE FROM tasks WHERE id=?", (int(c.data.split(":")[2]),))
+    await c.answer("Удалено 🗑")
+    text, markup = await tasks_view()
+    await edit(c, text, markup)
+
+
+CANCEL_TASKS = kb([btn("✖️ Отмена", cb="a:tasks", style="danger")])
+
+
+@admin.callback_query(F.data == "a:task_add")
+async def a_task_add(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await edit(c, "➕ <b>Новое задание</b>\n\nВыбери тип:", kb(
+        [btn("📢 Канал", cb="a:tk:channel", style="primary"), btn("🤖 Бот", cb="a:tk:bot", style="success")],
+        [btn("◀️ Назад", cb="a:tasks")]))
+    await c.answer()
+
+
+@admin.callback_query(F.data.startswith("a:tk:"))
+async def a_task_kind(c: CallbackQuery, state: FSMContext):
+    await state.update_data(kind=c.data.split(":")[2])
+    await state.set_state(TaskAdd.url)
+    await edit(c, "🔗 Отправь <b>ссылку</b> (https://t.me/...) — сюда можно вставить ссылку интеграции спонсора.",
+               CANCEL_TASKS)
+    await c.answer()
+
+
+@admin.message(TaskAdd.url, F.text)
+async def a_task_url(m: Message, state: FSMContext):
+    url = m.text.strip()
+    if not url.startswith(("https://", "http://")):
+        return await m.answer("❌ Ссылка должна начинаться с https://", reply_markup=CANCEL_TASKS)
+    data = await state.get_data()
+    await state.update_data(url=url)
+    if data["kind"] == "channel":
+        pub = re.match(r"https?://t\.me/([A-Za-z][A-Za-z0-9_]{3,})/?$", url)
+        if pub:
+            await state.update_data(chat="@" + pub.group(1))
         else:
-            lines.append(f"{medals[i]} —")
-
-    my_refs, my_rank = await get_user_refs_and_rank(user_id)
-    if my_rank is not None and my_rank <= 5:
-        footer = f"🏆 Ты на {my_rank} месте! Рефералов: {my_refs}"
-    elif my_rank is not None:
-        footer = f"📍 Твоё место: {my_rank} | Рефералов: {my_refs}"
+            await state.set_state(TaskAdd.chat)
+            return await m.answer(
+                "Ссылка приватная — отправь <b>ID канала</b> (вида <code>-100123456789</code>) для проверки подписки.\n"
+                "Бот должен быть админом канала. Или отправь «-» чтобы без проверки.", reply_markup=CANCEL_TASKS)
     else:
-        footer = f"🚫 Ты не попал в топ! | {my_refs} рефералов."
+        await state.update_data(chat="")
+    await state.set_state(TaskAdd.reward)
+    await m.answer(f"💰 Награда за задание в ⭐ (например <code>0.25</code>) или «-» = {DEFAULT_TASK_REWARD}:",
+                   reply_markup=CANCEL_TASKS)
 
-    text = "🏆 Топ 5 по приглашениям:\n\n" + "\n".join(lines) + f"\n\n{footer}"
-    await replace_with_photo(callback, TOP_PHOTO_URL, text, back_markup("back_to_main"))
+
+@admin.message(TaskAdd.chat, F.text)
+async def a_task_chat(m: Message, state: FSMContext):
+    v = m.text.strip()
+    await state.update_data(chat="" if v == "-" else v)
+    await state.set_state(TaskAdd.reward)
+    await m.answer(f"💰 Награда за задание в ⭐ (например <code>0.25</code>) или «-» = {DEFAULT_TASK_REWARD}:",
+                   reply_markup=CANCEL_TASKS)
 
 
-# ================= ВЫВОД =================
-@router.callback_query(F.data == "menu_withdraw")
-async def withdraw_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    await safe_answer(callback)
+@admin.message(TaskAdd.reward, F.text)
+async def a_task_reward(m: Message, state: FSMContext):
+    v = m.text.strip().replace(",", ".")
+    try:
+        reward = DEFAULT_TASK_REWARD if v == "-" else float(v)
+        assert reward > 0
+    except Exception:
+        return await m.answer("❌ Введи число больше нуля, например 0.25", reply_markup=CANCEL_TASKS)
+    d = await state.get_data()
+    await run("INSERT INTO tasks(kind,url,chat_id,reward) VALUES(?,?,?,?)",
+              (d["kind"], d["url"], d.get("chat", ""), reward))
     await state.clear()
-
-    text = "Выбери количество звёзд, которое хочешь вывести:"
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="15 ⭐", callback_data="withdraw_15"),
-                InlineKeyboardButton(text="25 ⭐", callback_data="withdraw_25"),
-            ],
-            [
-                InlineKeyboardButton(text="50 ⭐", callback_data="withdraw_50"),
-                InlineKeyboardButton(text="100 ⭐", callback_data="withdraw_100"),
-            ],
-            [
-                InlineKeyboardButton(text="Другое количество", callback_data="withdraw_custom"),
-                InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main"),
-            ],
-        ]
-    )
-    await replace_with_photo(callback, WITHDRAW_PHOTO_URL, text, markup)
+    text, markup = await tasks_view()
+    await m.answer("✅ Задание добавлено!\n\n" + text, reply_markup=markup)
 
 
-@router.callback_query(F.data.startswith("withdraw_") & ~F.data.in_({"withdraw_custom"}))
-async def withdraw_preset_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    amount = int(callback.data.split("_")[1])
-    user_id = callback.from_user.id
-    await set_wd(user_id, {"amount": amount})
-
-    await state.set_state(WithdrawStates.waiting_for_username)
-    await safe_answer(callback)
-    await replace_message(callback, "Введите @username получателя:", back_markup("menu_withdraw"))
-
-
-@router.callback_query(F.data == "withdraw_custom")
-async def withdraw_custom_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(WithdrawStates.waiting_for_custom_amount)
-    await safe_answer(callback)
-    await replace_message(callback, "Введите любое целое число от 50 ⭐", back_markup("menu_withdraw"))
+# ---------- Промокоды ----------
+async def promos_view():
+    rows = await fetchall("SELECT * FROM promos ORDER BY rowid DESC LIMIT 30")
+    btns = []
+    for p in rows:
+        lim = p["max_uses"] or "∞"
+        btns.append([btn(f"🎟 {p['code']} · {fmt(p['reward'])}⭐ · {p['uses']}/{lim}", cb=f"a:pv:{p['code']}")])
+    text = "🎟 <b>Промокоды</b>\n\n" + ("Нажми на промокод, чтобы управлять 👇" if rows else "Промокодов пока нет.")
+    btns.append([btn("➕ Создать промокод", cb="a:promo_add", style="success")])
+    btns.append(A_BACK)
+    return text, kb(*btns)
 
 
-@router.callback_query(F.data == "confirm_withdraw")
-async def confirm_withdraw_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    user_id = callback.from_user.id
-    await ensure_user(callback.from_user)
-    temp_data = await get_wd(user_id)
-
-    amount = to_int(temp_data.get("amount"))
-    username = temp_data.get("username", "@unknown")
-
-    if amount <= 0:
-        await safe_answer(callback, "❌ Данные заявки потеряны, начните заново.", show_alert=True)
-        return
-
-    # Сначала списываем, затем проверяем остаток — так нельзя вывести дважды одни и те же звёзды
-    new_balance = await add_balance(user_id, -amount)
-    if new_balance is None:
-        await safe_answer(callback, "❌ Ошибка сервера, попробуйте позже.", show_alert=True)
-        return
-    if new_balance < 0:
-        await add_balance(user_id, amount)  # возвращаем
-        await safe_answer(callback, "❌ У вас недостаточно средств на балансе!", show_alert=True)
-        return
-
-    await redis_cmd("INCRBYFLOAT", "stat:withdrawals", amount)
+@admin.callback_query(F.data == "a:promos")
+async def a_promos(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    await del_wd(user_id)
-    await safe_answer(callback)
+    text, markup = await promos_view()
+    await edit(c, text, markup)
+    await c.answer()
 
-    await replace_message(callback, f"Заявка на вывод {amount} ⭐ успешно выполнена", back_markup("back_to_main"))
 
-    user = callback.from_user
-    req_id = await create_withdraw_request(user, username, amount)
-    refs = await get_referrals_info(user_id)
-    subs = sum(r["sponsors"] or 0 for r in refs)
-    user_tag = f"@{user.username}" if user.username else f"id{user_id}"
-    title = f"📥 Заявка на вывод #{req_id}" if req_id else "📥 Заявка на вывод"
-    suffix = f"_{req_id}" if req_id else ""
-    admin_text = (
-        f"{title}\n"
-        f"Пользователь: {user.first_name or '—'} ({user_tag})\n"
-        f"Получатель: {username}\n"
-        f"Количество: {amount}⭐\n"
-        f"Приглашено: {len(refs)} · подписок на спонсоров: {subs}"
-    )
-    admin_markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Выплатил ✅", callback_data=f"admin_pay_yes{suffix}"),
-                InlineKeyboardButton(text="Не одобрена ❌", callback_data=f"admin_pay_no{suffix}"),
-            ]
-        ]
-    )
+@admin.callback_query(F.data.startswith("a:pv:"))
+async def a_promo_view(c: CallbackQuery):
+    p = await fetchone("SELECT * FROM promos WHERE code=?", (c.data.split(":", 2)[2],))
+    if not p:
+        return await c.answer("Не найден")
+    text = (f"🎟 <b>Промокод</b> <code>{esc(p['code'])}</code>\n\n"
+            f"Награда: {fmt(p['reward'])} ⭐\n"
+            f"Активаций: {p['uses']} / {p['max_uses'] or '∞'}")
+    await edit(c, text, kb([btn("🗑 Удалить", cb=f"a:pd:{p['code']}", style="danger")],
+                           [btn("◀️ Назад", cb="a:promos", style="primary")]))
+    await c.answer()
+
+
+@admin.callback_query(F.data.startswith("a:pd:"))
+async def a_promo_del(c: CallbackQuery):
+    code = c.data.split(":", 2)[2]
+    await run("DELETE FROM promos WHERE code=?", (code,))
+    await c.answer("Удалено 🗑")
+    text, markup = await promos_view()
+    await edit(c, text, markup)
+
+
+CANCEL_PROMOS = kb([btn("✖️ Отмена", cb="a:promos", style="danger")])
+
+
+@admin.callback_query(F.data == "a:promo_add")
+async def a_promo_add(c: CallbackQuery, state: FSMContext):
+    await state.set_state(PromoAdd.code)
+    await edit(c, "➕ <b>Новый промокод</b>\n\nОтправь текст промокода (латиница/цифры) или «-» для случайного:",
+               CANCEL_PROMOS)
+    await c.answer()
+
+
+@admin.message(PromoAdd.code, F.text)
+async def a_promo_code(m: Message, state: FSMContext):
+    v = m.text.strip().upper()
+    if v == "-":
+        v = "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    if not re.fullmatch(r"[A-Z0-9_]{3,32}", v):
+        return await m.answer("❌ Только латиница, цифры и _ (3–32 символа)", reply_markup=CANCEL_PROMOS)
+    if await fetchone("SELECT 1 FROM promos WHERE code=?", (v,)):
+        return await m.answer("❌ Такой промокод уже есть", reply_markup=CANCEL_PROMOS)
+    await state.update_data(code=v)
+    await state.set_state(PromoAdd.reward)
+    await m.answer("💰 Сколько ⭐ даёт промокод? (например <code>1</code>)", reply_markup=CANCEL_PROMOS)
+
+
+@admin.message(PromoAdd.reward, F.text)
+async def a_promo_reward(m: Message, state: FSMContext):
     try:
-        await callback.bot.send_message(chat_id=ADMIN_ID, text=admin_text, reply_markup=admin_markup)
+        r = float(m.text.strip().replace(",", "."))
+        assert r > 0
     except Exception:
-        pass
+        return await m.answer("❌ Введи число больше нуля", reply_markup=CANCEL_PROMOS)
+    await state.update_data(reward=r)
+    await state.set_state(PromoAdd.uses)
+    await m.answer("👥 Сколько раз можно активировать? (<code>0</code> = без лимита)", reply_markup=CANCEL_PROMOS)
 
 
-@router.callback_query(F.data.startswith("admin_pay_"))
-async def admin_action_handler(callback: CallbackQuery) -> None:
-    if callback.from_user.id != ADMIN_ID:
-        await safe_answer(callback, "Доступ запрещен", show_alert=True)
-        return
-    await safe_answer(callback)
-    parts = callback.data.split("_")  # admin, pay, yes|no[, id]
-    is_yes = parts[2] == "yes"
-    if len(parts) > 3:
-        await set_wd_status(to_int(parts[3]), "paid" if is_yes else "rejected")
-    action_text = "✅ Выплата отмечена как выполненная." if is_yes else "❌ Заявка отклонена."
+@admin.message(PromoAdd.uses, F.text)
+async def a_promo_uses(m: Message, state: FSMContext):
     try:
-        await callback.message.edit_text(f"{callback.message.text}\n\nСтатус: {action_text}")
+        n = int(m.text.strip())
+        assert n >= 0
     except Exception:
-        pass
+        return await m.answer("❌ Введи целое число (0 = без лимита)", reply_markup=CANCEL_PROMOS)
+    d = await state.get_data()
+    await run("INSERT INTO promos(code,reward,max_uses) VALUES(?,?,?)", (d["code"], d["reward"], n))
+    await state.clear()
+    text, markup = await promos_view()
+    await m.answer(f"✅ Промокод <code>{d['code']}</code> создан: {fmt(d['reward'])} ⭐, лимит: {n or '∞'}\n\n" + text,
+                   reply_markup=markup)
 
 
-# ================= ШТРАФ ЗА ОТПИСКУ =================
-UNSUBSCRIBE_PENALTY = 3.0     # штраф пользователю, ⭐
-REFERRER_PENALTY = 3.0        # штраф пригласившему, ⭐
-WATCH_DAYS = 3                # сколько дней нельзя отписываться
-RECHECK_INTERVAL = 60         # как часто перепроверять одного пользователя при его заходах (сек)
-CRON_RECHECK = 6 * 3600       # как часто перепроверять по расписанию (сек)
-CRON_BATCH = 20               # сколько пользователей проверять за один вызов /cron
+# ---------- Пользователи ----------
+async def user_card(uid: int):
+    u = await get_user(uid)
+    if not u:
+        return None, None
+    invited = await ref_count(uid)
+    done = (await fetchone("SELECT COUNT(*) c FROM done_tasks WHERE user_id=?", (uid,)))["c"]
+    uname = f"@{u['username']}" if u["username"] else "—"
+    text = (f"👤 <b>{esc(u['full_name'])}</b> ({esc(uname)})\n"
+            f"ID: <code>{uid}</code>\n"
+            f"Регистрация: {u['created_at']}\n"
+            f"Пригласил: {u['referrer_id'] or '—'}\n\n"
+            f"💰 Баланс: {fmt(u['balance'])} ⭐\n"
+            f"📈 Заработано: {fmt(u['earned'])} · 📤 Выведено: {fmt(u['withdrawn'])}\n"
+            f"👥 Рефералов: {invited} · ✅ Заданий: {done}\n"
+            f"Статус: {'🚫 забанен' if u['banned'] else '✅ активен'}")
+    markup = kb(
+        [btn("➕ Начислить", cb=f"a:uadd:{uid}", style="success"),
+         btn("➖ Списать", cb=f"a:usub:{uid}", style="danger")],
+        [btn("✅ Разбанить" if u["banned"] else "🚫 Забанить", cb=f"a:uban:{uid}", style="primary")],
+        [btn("◀️ Назад", cb="a:users")])
+    return text, markup
 
 
-def days_text(n: int) -> str:
-    n10, n100 = n % 10, n % 100
-    if n10 == 1 and n100 != 11:
-        return f"{n} день"
-    if 2 <= n10 <= 4 and not 12 <= n100 <= 14:
-        return f"{n} дня"
-    return f"{n} дней"
+@admin.callback_query(F.data == "a:users")
+async def a_users(c: CallbackQuery, state: FSMContext):
+    await state.set_state(UserAdm.find)
+    await edit(c, "👥 <b>Пользователи</b>\n\nОтправь <b>ID</b> или <b>@username</b> пользователя:",
+               kb(A_BACK))
+    await c.answer()
 
 
-def fmt_stars(x: float) -> str:
-    """1.4 -> '1.4', 86 -> '86.0', 1.35 -> '1.35'"""
-    s = f"{x:.2f}"
-    return s[:-1] if s.endswith("0") else s
+@admin.message(UserAdm.find, F.text)
+async def a_user_find(m: Message, state: FSMContext):
+    v = m.text.strip().lstrip("@")
+    row = await get_user(int(v)) if v.isdigit() else await fetchone(
+        "SELECT * FROM users WHERE LOWER(username)=LOWER(?)", (v,))
+    if not row:
+        return await m.answer("❌ Пользователь не найден. Попробуй ещё раз:", reply_markup=kb(A_BACK))
+    await state.clear()
+    text, markup = await user_card(row["id"])
+    await m.answer(text, reply_markup=markup)
 
 
-def sponsors_done_text() -> str:
-    return (
-        "<b>✅ Задание выполнено!\n\n"
-        f"❗ Не отписывайся от канала {days_text(WATCH_DAYS)}, иначе получишь штраф. "
-        "Совет: закинь канал в архив и отключи уведомления</b>"
-    )
+@admin.callback_query(F.data.startswith("a:uban:"))
+async def a_user_ban(c: CallbackQuery):
+    uid = int(c.data.split(":")[2])
+    await run("UPDATE users SET banned=1-banned WHERE id=?", (uid,))
+    text, markup = await user_card(uid)
+    await edit(c, text, markup)
+    await c.answer("Готово")
 
 
-def penalty_user_text(balance: float) -> str:
-    return (
-        "<b>⚠️ Вы отписались от канала\n\n"
-        f"Отписка зафиксирована раньше, чем через {days_text(WATCH_DAYS)} после выполнения задания.\n\n"
-        f"💸 Штраф: -{UNSUBSCRIBE_PENALTY:g}⭐\n"
-        f"💳 Баланс: {fmt_stars(balance)}⭐\n\n"
-        f"Сохраняйте подписки минимум {days_text(WATCH_DAYS)} — таковы условия начисления звёзд.</b>"
-    )
+@admin.callback_query(F.data.startswith(("a:uadd:", "a:usub:")))
+async def a_user_bal(c: CallbackQuery, state: FSMContext):
+    _, kind, uid = c.data.split(":")
+    await state.set_state(UserAdm.amount)
+    await state.update_data(uid=int(uid), sign=1 if kind == "uadd" else -1)
+    await edit(c, "Введи сумму в ⭐ (например <code>5</code>):", kb(A_BACK))
+    await c.answer()
 
 
-def penalty_referrer_text(username: str, reward: float, balance: float) -> str:
-    return (
-        f"<b>реферал: {html.escape(username)} отписался раньше, чем {days_text(WATCH_DAYS)}\n\n"
-        f"💸 Штраф: -{reward:g} ⭐\n"
-        f"доход: {fmt_stars(balance)} ⭐\n\n"
-        f"Рефералы должны сохранять подписки минимум {days_text(WATCH_DAYS)} "
-        "таковы условия начисления звёзд</b>"
-    )
-
-
-async def send_sponsors_done(target) -> None:
-    message = target.message if isinstance(target, CallbackQuery) else target
+@admin.message(UserAdm.amount, F.text)
+async def a_user_amount(m: Message, state: FSMContext):
     try:
-        await message.answer(sponsors_done_text(), parse_mode="HTML")
-    except Exception as e:
-        print(f"send_sponsors_done error: {e!r}")
+        v = float(m.text.strip().replace(",", "."))
+        assert v > 0
+    except Exception:
+        return await m.answer("❌ Введи число больше нуля", reply_markup=kb(A_BACK))
+    d = await state.get_data()
+    if d["sign"] > 0:
+        await run("UPDATE users SET balance=balance+?, earned=earned+? WHERE id=?", (v, v, d["uid"]))
+    else:
+        await run("UPDATE users SET balance=MAX(0, balance-?) WHERE id=?", (v, d["uid"]))
+    await state.clear()
+    text, markup = await user_card(d["uid"])
+    await m.answer("✅ Баланс обновлён\n\n" + text, reply_markup=markup)
 
 
-# ----- проверка «всё ещё подписан» -----
-# Штраф выдаётся только если сервис ЯВНО ответил «не подписан». Ошибка или пустой ответ — не штраф.
-# Подключены сервисы, у которых API показывает текущее состояние подписки.
-async def retention_piarflow(session, uid, items):
-    _, res, _ = await api_post(
-        session, "piarflow-retention", f"{PIARFLOW_API_URL}/sponsors/check",
-        {"user_id": uid, "links": [i["link"] for i in items]}, piarflow_headers(),
-    )
-    if not isinstance(res, dict):
-        return []
-    bad = {s.get("link") for s in (res.get("sponsors") or []) if s.get("status") == "unsubscribed"}
-    return [i for i in items if i["link"] in bad]
+# ---------- Рассылка ----------
+@admin.callback_query(F.data == "a:cast")
+async def a_cast(c: CallbackQuery, state: FSMContext):
+    await state.set_state(Cast.msg)
+    await edit(c, "📨 <b>Рассылка</b>\n\nОтправь сообщение для рассылки (текст, фото, видео — что угодно, "
+                  "форматирование сохранится):", kb(A_BACK))
+    await c.answer()
 
 
-async def retention_own(session, uid, items):
-    """Штраф только если Telegram явно показал, что человек не в канале."""
-    bot = _current_bot.get()
-    if bot is None:
-        return []
-    return [
-        i for i in items
-        if await check_subscription(bot, i.get("chat_id", OWN_CHANNEL_ID), uid) is False
-    ]
+@admin.message(Cast.msg)
+async def a_cast_msg(m: Message, state: FSMContext):
+    await state.update_data(chat=m.chat.id, mid=m.message_id)
+    n = (await fetchone("SELECT COUNT(*) c FROM users WHERE banned=0"))["c"]
+    await m.answer(f"👆 Так выглядит сообщение.\n\nОтправить <b>{n}</b> пользователям?", reply_markup=kb(
+        [btn("✅ Запустить", cb="a:cast_go", style="success"),
+         btn("✖️ Отмена", cb="a:menu", style="danger")]))
 
 
-RETENTION = {"own": retention_own, "piarflow": retention_piarflow}
-
-
-async def start_watch(uid: int, shown: dict) -> None:
-    """Пользователь выполнил спонсоров — следим за подпиской WATCH_DAYS дней."""
-    items = {n: list(shown.get(n) or []) for n in RETENTION if shown.get(n)}
-    # наш канал под наблюдением всегда, даже если человек был подписан ещё до бота
-    items["own"] = [{"link": OWN_CHANNEL_LINK, "chat_id": OWN_CHANNEL_ID}]
-    now = time.time()
-    watch = {
-        "started": now,
-        "expires": now + WATCH_DAYS * 86400,
-        "items": items,
-        "last": now,
-    }
-    await redis_set_json(f"watch:{uid}", watch, ex=(WATCH_DAYS + 1) * 86400)
-    await redis_cmd("ZADD", "watch_list", now + RECHECK_INTERVAL, uid)
-
-
-async def apply_unsubscribe_penalty(bot: Bot, uid: int) -> None:
-    # SET NX: штраф выдаётся один раз на пользователя
-    first = await redis_cmd("SET", f"penalized:{uid}", "1", "NX")
-    await redis_cmd("DEL", f"watch:{uid}")
-    await redis_cmd("ZREM", "watch_list", uid)
-    if first is None:
-        return
-
-    balance = await add_balance(uid, -UNSUBSCRIBE_PENALTY)
-    if balance is not None:
+async def _cast_one(bot: Bot, uid: int, d: dict) -> int:
+    try:
+        await bot.copy_message(uid, d["chat"], d["mid"])
+        return 1
+    except TelegramRetryAfter as ex:
+        await asyncio.sleep(min(ex.retry_after, 5))
         try:
-            await bot.send_message(chat_id=uid, text=penalty_user_text(balance), parse_mode="HTML")
+            await bot.copy_message(uid, d["chat"], d["mid"])
+            return 1
         except Exception:
-            pass
-
-    # Пригласившему возвращаем (списываем) награду за этого реферала
-    raw = await redis_cmd("GET", f"refby:{uid}")
-    if raw:
-        try:
-            ref_part, reward_part = str(raw).split(":", 1)
-            ref_id, reward = int(ref_part), float(reward_part)
-        except ValueError:
-            return
-        ref_balance = await add_balance(ref_id, -REFERRER_PENALTY)
-        if ref_balance is None:
-            return
-        me = await get_user(uid)
-        username = me["username"] if me and me["username"] else f"id{uid}"
-        try:
-            await bot.send_message(
-                chat_id=ref_id, text=penalty_referrer_text(username, REFERRER_PENALTY, ref_balance), parse_mode="HTML",
-            )
-        except Exception:
-            pass
-
-
-async def run_watch_check(bot: Bot, uid: int) -> bool:
-    """Перепроверяет подписки пользователя. True — штраф выдан."""
-    watch = await redis_get_json(f"watch:{uid}")
-    now = time.time()
-    if not isinstance(watch, dict) or now >= to_float(watch.get("expires")):
-        # срок вышел или записи нет — следить больше не нужно
-        await redis_cmd("DEL", f"watch:{uid}")
-        await redis_cmd("ZREM", "watch_list", uid)
-        return False
-
-    items = watch.get("items") or {}
-    names = [n for n in RETENTION if items.get(n)]
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
-        results = await asyncio.gather(
-            *(RETENTION[n](session, uid, items[n]) for n in names), return_exceptions=True,
-        )
-    unsubscribed = False
-    for name, res in zip(names, results):
-        if isinstance(res, Exception):
-            print(f"[{name}] ошибка проверки удержания: {res!r}")
-            continue
-        if res:
-            unsubscribed = True
-
-    if unsubscribed:
-        await apply_unsubscribe_penalty(bot, uid)
-        return True
-
-    expires = to_float(watch.get("expires"))
-    watch["last"] = now
-    await redis_set_json(f"watch:{uid}", watch, ex=int(expires - now) + 86400)
-    # последняя проверка — незадолго до конца срока
-    await redis_cmd("ZADD", "watch_list", max(min(now + CRON_RECHECK, expires - 60), now + 60), uid)
-    return False
-
-
-async def maybe_check_watch(event) -> None:
-    """Вызывается, когда пользователь заходит в бота: перепроверка не чаще RECHECK_INTERVAL."""
-    uid = event.from_user.id
-    watch = await redis_get_json(f"watch:{uid}")
-    if not isinstance(watch, dict):
-        return
-    if time.time() - to_float(watch.get("last")) < RECHECK_INTERVAL:
-        return
-    try:
-        await run_watch_check(event.bot, uid)
-    except Exception as e:
-        print(f"maybe_check_watch error: {e!r}")
-
-
-@router.chat_member(F.chat.id == OWN_CHANNEL_ID)
-async def own_channel_member_handler(event: ChatMemberUpdated) -> None:
-    """Человек вышел из нашего канала — штраф сразу, если он ещё в 3-дневном окне."""
-    if _status_str(event.new_chat_member) not in ("left", "kicked"):
-        return
-    uid = event.new_chat_member.user.id
-    watch = await redis_get_json(f"watch:{uid}")
-    if not isinstance(watch, dict) or time.time() >= to_float(watch.get("expires")):
-        return
-    if not (watch.get("items") or {}).get("own"):
-        return
-    bot = _current_bot.get() or event.bot
-    await apply_unsubscribe_penalty(bot, uid)
-
-
-async def process_cron() -> int:
-    """Проверка подписок по расписанию. Возвращает, сколько пользователей проверено."""
-    bot = Bot(token=BOT_TOKEN)
-    redis_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))
-    token = _redis_session.set(redis_session)
-    bot_token = _current_bot.set(bot)
-    try:
-        ids = await redis_cmd("ZRANGEBYSCORE", "watch_list", "-inf", time.time(), "LIMIT", 0, CRON_BATCH) or []
-        sem = asyncio.Semaphore(5)
-
-        async def one(uid):
-            async with sem:
-                try:
-                    await run_watch_check(bot, to_int(uid))
-                except Exception as e:
-                    print(f"cron check error for {uid}: {e!r}")
-
-        await asyncio.gather(*(one(i) for i in ids))
-        return len(ids)
-    finally:
-        _current_bot.reset(bot_token)
-        _redis_session.reset(token)
-        await redis_session.close()
-        await bot.session.close()
-
-
-# ================= ЗАЯВКИ НА ВЫВОД (админ-панель) =================
-MSK = timezone(timedelta(hours=3))
-WD_PAGE_SIZE = 5
-WD_STATUS = {"new": "⏳ новая", "paid": "✅ выплачена", "rejected": "❌ не одобрена"}
-
-
-def fmt_ts(ts) -> str:
-    try:
-        return datetime.fromtimestamp(float(ts), MSK).strftime("%d.%m.%Y %H:%M")
+            return 0
     except Exception:
-        return "—"
-
-
-async def record_sponsors(uid: int, count: int) -> None:
-    """Запоминает, на скольких спонсоров подписался пользователь (только первый раз)."""
-    await redis_cmd("HSETNX", user_key(uid), "sponsors", count)
-
-
-async def get_referrals_info(uid: int) -> list[dict]:
-    """Кого пригласил пользователь и сколько спонсоров выполнил каждый реферал."""
-    ids = await redis_cmd("SMEMBERS", f"refs:{uid}") or []
-    if not ids:
-        return []
-    rows = await redis_pipeline([["HMGET", user_key(to_int(i)), "username", "sponsors"] for i in ids])
-    out = []
-    for rid, row in zip(ids, rows):
-        username, sponsors = None, None
-        if isinstance(row, list) and len(row) == 2:
-            username, sponsors = row
-        out.append({
-            "id": to_int(rid),
-            "username": username or f"id{rid}",
-            "sponsors": to_int(sponsors) if sponsors is not None else None,
-        })
-    out.sort(key=lambda r: r["id"])
-    return out
-
-
-async def create_withdraw_request(user, recipient: str, amount: int) -> int:
-    """Сохраняет заявку на вывод. Возвращает её номер (0 — если Redis недоступен)."""
-    req_id = to_int(await redis_cmd("INCR", "wd_seq"))
-    if req_id <= 0:
         return 0
-    now = time.time()
-    req = {
-        "id": req_id,
-        "user_id": user.id,
-        "name": user.first_name or "",
-        "username": f"@{user.username}" if user.username else f"id{user.id}",
-        "recipient": recipient,
-        "amount": amount,
-        "ts": now,
-        "status": "new",
-    }
-    await redis_set_json(f"wdreq:{req_id}", req)
-    await redis_cmd("ZADD", "wd_list", now, req_id)
-    return req_id
 
 
-async def get_wd_request(req_id: int) -> Optional[dict]:
-    req = await redis_get_json(f"wdreq:{req_id}")
-    return req if isinstance(req, dict) else None
-
-
-async def set_wd_status(req_id: int, status: str) -> Optional[dict]:
-    req = await get_wd_request(req_id)
-    if not req:
-        return None
-    req["status"] = status
-    await redis_set_json(f"wdreq:{req_id}", req)
-    return req
-
-
-async def render_wd_details(req: dict, page: int):
-    refs = await get_referrals_info(req["user_id"])
-    total_sponsors = sum(r["sponsors"] or 0 for r in refs)
-    lines = [
-        f"💸 Заявка #{req['id']}",
-        f"Статус: {WD_STATUS.get(req.get('status'), req.get('status'))}",
-        f"Пользователь: {req.get('name') or '—'} ({req.get('username')}, id {req['user_id']})",
-        f"Получатель: {req.get('recipient')}",
-        f"Сумма: {req.get('amount')} ⭐",
-        f"Дата: {fmt_ts(req.get('ts'))} (МСК)",
-        "",
-        f"👥 Приглашено: {len(refs)} · подписок на спонсоров: {total_sponsors}",
-    ]
-    if refs:
-        lines.append("")
-        for i, r in enumerate(refs[:60], 1):
-            sp = str(r["sponsors"]) if r["sponsors"] is not None else "нет данных"
-            lines.append(f"{i}. {r['username']} — спонсоров: {sp}")
-        if len(refs) > 60:
-            lines.append(f"… и ещё {len(refs) - 60}")
-    else:
-        lines.append("Рефералов пока нет.")
-
-    rows = []
-    if req.get("status") == "new":
-        rows.append([
-            InlineKeyboardButton(text="Выплатил ✅", callback_data=f"admin_wdpay_yes_{req['id']}_{page}"),
-            InlineKeyboardButton(text="Не одобрена ❌", callback_data=f"admin_wdpay_no_{req['id']}_{page}"),
-        ])
-    rows.append([InlineKeyboardButton(text="⬅️ К списку", callback_data=f"admin_wdlist_{page}")])
-    return "\n".join(lines)[:4000], InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@router.callback_query(F.data.startswith("admin_wdlist_"))
-async def admin_wd_list(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != ADMIN_ID:
-        await safe_answer(callback, "Доступ запрещен", show_alert=True)
-        return
-    await safe_answer(callback)
-
-    page = max(to_int(callback.data.split("_")[2]), 0)
-    total = to_int(await redis_cmd("ZCARD", "wd_list"))
-    pages = max(1, -(-total // WD_PAGE_SIZE))
-    page = min(page, pages - 1)
-
-    ids = await redis_cmd("ZREVRANGE", "wd_list", page * WD_PAGE_SIZE, (page + 1) * WD_PAGE_SIZE - 1) or []
-    raws = await redis_pipeline([["GET", f"wdreq:{i}"] for i in ids])
-    reqs = []
-    for raw in raws:
+@admin.callback_query(F.data == "a:cast_go")
+async def a_cast_go(c: CallbackQuery, state: FSMContext):
+    """Рассылка порциями: один вызов Vercel живёт ≤ 60 с, поэтому прогресс хранится в cast_log, а «Продолжить» дошлёт остальным."""
+    d = await state.get_data()
+    if not d:
+        return await c.answer("Сессия устарела", show_alert=True)
+    ck = f"{d['chat']}:{d['mid']}"
+    ids = [r["id"] for r in await fetchall(
+        "SELECT id FROM users WHERE banned=0 AND id NOT IN (SELECT user_id FROM cast_log WHERE ck=?) LIMIT 5000", (ck,))]
+    await edit(c, f"⏳ Рассылка идёт… осталось {len(ids)}")
+    deadline = time.monotonic() + 40
+    i = 0
+    while i < len(ids) and time.monotonic() < deadline:
+        batch = ids[i:i + 20]
+        i += len(batch)
+        res = await asyncio.gather(*(_cast_one(c.bot, uid, d) for uid in batch))
+        await db.batch([("INSERT OR IGNORE INTO cast_log(ck,user_id,ok) VALUES(?,?,?)", (ck, uid, ok))
+                        for uid, ok in zip(batch, res)])
+        await asyncio.sleep(0.7)
+    left = len(ids) - i
+    if left > 0:
         try:
-            req = json.loads(raw) if raw else None
-        except Exception:
-            req = None
-        if isinstance(req, dict):
-            reqs.append(req)
-    infos = await asyncio.gather(*(get_referrals_info(r["user_id"]) for r in reqs))
-
-    rows = []
-    if not reqs:
-        text = "💸 Заявок на вывод пока нет."
-    else:
-        lines = [f"💸 Заявки на вывод — всего {total} (стр. {page + 1}/{pages})", ""]
-        for req, refs in zip(reqs, infos):
-            subs = sum(r["sponsors"] or 0 for r in refs)
-            status = WD_STATUS.get(req.get("status"), req.get("status"))
-            lines += [
-                f"#{req['id']} · {req['username']} · {req['amount']} ⭐ · {status}",
-                f"получатель: {req['recipient']} · {fmt_ts(req.get('ts'))}",
-                f"приглашено: {len(refs)} · подписок на спонсоров: {subs}",
-                "",
-            ]
-            rows.append([InlineKeyboardButton(
-                text=f"#{req['id']} · {req['amount']}⭐ · подробнее",
-                callback_data=f"admin_wdview_{req['id']}_{page}",
-            )])
-        lines.append("Нажмите на заявку, чтобы увидеть всех рефералов и их подписки.")
-        text = "\n".join(lines)[:4000]
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton(text="◀️", callback_data=f"admin_wdlist_{page - 1}"))
-    if page < pages - 1:
-        nav.append(InlineKeyboardButton(text="▶️", callback_data=f"admin_wdlist_{page + 1}"))
-    if nav:
-        rows.append(nav)
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")])
-    await replace_message(callback, text, InlineKeyboardMarkup(inline_keyboard=rows))
-
-
-@router.callback_query(F.data.startswith("admin_wdview_"))
-async def admin_wd_view(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != ADMIN_ID:
-        await safe_answer(callback, "Доступ запрещен", show_alert=True)
-        return
-    parts = callback.data.split("_")  # admin, wdview, id, page
-    req = await get_wd_request(to_int(parts[2]))
-    if not req:
-        await safe_answer(callback, "Заявка не найдена", show_alert=True)
-        return
-    await safe_answer(callback)
-    text, markup = await render_wd_details(req, to_int(parts[3]))
-    await replace_message(callback, text, markup)
-
-
-@router.callback_query(F.data.startswith("admin_wdpay_"))
-async def admin_wd_pay(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != ADMIN_ID:
-        await safe_answer(callback, "Доступ запрещен", show_alert=True)
-        return
-    parts = callback.data.split("_")  # admin, wdpay, yes|no, id, page
-    status = "paid" if parts[2] == "yes" else "rejected"
-    req = await set_wd_status(to_int(parts[3]), status)
-    if not req:
-        await safe_answer(callback, "Заявка не найдена", show_alert=True)
-        return
-    await safe_answer(callback, "Отмечено")
-    text, markup = await render_wd_details(req, to_int(parts[4]))
-    await replace_message(callback, text, markup)
-
-
-# ================= ПРОМОКОД (пользователь) =================
-@router.callback_query(F.data == "menu_promocode")
-async def promocode_menu_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(PromocodeStates.waiting_for_activation_input)
-    await safe_answer(callback)
-    await replace_message(callback, "🎟 Введите промокод:", back_markup("back_to_main"))
-
-
-# ================= АДМИН ПАНЕЛЬ =================
-@router.callback_query(F.data == "admin_panel")
-async def admin_panel_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != ADMIN_ID:
-        await safe_answer(callback, "Доступ запрещен", show_alert=True)
-        return
-    await safe_answer(callback)
-    await state.clear()
-
-    now = time.time()
-    total_users = to_int(await redis_cmd("SCARD", "users"))
-
-    async def joined_since(seconds: int) -> int:
-        return to_int(await redis_cmd("ZCOUNT", "users_joined", now - seconds, "+inf"))
-
-    u_24h = await joined_since(24 * 3600)
-    u_7d = await joined_since(7 * 24 * 3600)
-    u_30d = await joined_since(30 * 24 * 3600)
-
-    sponsors_count = to_int(await redis_cmd("GET", "stat:sponsors_completed"))
-    total_sponsor_subs = await get_income_sponsors()
-    income_rub = total_sponsor_subs * INCOME_PER_SPONSOR
-    withdrawals = to_float(await redis_cmd("GET", "stat:withdrawals"))
-
-    text = (
-        "панель админа:\n"
-        f"всего пользователей: {total_users}\n"
-        f"пользователей за 24h: {u_24h}\n"
-        f"пользователей за 7 дней: {u_7d}\n"
-        f"пользователей за 30 дней: {u_30d}\n"
-        f"пользователей подписавшись на спонсоров: {sponsors_count}\n"
-        f"подписок на спонсоров всего: {total_sponsor_subs}\n"
-        f"доход: {income_rub:g} руб\n"
-        f"выводы: {withdrawals:g} звезд"
-    )
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🚀 Рассылка", callback_data="admin_broadcast"),
-                InlineKeyboardButton(text="⭐ Задание", callback_data="admin_tasks_menu"),
-            ],
-            [
-                InlineKeyboardButton(text="🎁 Промокоды", callback_data="admin_promo_menu"),
-                InlineKeyboardButton(text="✨ Вознаграждение", callback_data="admin_reward_menu"),
-            ],
-            [InlineKeyboardButton(text="💸 Выводы", callback_data="admin_wdlist_0")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_main")],
-        ]
-    )
-    await replace_message(callback, text, markup)
-
-
-@router.callback_query(F.data == "admin_broadcast")
-async def admin_bc_start(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != ADMIN_ID:
-        await safe_answer(callback, "Доступ запрещен", show_alert=True)
-        return
-    await state.set_state(AdminBroadcastStates.waiting_for_text)
-    await safe_answer(callback)
-
-    count_users = to_int(await redis_cmd("SCARD", "users"))
-    text = f"пользователей увидят рассылку: {count_users}\n\nвведите текст рассылки"
-    await replace_message(callback, text, back_markup("admin_panel"))
-
-
-@router.callback_query(F.data == "admin_bc_send")
-async def admin_bc_send(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != ADMIN_ID:
-        await safe_answer(callback, "Доступ запрещен", show_alert=True)
-        return
-    data = await state.get_data()
-    bc_text = data.get("broadcast_text", "")
-    await safe_answer(callback)
-    await state.clear()
-
-    user_ids = await redis_cmd("SMEMBERS", "users") or []
-    sent_count = 0
-    for uid in user_ids:
-        try:
-            await callback.bot.send_message(chat_id=int(uid), text=bc_text)
-            sent_count += 1
-            await asyncio.sleep(0.05)
-        except Exception:
+            await c.message.edit_text(
+                f"⏳ Отправлено порцию, осталось <b>{left}</b>. Нажми «Продолжить».",
+                reply_markup=kb([btn("▶️ Продолжить", cb="a:cast_go", style="success")], A_BACK))
+        except TelegramBadRequest:
             pass
-
-    await replace_message(callback, f"отправлено пользователям: {sent_count}", back_markup("admin_panel"))
-
-
-@router.callback_query(F.data == "admin_bc_edit")
-async def admin_bc_edit(callback: CallbackQuery, state: FSMContext) -> None:
-    await admin_bc_start(callback, state)
-
-
-@router.callback_query(F.data == "admin_tasks_menu")
-async def admin_tasks_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != ADMIN_ID:
-        await safe_answer(callback, "Доступ запрещен", show_alert=True)
         return
-    await safe_answer(callback)
-
-    tasks = await load_tasks()
-    keyboard_rows = []
-    if not tasks:
-        text = "У вас нет активных заданий."
-    else:
-        text = "Активные задания (нажмите, чтобы удалить):"
-        for t in tasks:
-            keyboard_rows.append([
-                InlineKeyboardButton(
-                    text=f"❌ Удалить №{t['id']} ({t['link']})",
-                    callback_data=f"admin_del_task_{t['id']}",
-                )
-            ])
-
-    keyboard_rows.append([InlineKeyboardButton(text="➕ Создать задание", callback_data="admin_task_create")])
-    keyboard_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_panel")])
-    await replace_message(callback, text, InlineKeyboardMarkup(inline_keyboard=keyboard_rows))
-
-
-@router.callback_query(F.data == "admin_task_create")
-async def admin_task_create(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != ADMIN_ID:
-        await safe_answer(callback, "Доступ запрещен", show_alert=True)
-        return
-    await state.set_state(AdminTaskStates.text)
-    await safe_answer(callback)
-    await replace_message(callback, "ввести текст задания", back_markup("admin_panel"))
-
-
-@router.callback_query(F.data.startswith("admin_del_task_"))
-async def admin_del_task(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != ADMIN_ID:
-        await safe_answer(callback, "Доступ запрещен", show_alert=True)
-        return
-    task_id = int(callback.data.split("_")[3])
-    tasks = await load_tasks()
-    await save_tasks([t for t in tasks if t["id"] != task_id])
-    await redis_cmd("DEL", f"task_cnt:{task_id}")
-    await safe_answer(callback, "Задание удалено!")
-    await admin_tasks_menu(callback, state)
-
-
-@router.callback_query(F.data == "admin_task_pub")
-async def admin_task_pub(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != ADMIN_ID:
-        await safe_answer(callback, "Доступ запрещен", show_alert=True)
-        return
-    data = await state.get_data()
-    await safe_answer(callback)
+    st = await fetchone("SELECT COALESCE(SUM(ok),0) AS ok, COUNT(*) AS n FROM cast_log WHERE ck=?", (ck,))
     await state.clear()
-
-    # Счётчик id: номера заданий не повторяются, даже если старые удалены
-    next_id = to_int(await redis_cmd("INCR", "task_seq"))
-    tasks = await load_tasks()
-    tasks.append({
-        "id": next_id,
-        "text": data.get("task_text"),
-        "link": data.get("task_link"),
-        "chat_id": data.get("task_chat"),
-        "reward": data.get("task_reward"),
-        "max_completions": data.get("task_max_completions"),
-    })
-    await save_tasks(tasks)
-    await admin_panel_handler(callback, state)
-
-
-@router.callback_query(F.data == "admin_promo_menu")
-async def admin_promo_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != ADMIN_ID:
-        await safe_answer(callback, "Доступ запрещен", show_alert=True)
-        return
-    await safe_answer(callback)
-    await state.clear()
-
-    codes = await redis_cmd("ZRANGE", "promos", 0, -1) or []
-    promos = []
-    for code in codes:
-        p = await get_promo(code)
-        if p:
-            promos.append((code, p))
-        else:
-            await redis_cmd("ZREM", "promos", code)  # чистим «мёртвые» записи
-
-    if not promos:
-        text = "у вас нету активных промокодов 🎁"
-        markup = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="Создать", callback_data="admin_promo_create")],
-                [InlineKeyboardButton(text="Назад", callback_data="admin_panel")],
-            ]
-        )
-    else:
-        keyboard_rows = []
-        for code, _ in promos:
-            keyboard_rows.append([
-                InlineKeyboardButton(text=f"🗑 Удалить: {code}", callback_data=f"admin_del_promo_{code}")
-            ])
-
-        _, p = promos[-1]
-        text = (
-            f"{len(promos)} активный промокод ⭐\n"
-            f"название: {p['name']}\n"
-            f"Цена: {p['price']} звезд\n"
-            f"кол во активаций: {p['activations']}"
-        )
-        keyboard_rows.append([InlineKeyboardButton(text="Создать", callback_data="admin_promo_create")])
-        keyboard_rows.append([InlineKeyboardButton(text="Назад", callback_data="admin_panel")])
-        markup = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
-
-    await replace_message(callback, text, markup)
-
-
-@router.callback_query(F.data.startswith("admin_del_promo_"))
-async def admin_del_promo(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != ADMIN_ID:
-        await safe_answer(callback, "Доступ запрещен", show_alert=True)
-        return
-    code = callback.data.replace("admin_del_promo_", "")
-    if await get_promo(code):
-        await delete_promo(code)
-        await safe_answer(callback, "Промокод удален!")
-    await admin_promo_menu(callback, state)
-
-
-@router.callback_query(F.data == "admin_promo_create")
-async def admin_promo_create(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != ADMIN_ID:
-        await safe_answer(callback, "Доступ запрещен", show_alert=True)
-        return
-    await state.set_state(PromocodeStates.admin_name)
-    await safe_answer(callback)
-    await replace_message(callback, "введите название промокода:", back_markup("admin_panel", "Назад"))
-
-
-@router.callback_query(F.data == "admin_promo_pub")
-async def admin_promo_pub(callback: CallbackQuery, state: FSMContext) -> None:
-    await admin_promo_menu(callback, state)
-
-
-@router.callback_query(F.data == "admin_reward_menu")
-async def admin_reward_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != ADMIN_ID:
-        await safe_answer(callback, "Доступ запрещен", show_alert=True)
-        return
-    await safe_answer(callback)
-
-    reward = await get_referral_reward()
-    text = f"цена за реферала {reward} ⭐"
-    markup = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="изменить", callback_data="admin_reward_change"),
-                InlineKeyboardButton(text="назад", callback_data="admin_panel"),
-            ]
-        ]
-    )
-    await replace_message(callback, text, markup)
-
-
-@router.callback_query(F.data == "admin_reward_change")
-async def admin_reward_change(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != ADMIN_ID:
-        await safe_answer(callback, "Доступ запрещен", show_alert=True)
-        return
-    await state.set_state(AdminRewardStates.waiting_for_new_value)
-    await safe_answer(callback)
-    await replace_message(callback, "введите количество за реферала", back_markup("admin_panel", "назад"))
-
-
-@router.callback_query(F.data == "admin_reward_apply")
-async def admin_reward_apply(callback: CallbackQuery, state: FSMContext) -> None:
-    if callback.from_user.id != ADMIN_ID:
-        await safe_answer(callback, "Доступ запрещен", show_alert=True)
-        return
-    data = await state.get_data()
-    new_val = data.get("new_reward")
-    if new_val is not None:
-        await redis_cmd("SET", "cfg:referral_reward", new_val)
-    await state.clear()
-    await admin_reward_menu(callback, state)
-
-
-@router.callback_query(F.data == "back_to_main")
-async def back_to_main_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    await safe_answer(callback)
-    await state.clear()
-    await send_main_menu(callback)
-
-
-# ================= ПРОВЕРКА ПОДПИСКИ =================
-@router.callback_query(F.data == "check_all_tasks")
-async def check_all_tasks_handler(callback: CallbackQuery) -> None:
-    user_id = callback.from_user.id
-    await ensure_user(callback.from_user)
-    tasks_data = await get_active(user_id)
-
-    if not tasks_data or tasks_data.get("v") != 2:
-        # Данных о спонсорах нет (или они от старой версии бота) — просто заново запрашиваем
-        await safe_answer(callback)
-        await show_sponsors(callback.message, callback.from_user)
-        return
-
-    user = callback.from_user
-    names = [n for n in SERVICES if tasks_data.get(n)]
-    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
-        results = await asyncio.gather(
-            *(CHECKERS[n](session, user, tasks_data[n]) for n in names),
-            return_exceptions=True,
-        )
-    for name, res in zip(names, results):
-        if isinstance(res, Exception):
-            print(f"[{name}] ошибка проверки: {res!r}")  # список этого сервиса оставляем как был
-            continue
-        tasks_data[name] = res
-
-    limit_sponsors(tasks_data)
-    all_links = links_of(tasks_data)
-
-    if not all_links:
-        await del_active(user_id)
-        done_count = await pop_sponsor_total(user_id, tasks_data.get("total_count", 0))
-        await add_income(user_id, done_count)
-        await record_sponsors(user_id, done_count)
-        await start_watch(user_id, tasks_data.get("all") or {})
-        await mark_passed(user_id)
-
-        await safe_answer(callback)
-        await after_sponsors(callback.bot, callback, callback.from_user, had_sponsors=True, sponsors_count=done_count)
-    else:
-        await set_active(user_id, tasks_data)
-        try:
-            await callback.message.edit_reply_markup(reply_markup=build_sponsor_markup(all_links))
-        except Exception:
-            pass
-        await safe_answer(callback, "❌ Вы подписались не на все каналы. Проверьте оставшиеся подписки.")
-
-
-# ================= FLASK WEBHOOK (ДЛЯ VERCEL) =================
-app = Flask(__name__)
-dp.include_router(router)
-
-
-async def process_update(json_data: dict) -> None:
-    # Новый Bot на каждый апдейт: aiohttp-сессия привязана к event loop,
-    # а asyncio.run() каждый раз создаёт и закрывает новый loop.
-    bot = Bot(token=BOT_TOKEN)
-    # Одна сессия для всех запросов к Redis в рамках этого апдейта
-    redis_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))
-    token = _redis_session.set(redis_session)
-    bot_token = _current_bot.set(bot)
+    await run("DELETE FROM cast_log WHERE ck=?", (ck,))
     try:
-        update = Update.model_validate(json_data, context={"bot": bot})
-        await dp.feed_update(bot, update)
-    except Exception as e:
-        print(f"Webhook error: {e!r}")
-    finally:
-        _current_bot.reset(bot_token)
-        _redis_session.reset(token)
-        await redis_session.close()
-        await bot.session.close()
+        await c.message.edit_text(
+            f"✅ <b>Рассылка завершена</b>\n\nДоставлено: {st['ok']}\nНе доставлено: {st['n'] - st['ok']}",
+            reply_markup=kb(A_BACK))
+    except TelegramBadRequest:
+        pass
 
 
-@app.route("/", methods=["POST"])
-def webhook():
-    if "application/json" in (request.headers.get("content-type") or ""):
-        json_data = request.get_json(force=True)
-        asyncio.run(process_update(json_data))
-        return "OK", 200
-    return "Error", 403
+# ---------- Настройки ----------
+async def settings_view():
+    rr, rt = await get_setting("ref_reward"), int(await get_setting("ref_tasks"))
+    fr = await get_setting("flyer_reward")
+    gr = await get_setting("tgrass_reward")
+    xr = {k: await get_setting(f"{k}_reward") for k in EXT_NAMES}
+    text = (f"⚙️ <b>Настройки</b>\n\n"
+            f"💰 Награда за реферала: <b>{fmt(rr)}</b> ⭐\n"
+            f"🎯 Заданий для получения награды: <b>{rt}</b>\n"
+            f"🛰 Награда за задание Flyer: <b>{fmt(fr)}</b> ⭐\n"
+            f"🌿 Награда за задание TGrass: <b>{fmt(gr)}</b> ⭐\n"
+            f"📡 Trafsly: <b>{fmt(xr['trafsly'])}</b> ⭐ · PiarFlow: <b>{fmt(xr['piarflow'])}</b> ⭐ · "
+            f"Traffy: <b>{fmt(xr['traffy'])}</b> ⭐")
+    return text, kb([btn("💰 Награда за реферала", cb="a:set:ref_reward", style="primary")],
+                    [btn("🎯 Кол-во заданий", cb="a:set:ref_tasks", style="primary")],
+                    [btn("🛰 Награда за Flyer-задание", cb="a:set:flyer_reward", style="success")],
+                    [btn("🌿 Награда за TGrass-задание", cb="a:set:tgrass_reward", style="success")],
+                    [btn("📡 Trafsly", cb="a:set:trafsly_reward", style="success"),
+                     btn("📡 PiarFlow", cb="a:set:piarflow_reward", style="success"),
+                     btn("📡 Traffy", cb="a:set:traffy_reward", style="success")], A_BACK)
 
 
-@app.route("/", methods=["GET"])
-def index():
-    return "Bot is running on Vercel!", 200
+@admin.callback_query(F.data == "a:set")
+async def a_set(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    text, markup = await settings_view()
+    await edit(c, text, markup)
+    await c.answer()
 
 
-@app.route("/setwebhook", methods=["GET"])
-def set_webhook_route():
-    """Один раз открыть: https://ВАШ-ДОМЕН/setwebhook?key=<CRON_SECRET>
-    Включает получение событий выхода из канала (chat_member) для мгновенных штрафов."""
-    secret = os.environ.get("CRON_SECRET")
-    given = request.args.get("key", "")
-    if not secret or not hmac.compare_digest(given.encode(), secret.encode()):
-        return "Forbidden", 403
-
-    async def _go():
-        bot = Bot(token=BOT_TOKEN)
-        try:
-            return await bot.set_webhook(
-                url=f"https://{request.host}/",
-                allowed_updates=["message", "callback_query", "chat_member"],
-            )
-        finally:
-            await bot.session.close()
-
-    return f"webhook set: {asyncio.run(_go())}", 200
+@admin.callback_query(F.data.startswith("a:set:"))
+async def a_set_key(c: CallbackQuery, state: FSMContext):
+    key = c.data.split(":")[2]
+    await state.set_state(SetSt.value)
+    await state.update_data(key=key)
+    label = {"ref_reward": "награду за реферала (⭐)", "ref_tasks": "количество заданий",
+             "flyer_reward": "награду за задание Flyer (⭐)",
+             "tgrass_reward": "награду за задание TGrass (⭐)",
+             "trafsly_reward": "награду за задание Trafsly (⭐)",
+             "piarflow_reward": "награду за задание PiarFlow (⭐)",
+             "traffy_reward": "награду за задание Traffy (⭐)"}.get(key, key)
+    await edit(c, f"Введи новое значение: <b>{label}</b>", kb([btn("✖️ Отмена", cb="a:set", style="danger")]))
+    await c.answer()
 
 
-@app.route("/cron", methods=["GET", "POST"])
-def cron():
-    """Проверка подписок по расписанию. Доступ только с CRON_SECRET
-    (заголовок Authorization: Bearer <секрет> — так шлёт Vercel Cron, или ?key=<секрет>)."""
-    secret = os.environ.get("CRON_SECRET")
-    given = (request.headers.get("Authorization") or "").removeprefix("Bearer ").strip() or request.args.get("key", "")
-    if not secret or not hmac.compare_digest(given.encode(), secret.encode()):
-        return "Forbidden", 403
-    checked = asyncio.run(process_cron())
-    return f"checked: {checked}", 200
+@admin.message(SetSt.value, F.text)
+async def a_set_value(m: Message, state: FSMContext):
+    d = await state.get_data()
+    try:
+        v = float(m.text.strip().replace(",", "."))
+        assert v > 0
+        if d["key"] == "ref_tasks":
+            v = int(v)
+    except Exception:
+        return await m.answer("❌ Введи положительное число")
+    await run("UPDATE settings SET value=? WHERE key=?", (str(v), d["key"]))
+    _SET_CACHE.clear()
+    await state.clear()
+    text, markup = await settings_view()
+    await m.answer("✅ Сохранено\n\n" + text, reply_markup=markup)
