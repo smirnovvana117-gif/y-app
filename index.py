@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Реферальный бот со звёздами — версия для Vercel (webhook + Turso/libSQL).
+Реферальный бот со звёздами — версия для Vercel (webhook + хранение базы в Redis/Upstash).
 Работает через api/index.py (FastAPI). Локально не запускается (нет polling).
 """
 import asyncio
@@ -12,7 +12,11 @@ import logging
 import os
 import random
 import re
+import sqlite3
 import string
+import uuid
+import zlib
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from urllib.parse import quote
 
@@ -33,7 +37,8 @@ from aiogram.types import (
 # ============================== КОНФИГ ==============================
 # ---------- КЛЮЧИ: только из переменных окружения (Vercel -> Settings -> Environment Variables) ----------
 # BOT_TOKEN, FLYER_KEY, TGRASS_KEY, PIARFLOW_KEY, TRAFSLY_KEY, TRAFFY_KEY,
-# TURSO_URL, TURSO_TOKEN, WEBHOOK_SECRET, CRON_SECRET, ADMIN_IDS
+# UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN (или KV_REST_API_URL / KV_REST_API_TOKEN),
+# WEBHOOK_SECRET, CRON_SECRET, ADMIN_IDS
 
 
 def key(name: str) -> str:
@@ -194,25 +199,7 @@ class _Http:
 http = _Http()
 
 
-# ---- Turso (libSQL) по HTTP: тот же SQLite-диалект, что и раньше ----
-class Row:
-    __slots__ = ("_c", "_v")
-
-    def __init__(self, cols, vals):
-        self._c = {c: i for i, c in enumerate(cols)}
-        self._v = tuple(vals)
-
-    def __getitem__(self, k):
-        return self._v[k] if isinstance(k, int) else self._v[self._c[k]]
-
-    def keys(self):
-        return list(self._c)
-
-    def __iter__(self):
-        return iter(self._v)
-
-    def __len__(self):
-        return len(self._v)
+# ---- SQLite в памяти; снимок базы хранится в Redis (Upstash REST) ----
 
 
 class Cursor:
@@ -242,89 +229,154 @@ class _Exec:
         return False
 
 
-def _h_arg(v):
-    if v is None:
-        return {"type": "null"}
-    if isinstance(v, bool):
-        return {"type": "integer", "value": str(int(v))}
-    if isinstance(v, int):
-        return {"type": "integer", "value": str(v)}
-    if isinstance(v, float):
-        return {"type": "float", "value": v}
-    if isinstance(v, (bytes, bytearray)):
-        return {"type": "blob", "base64": base64.b64encode(bytes(v)).decode()}
-    return {"type": "text", "value": str(v)}
+REDIS_URL = (key("UPSTASH_REDIS_REST_URL") or key("KV_REST_API_URL")).rstrip("/")
+REDIS_TOKEN = key("UPSTASH_REDIS_REST_TOKEN") or key("KV_REST_API_TOKEN")
+DB_KEY = os.getenv("DB_KEY", "bot:db")  # ключ в Redis, где лежит вся база
+LOCK_KEY = DB_KEY + ":lock"
+LOCK_TTL_MS = int(os.getenv("DB_LOCK_TTL", "55")) * 1000  # блокировка живёт не дольше лимита функции Vercel
+LOCK_WAIT = float(os.getenv("DB_LOCK_WAIT", "25"))        # сколько ждать, пока другой апдейт освободит базу
+
+# Сохранить снимок и снять блокировку одним атомарным действием — только если блокировка всё ещё наша.
+_SAVE_LUA = (
+    "if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end "
+    "if ARGV[2] ~= '' then redis.call('SET', KEYS[2], ARGV[2]) end "
+    "redis.call('DEL', KEYS[1]) return 1"
+)
 
 
-def _h_val(x):
-    t = x.get("type")
-    if t == "null":
-        return None
-    if t == "integer":
-        return int(x["value"])
-    if t == "float":
-        return float(x["value"])
-    if t == "blob":
-        return base64.b64decode(x.get("base64", ""))
-    return x.get("value")
+class DBBusy(RuntimeError):
+    """База занята другим апдейтом дольше LOCK_WAIT секунд."""
 
 
-class TursoDB:
-    def __init__(self, url: str, token: str):
-        self.token = token
-        base = (url or "").strip().replace("libsql://", "https://").rstrip("/")
-        self.endpoint = base + "/v2/pipeline"
+async def redis_cmd(*cmd, retries: int = 1):
+    if not REDIS_URL or not REDIS_TOKEN:
+        raise RuntimeError("UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN не заданы")
+    last = None
+    for attempt in range(retries):
+        try:
+            async with http.post(REDIS_URL, json=[str(c) for c in cmd],
+                                 headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
+                                 timeout=aiohttp.ClientTimeout(total=20)) as r:
+                data = await r.json(content_type=None)
+                if r.status != 200 or (isinstance(data, dict) and data.get("error")):
+                    raise RuntimeError(f"Redis HTTP {r.status}: {data}")
+                return data.get("result")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as ex:
+            last = ex
+            await asyncio.sleep(0.3 * (attempt + 1))
+    raise RuntimeError(f"Redis недоступен: {last!r}")
 
-    async def _pipeline(self, stmts):
-        if not self.token or not self.endpoint.startswith("http"):
-            raise RuntimeError("TURSO_URL / TURSO_TOKEN не заданы")
-        body = {"requests": [{"type": "execute", "stmt": {"sql": sql, "args": [_h_arg(a) for a in args]}}
-                             for sql, args in stmts] + [{"type": "close"}]}
-        read_only = all(sql.lstrip().upper().startswith(("SELECT", "PRAGMA")) for sql, _ in stmts)
-        last = None
-        for attempt in range(3 if read_only else 1):
+
+_LOCAL = {"loop": None, "lock": None}
+
+
+def _local_lock() -> asyncio.Lock:
+    """Один апдейт за раз внутри процесса (event loop на serverless может меняться — пересоздаём)."""
+    loop = asyncio.get_running_loop()
+    if _LOCAL["loop"] is not loop:
+        _LOCAL["loop"], _LOCAL["lock"] = loop, asyncio.Lock()
+    return _LOCAL["lock"]
+
+
+def _arg(v):
+    if v is None or isinstance(v, (int, float, str, bytes)):
+        return v  # bool — это int
+    if isinstance(v, bytearray):
+        return bytes(v)
+    return str(v)
+
+
+class RedisSQLite:
+    """Тот же интерфейс, что был у TursoDB (execute / batch / executescript / commit),
+    но SQL выполняется в SQLite в памяти. Базу целиком грузим из Redis в начале апдейта
+    и кладём обратно в конце (если что-то изменилось). Пока апдейт идёт, в Redis держится
+    блокировка, поэтому параллельные апдейты не затирают друг друга."""
+
+    def __init__(self):
+        self.conn = None
+
+    def _need(self):
+        if self.conn is None:
+            raise RuntimeError("Обращение к базе вне db.session()")
+        return self.conn
+
+    @asynccontextmanager
+    async def session(self):
+        async with _local_lock():
+            token = uuid.uuid4().hex
+            deadline = time.monotonic() + LOCK_WAIT
+            delay = 0.05
+            while await redis_cmd("SET", LOCK_KEY, token, "NX", "PX", LOCK_TTL_MS) != "OK":
+                if time.monotonic() > deadline:
+                    raise DBBusy("база занята другим апдейтом")
+                await asyncio.sleep(delay + random.random() * 0.05)
+                delay = min(delay * 1.5, 0.4)
+            conn = None
             try:
-                async with http.post(self.endpoint, json=body, headers={"Authorization": f"Bearer {self.token}"},
-                                     timeout=aiohttp.ClientTimeout(total=20)) as r:
-                    data = await r.json(content_type=None)
-                    if r.status != 200:
-                        raise RuntimeError(f"Turso HTTP {r.status}: {data}")
-                    break
-            except (aiohttp.ClientError, asyncio.TimeoutError) as ex:
-                last = ex
-                await asyncio.sleep(0.3 * (attempt + 1))
-        else:
-            raise RuntimeError(f"Turso недоступен: {last!r}")
-        out = []
-        for res in data["results"][:len(stmts)]:
-            if res.get("type") == "error":
-                raise RuntimeError(f"SQL error: {(res.get('error') or {}).get('message')}")
-            r = res["response"]["result"]
-            cols = [c.get("name") for c in r.get("cols", [])]
-            rows = [Row(cols, [_h_val(x) for x in row]) for row in r.get("rows", [])]
-            lid = r.get("last_insert_rowid")
-            out.append(Cursor(rows, r.get("affected_row_count", 0), int(lid) if lid is not None else None))
-        return out
+                raw = await redis_cmd("GET", DB_KEY, retries=3)
+                conn = sqlite3.connect(":memory:", isolation_level=None)  # автокоммит, как было в Turso
+                conn.row_factory = sqlite3.Row
+                if raw:
+                    conn.deserialize(zlib.decompress(base64.b64decode(raw)))
+                c0 = conn.total_changes
+                s0 = conn.execute("PRAGMA schema_version").fetchone()[0]
+                self.conn = conn
+                try:
+                    yield self
+                finally:
+                    self.conn = None
+                    # сохраняем и при ошибке в обработчике: раньше каждый запрос применялся сразу
+                    changed = (conn.total_changes != c0
+                               or conn.execute("PRAGMA schema_version").fetchone()[0] != s0)
+                    payload = base64.b64encode(zlib.compress(conn.serialize(), 6)).decode() if changed else ""
+                    conn.close()
+                    conn = None
+                    ok = await redis_cmd("EVAL", _SAVE_LUA, 2, LOCK_KEY, DB_KEY, token, payload)
+                    token = None
+                    if changed and ok != 1:
+                        raise RuntimeError("Блокировка базы потеряна (апдейт шёл дольше DB_LOCK_TTL) — изменения не сохранены")
+            finally:
+                if conn is not None:
+                    conn.close()
+                if token is not None:  # ошибка до сохранения — просто снимаем блокировку
+                    try:
+                        await redis_cmd("EVAL", _SAVE_LUA, 2, LOCK_KEY, DB_KEY, token, "")
+                    except Exception:
+                        logging.exception("не удалось снять блокировку базы")
+
+    def _run(self, sql, args):
+        conn = self._need()
+        cur = conn.execute(sql, tuple(_arg(a) for a in args))
+        rows = cur.fetchall() if cur.description else []
+        is_insert = sql.lstrip().upper().startswith("INSERT")
+        return Cursor(rows, max(cur.rowcount, 0), cur.lastrowid if is_insert else None)
 
     async def _one(self, sql, args):
-        return (await self._pipeline([(sql, tuple(args))]))[0]
+        return self._run(sql, args)
 
     def execute(self, sql, args=()):
         return _Exec(self._one(sql, args))
 
     async def batch(self, stmts):
-        """Несколько запросов за один HTTP-вызов."""
-        return await self._pipeline([(sql, tuple(a)) for sql, a in stmts])
+        """Несколько запросов одной транзакцией."""
+        conn = self._need()
+        conn.execute("BEGIN")
+        try:
+            out = [self._run(sql, tuple(a)) for sql, a in stmts]
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+        return out
 
     async def executescript(self, script: str):
-        parts = [p.strip() for p in script.split(";") if p.strip()]
-        await self._pipeline([(p, ()) for p in parts])
+        self._need().executescript(script)
 
     async def commit(self):
         return None
 
 
-db = TursoDB(key("TURSO_URL"), key("TURSO_TOKEN"))
+db = RedisSQLite()
 
 
 async def fetchone(sql, args=()):
@@ -834,7 +886,7 @@ async def check_unsubs(bot: Bot) -> list:
     return report
 
 
-UNSUB_BUDGET = 40  # секунд на один вызов проверки (лимит функции Vercel — 60 с)
+UNSUB_BUDGET = 15  # секунд на один вызов проверки: пока она идёт, база занята (cron гоняет её часто)
 
 
 async def _ext_unsub(bot: Bot, provider: str, uid: int, cond: str, args: tuple) -> int:
@@ -900,10 +952,8 @@ _READY = False
 
 
 async def ensure_ready(bot: Bot):
-    global _READY, BOT_USERNAME
-    if not _READY:
-        await init_db()
-        _READY = True
+    global BOT_USERNAME
+    await init_db()  # дешёвая проверка схемы: база каждый раз загружается из Redis
     if not BOT_USERNAME:
         BOT_USERNAME = (await bot.get_me()).username
 
@@ -2444,8 +2494,11 @@ async def webhook(request: Request):
     bot = make_bot()
     try:
         update = Update.model_validate(data, context={"bot": bot})
-        await ensure_ready(bot)
-        await dp.feed_update(bot, update)
+        async with db.session():
+            await ensure_ready(bot)
+            await dp.feed_update(bot, update)
+    except DBBusy:
+        raise HTTPException(503, "db busy")  # Telegram повторит этот апдейт позже
     except Exception:
         logging.exception("update failed")
     finally:
@@ -2477,8 +2530,11 @@ async def cron(request: Request):
         raise HTTPException(403, "bad cron secret")
     bot = make_bot()
     try:
-        await ensure_ready(bot)
-        report = await check_unsubs(bot)
+        async with db.session():
+            await ensure_ready(bot)
+            report = await check_unsubs(bot)
+    except DBBusy:
+        raise HTTPException(503, "db busy")
     finally:
         await bot.session.close()
     return {"ok": True, "report": report}
@@ -2494,8 +2550,11 @@ async def provider_hook(provider: str, request: Request, key: str = ""):
     payload = await request.json()
     bot = make_bot()
     try:
-        await ensure_ready(bot)
-        n = await handle_provider_hook(bot, provider, payload)
+        async with db.session():
+            await ensure_ready(bot)
+            n = await handle_provider_hook(bot, provider, payload)
+    except DBBusy:
+        raise HTTPException(503, "db busy")
     finally:
         await bot.session.close()
     return {"ok": True, "penalized": n}
