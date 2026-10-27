@@ -35,39 +35,45 @@ from aiogram.types import (
 )
 
 # ============================== КОНФИГ ==============================
-# ---------- КЛЮЧИ: только из переменных окружения (Vercel -> Settings -> Environment Variables) ----------
-# BOT_TOKEN, FLYER_KEY, TGRASS_KEY, PIARFLOW_KEY, TRAFSLY_KEY, TRAFFY_KEY,
-# UPSTASH_REDIS_REST_URL, UPSTASH_REDIS_REST_TOKEN (или KV_REST_API_URL / KV_REST_API_TOKEN),
-# WEBHOOK_SECRET, CRON_SECRET, ADMIN_IDS
+# =====================================================================
+#  ВПИШИ СВОИ ИНТЕГРАЦИИ И АДМИН ID ПРЯМО ЗДЕСЬ (между кавычками)
+#  Если оставить пустым — ключ возьмётся из переменных окружения Vercel.
+# =====================================================================
+FLYER_KEY = "FL-QPqFnZ-zIfInx-rcOuHk-elIxUh"       # Flyer (flyerhubs.com), тип ключа "tasks"
+TGRASS_KEY = "6d6e9e9701e7440a81fe099d360710d5"      # TGrass (tgrass.space)
+PIARFLOW_KEY = "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv"    # PiarFlow (piarflow.com)
+TRAFSLY_KEY = "at_99ddd0618296db80b905c92ff9adaa8c"     # Trafsly (токен бота at_... из @TrafslyBot)
+TRAFFY_KEY = "pk_live_iipu6bSNFs4PxIq9oF8he6trh8DUzqcL"      # Traffy (ключ pk_live_...)
+ADMIN_IDS = {619112100}  # ID админов через запятую, например {619112100, 123456789}
+# =====================================================================
 
 
 def key(name: str) -> str:
     return os.getenv(name, "").strip()
 
 
+# остальные секреты — из переменных окружения Vercel
 BOT_TOKEN = key("BOT_TOKEN")
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "619112100").split(",") if x.strip()}
 WEBHOOK_SECRET = key("WEBHOOK_SECRET")
 CRON_SECRET = key("CRON_SECRET")
+
+# если в коде пусто — берём из окружения
+FLYER_KEY = FLYER_KEY.strip() or key("FLYER_KEY")
+TGRASS_KEY = TGRASS_KEY.strip() or key("TGRASS_KEY")
+PIARFLOW_KEY = PIARFLOW_KEY.strip() or key("PIARFLOW_KEY")
+TRAFSLY_KEY = TRAFSLY_KEY.strip() or key("TRAFSLY_KEY")
+TRAFFY_KEY = TRAFFY_KEY.strip() or key("TRAFFY_KEY")
+ADMIN_IDS = set(ADMIN_IDS) | {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
+
 WITHDRAW_CHANNEL = "@AvoReputation"
-# Flyer (flyerhubs.com): ключ берётся из переменной окружения FLYER_KEY (тип ключа должен быть "tasks")
-FLYER_KEY = key("FLYER_KEY")
 FLYER_URL = "https://api.flyerhubs.com"
 FLYER_LIMIT = 10  # сколько заданий Flyer закрепляет за пользователем (макс. 10)
-# TGrass (tgrass.space): ключ из переменной окружения TGRASS_KEY
-TGRASS_KEY = key("TGRASS_KEY")
 TGRASS_URL = "https://tgrass.space"
 TGRASS_ENDPOINT = os.getenv("TGRASS_ENDPOINT", "tasks")  # "tasks" — для ботов с заданиями, "offers" — для обязательных офферов
-TGRASS_VERIFY_SSL = os.getenv("TGRASS_VERIFY_SSL", "1") != "0"  # если будут ошибки сертификата: $env:TGRASS_VERIFY_SSL="0"
-# Trafsly (trafsly.com): токен бота (at_...) из @TrafslyBot -> переменная окружения TRAFSLY_KEY
-TRAFSLY_KEY = key("TRAFSLY_KEY")
+TGRASS_VERIFY_SSL = os.getenv("TGRASS_VERIFY_SSL", "1") != "0"
 TRAFSLY_URL = "https://api.trafsly.com/api/v1"
-# PiarFlow (piarflow.com): API key бота -> PIARFLOW_KEY
-PIARFLOW_KEY = key("PIARFLOW_KEY")
 PIARFLOW_URL = "https://piarflow.com/v1"
 PIARFLOW_NO_TOKEN = os.getenv("PIARFLOW_NO_TOKEN", "0") == "1"  # 1 — если бот подключён в PiarFlow БЕЗ токена бота
-# Traffy (traffy.ai): ключ pk_live_... -> TRAFFY_KEY
-TRAFFY_KEY = key("TRAFFY_KEY")
 TRAFFY_URL = "https://api.traffy.ai/publisher"
 # Кому доступна команда /e (сброс аккаунта для тестов рефералки)
 RESET_IDS = {792875116, 8789146386, 8956779618}
@@ -919,7 +925,7 @@ async def handle_provider_hook(bot: Bot, provider: str, p: dict) -> int:
     return n
 
 
-# ---------- FSM-хранилище в Turso (память процесса на Vercel не сохраняется) ----------
+# ---------- FSM-хранилище в базе (память процесса на Vercel не сохраняется) ----------
 class TursoStorage(BaseStorage):
     @staticmethod
     def _k(key) -> str:
@@ -1861,8 +1867,7 @@ async def a_close(c: CallbackQuery, state: FSMContext):
 @admin.message(Command("flyer"))
 async def a_flyer(m: Message):
     if not FLYER_KEY:
-        return await m.answer("❌ <b>FLYER_KEY не задан.</b>\nУстанови переменную в том же терминале, где запускаешь бота:\n"
-                              "<code>$env:FLYER_KEY=\"FL-...\"</code>")
+        return await m.answer("❌ <b>FLYER_KEY не задан.</b>\nВпиши ключ в начале кода: <code>FLYER_KEY = \"FL-...\"</code>")
     me = await flyer_call("get_me", {})
     tasks = await flyer_call("get_tasks", {"user_id": m.from_user.id,
                                            "language_code": m.from_user.language_code or "ru",
@@ -1878,8 +1883,7 @@ async def a_flyer(m: Message):
 @admin.message(Command("tgrass"))
 async def a_tgrass(m: Message):
     if not TGRASS_KEY:
-        return await m.answer("❌ <b>TGRASS_KEY не задан.</b>\nУстанови переменную в том же терминале, где запускаешь бота:\n"
-                              "<code>$env:TGRASS_KEY=\"ключ\"</code>")
+        return await m.answer("❌ <b>TGRASS_KEY не задан.</b>\nВпиши ключ в начале кода: <code>TGRASS_KEY = \"...\"</code>")
     data = await tgrass_offers(m.from_user)
     text = html.escape(json.dumps(data, ensure_ascii=False, indent=1)[:2500])
     await m.answer(f"🌿 <b>TGrass /{TGRASS_ENDPOINT} (для тебя)</b>\n<pre>{text}</pre>")
@@ -2002,7 +2006,8 @@ async def tasks_view():
         btns.append([btn(f"{icon} #{t['id']} {kind} +{fmt(t['reward'])}⭐ · выполнили: {done}", cb=f"a:tv:{t['id']}")])
     text = "📋 <b>Задания</b>\n\n" + (f"Всего своих: {len(rows)}. Нажми на задание, чтобы управлять 👇" if rows else "Своих заданий пока нет.") + \
         f"\n\n🛰 Flyer: {'подключён ✅ (задания приходят автоматически)' if FLYER_KEY else 'не подключён (нет FLYER_KEY)'}" + \
-        f"\n🌿 TGrass: {'подключён ✅' if TGRASS_KEY else 'не подключён (нет TGRASS_KEY)'}"
+        f"\n🌿 TGrass: {'подключён ✅' if TGRASS_KEY else 'не подключён (нет TGRASS_KEY)'}" + \
+        f"\n📡 PiarFlow: {'✅' if PIARFLOW_KEY else '—'} · Trafsly: {'✅' if TRAFSLY_KEY else '—'} · Traffy: {'✅' if TRAFFY_KEY else '—'}"
     btns.append([btn("➕ Добавить задание", cb="a:task_add", style="success")])
     btns.append(A_BACK)
     return text, kb(*btns)
@@ -2430,7 +2435,6 @@ async def a_set_value(m: Message, state: FSMContext):
 
 # ============================== FASTAPI-ПРИЛОЖЕНИЕ (webhook / cron) ==============================
 import hmac
-import re
 from urllib.parse import parse_qs
 from aiogram.types import Update
 from fastapi import FastAPI, HTTPException, Request
@@ -2472,7 +2476,13 @@ dp.include_router(user)
 def make_bot() -> Bot:
     if not BOT_TOKEN:
         raise HTTPException(500, "BOT_TOKEN не задан в Environment Variables")
-    return Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    return Bot(
+        BOT_TOKEN,
+        default=DefaultBotProperties(
+            parse_mode=ParseMode.HTML,
+            link_preview_is_disabled=True,  # предпросмотр ссылок отключён во всех сообщениях бота
+        ),
+    )
 
 
 def same(a: str, b: str) -> bool:
