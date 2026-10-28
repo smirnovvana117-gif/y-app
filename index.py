@@ -173,7 +173,12 @@ def main_kb(uid: int) -> ReplyKeyboardMarkup:
     ]
     if uid in ADMIN_IDS:
         rows.append([KeyboardButton(text=B_ADMIN)])
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True)
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        is_persistent=False,       # меню можно свернуть (кнопка «назад», свайп, иконка ▦)
+        one_time_keyboard=False,   # после нажатия кнопки меню остаётся доступным
+    )
 
 
 # ============================== БАЗА ДАННЫХ ==============================
