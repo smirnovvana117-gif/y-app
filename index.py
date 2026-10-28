@@ -39,11 +39,11 @@ from aiogram.types import (
 #  ВПИШИ СВОИ ИНТЕГРАЦИИ И АДМИН ID ПРЯМО ЗДЕСЬ (между кавычками)
 #  Если оставить пустым — ключ возьмётся из переменных окружения Vercel.
 # =====================================================================
-FLYER_KEY = "FL-NelisY-SRnApI-zNZkhB-XGGECE"       # Flyer (flyerhubs.com), тип ключа "tasks"
-TGRASS_KEY = "6d6e9e9701e7440a81fe099d360710d5"      # TGrass (tgrass.space)
-PIARFLOW_KEY = "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv"    # PiarFlow (piarflow.com)
-TRAFSLY_KEY = "at_99ddd0618296db80b905c92ff9adaa8c"     # Trafsly (токен бота at_... из @TrafslyBot)
-TRAFFY_KEY = "pk_live_iipu6bSNFs4PxIq9oF8he6trh8DUzqcL"      # Traffy (ключ pk_live_...)
+FLYER_KEY = ""       # Flyer (flyerhubs.com), тип ключа "tasks"
+TGRASS_KEY = ""      # TGrass (tgrass.space)
+PIARFLOW_KEY = ""    # PiarFlow (piarflow.com)
+TRAFSLY_KEY = ""     # Trafsly (токен бота at_... из @TrafslyBot)
+TRAFFY_KEY = ""      # Traffy (ключ pk_live_...)
 ADMIN_IDS = {619112100}  # ID админов через запятую, например {619112100, 123456789}
 # =====================================================================
 
@@ -406,7 +406,7 @@ async def run(sql, args=()):
     return cur
 
 
-SCHEMA_V = "1"  # увеличь, если меняешь таблицы/настройки по умолчанию
+SCHEMA_V = "2"  # увеличь, если меняешь таблицы/настройки по умолчанию
 
 
 async def init_db():
@@ -468,8 +468,9 @@ REQUIRED_COLUMNS = {
         "ref_paid": "INTEGER DEFAULT 0", "banned": "INTEGER DEFAULT 0", "created_at": "TEXT",
         "ref_penalized": "INTEGER DEFAULT 0", "fresh": "INTEGER DEFAULT 0",
     },
-    "flyer_tasks": {"penalized": "INTEGER DEFAULT 0"},
-    "tgrass_tasks": {"penalized": "INTEGER DEFAULT 0"},
+    "flyer_tasks": {"penalized": "INTEGER DEFAULT 0", "checked_at": "TEXT"},
+    "tgrass_tasks": {"penalized": "INTEGER DEFAULT 0", "checked_at": "TEXT"},
+    "ext_tasks": {"penalized": "INTEGER DEFAULT 0", "checked_at": "TEXT"},
     "tasks": {"kind": "TEXT", "url": "TEXT", "chat_id": "TEXT", "reward": "REAL", "active": "INTEGER DEFAULT 1"},
     "user_tasks": {"status": "TEXT", "day": "TEXT", "penalized": "INTEGER DEFAULT 0"},
     "promos": {"reward": "REAL", "max_uses": "INTEGER DEFAULT 0", "uses": "INTEGER DEFAULT 0"},
@@ -796,16 +797,17 @@ async def apply_unsub_penalty(bot: Bot, uid: int, link: str, table: str, where: 
 UNSUB_STATS = {"penalized": 0}
 
 
-async def check_unsubs(bot: Bot) -> list:
+async def check_unsubs(bot: Bot, budget: float = None) -> list:
     """Проверяет отписки рефералов. Возвращает строки отчёта (для /unsub и логов)."""
     days = int(await get_setting("unsub_days"))
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    budget = budget or UNSUB_BUDGET
     report = []
-    deadline = time.monotonic() + UNSUB_BUDGET
+    deadline = time.monotonic() + budget
 
     async def section(name, coro):
         nonlocal deadline
-        deadline = time.monotonic() + UNSUB_BUDGET  # свой таймер на каждую секцию
+        deadline = time.monotonic() + budget  # свой таймер на каждую секцию
         UNSUB_STATS["penalized"] = 0
         try:
             checked, info = await coro
@@ -843,71 +845,67 @@ async def check_unsubs(bot: Bot) -> list:
             info += f"; ошибок проверки: {errs} — бот должен быть админом канала"
         return asked, info
 
-    async def flyer():
-        rows = await fetchall(
-            "SELECT f.* FROM flyer_tasks f JOIN users u ON u.id=f.user_id "
-            "WHERE f.status='done' AND f.penalized=0 AND f.task='subscribe channel' "
-            "AND u.referrer_id IS NOT NULL AND f.day>=? ORDER BY RANDOM() LIMIT 100", (cutoff,))
-        seen = set()
-        asked = 0
-        for r in rows:
+    async def probe(rows, fn):
+        """Опрашивает сервис параллельно пачками по 10 — быстро, пока база занята."""
+        out = []
+        for i in range(0, len(rows), 10):
             if time.monotonic() > deadline:
                 break
-            res = await flyer_call("check_task", {"signature": r["signature"]})
+            part = rows[i:i + 10]
+            res = await asyncio.gather(*(fn(r) for r in part), return_exceptions=True)
+            out += list(zip(part, res))
+        return out
+
+    async def settle(table, rows, pairs, link_key, is_unsub, label):
+        if pairs:  # запоминаем время проверки: в следующий раз первыми берутся самые давно не проверявшиеся
+            await db.batch([(f"UPDATE {table} SET checked_at=? WHERE id=?", (now(), r["id"])) for r, _ in pairs])
+        seen, asked = set(), 0
+        for r, x in pairs:
+            if isinstance(x, BaseException):
+                seen.add("ошибка запроса")
+                continue
             asked += 1
-            seen.add(str(res.get("result") or res.get("error")))
-            logging.info("unsub flyer user=%s result=%s", r["user_id"], res)
-            if res.get("result") in ("incomplete", "abort"):
-                await apply_unsub_penalty(bot, r["user_id"], r["url"], "flyer_tasks", "id=?", (r["id"],))
-            await asyncio.sleep(0.2)
+            seen.add(label(r, x))
+            logging.info("unsub %s user=%s result=%s", table, r["user_id"], x)
+            if is_unsub(r, x):
+                await apply_unsub_penalty(bot, r["user_id"], r[link_key], table, "id=?", (r["id"],))
         info = f"кандидатов {len(rows)}"
         if seen:
             info += "; ответы: " + ", ".join(sorted(seen))
         return asked, info
+
+    async def flyer():
+        rows = await fetchall(
+            "SELECT f.* FROM flyer_tasks f JOIN users u ON u.id=f.user_id "
+            "WHERE f.status='done' AND f.penalized=0 AND f.task='subscribe channel' "
+            "AND u.referrer_id IS NOT NULL AND f.day>=? "
+            "ORDER BY COALESCE(f.checked_at,'') ASC, f.id ASC LIMIT 200", (cutoff,))
+        pairs = await probe(rows, lambda r: flyer_call("check_task", {"signature": r["signature"]}))
+        return await settle("flyer_tasks", rows, pairs, "url",
+                            lambda r, x: x.get("result") in ("incomplete", "abort"),
+                            lambda r, x: str(x.get("result") or x.get("error")))
 
     async def tgrass():
         rows = await fetchall(
             "SELECT g.* FROM tgrass_tasks g JOIN users u ON u.id=g.user_id "
             "WHERE g.status='done' AND g.penalized=0 AND g.kind='channel' "
-            "AND u.referrer_id IS NOT NULL AND g.day>=? ORDER BY RANDOM() LIMIT 100", (cutoff,))
-        seen = set()
-        asked = 0
-        for r in rows:
-            if time.monotonic() > deadline:
-                break
-            res = await tgrass_call("check", {"tg_user_id": r["user_id"], "offer_id": r["offer_id"]})
-            asked += 1
-            seen.add(str(res.get("status") or res.get("error")))
-            logging.info("unsub tgrass user=%s result=%s", r["user_id"], res)
-            if res.get("status") == "not_subscribed":
-                await apply_unsub_penalty(bot, r["user_id"], r["link"], "tgrass_tasks", "id=?", (r["id"],))
-            await asyncio.sleep(0.2)
-        info = f"кандидатов {len(rows)}"
-        if seen:
-            info += "; ответы: " + ", ".join(sorted(seen))
-        return asked, info
+            "AND u.referrer_id IS NOT NULL AND g.day>=? "
+            "ORDER BY COALESCE(g.checked_at,'') ASC, g.id ASC LIMIT 200", (cutoff,))
+        pairs = await probe(rows, lambda r: tgrass_call("check", {"tg_user_id": r["user_id"], "offer_id": r["offer_id"]}))
+        return await settle("tgrass_tasks", rows, pairs, "link",
+                            lambda r, x: x.get("status") == "not_subscribed",
+                            lambda r, x: str(x.get("status") or x.get("error")))
 
     async def ext():
         rows = await fetchall(
             "SELECT e.* FROM ext_tasks e JOIN users u ON u.id=e.user_id "
             "WHERE e.status='done' AND e.penalized=0 AND e.kind='channel' "
-            "AND u.referrer_id IS NOT NULL AND e.day>=? ORDER BY RANDOM() LIMIT 100", (cutoff,))
-        seen = set()
-        asked = 0
-        for r in rows:
-            if time.monotonic() > deadline:
-                break
-            state, _ = await EXT_CHECK[r["provider"]](r["user_id"], r)
-            asked += 1
-            seen.add(f"{r['provider']}:{state}")
-            logging.info("unsub %s user=%s state=%s", r["provider"], r["user_id"], state)
-            if state == "unsub":
-                await apply_unsub_penalty(bot, r["user_id"], r["link"], "ext_tasks", "id=?", (r["id"],))
-            await asyncio.sleep(0.2)
-        info = f"кандидатов {len(rows)}"
-        if seen:
-            info += "; ответы: " + ", ".join(sorted(seen))
-        return asked, info
+            "AND u.referrer_id IS NOT NULL AND e.day>=? "
+            "ORDER BY COALESCE(e.checked_at,'') ASC, e.id ASC LIMIT 200", (cutoff,))
+        pairs = await probe(rows, lambda r: EXT_CHECK[r["provider"]](r["user_id"], r))
+        return await settle("ext_tasks", rows, pairs, "link",
+                            lambda r, x: x[0] == "unsub",
+                            lambda r, x: f"{r['provider']}:{x[0]}")
 
     await section("Каналы админа", admin_tasks())
     if FLYER_KEY:
@@ -922,6 +920,7 @@ async def check_unsubs(bot: Bot) -> list:
 # секунд на КАЖДУЮ секцию проверки (4 секции ≈ 40 с < DB_LOCK_TTL 55 с и maxDuration 60 с):
 # пока проверка идёт, база занята
 UNSUB_BUDGET = 10
+CRON_BUDGET = 4  # cron дёргают каждую минуту: короткий заход, чтобы не задерживать пользователей
 
 
 async def _ext_unsub(bot: Bot, provider: str, uid: int, cond: str, args: tuple) -> int:
@@ -2587,7 +2586,7 @@ async def cron(request: Request):
     try:
         async with db.session():
             await ensure_ready(bot)
-            report = await check_unsubs(bot)
+            report = await check_unsubs(bot, budget=CRON_BUDGET)
     except DBBusy:
         raise HTTPException(503, "db busy")
     finally:
