@@ -39,11 +39,11 @@ from aiogram.types import (
 #  ВПИШИ СВОИ ИНТЕГРАЦИИ И АДМИН ID ПРЯМО ЗДЕСЬ (между кавычками)
 #  Если оставить пустым — ключ возьмётся из переменных окружения Vercel.
 # =====================================================================
-FLYER_KEY = ""       # Flyer (flyerhubs.com), тип ключа "tasks"
-TGRASS_KEY = ""      # TGrass (tgrass.space)
-PIARFLOW_KEY = ""    # PiarFlow (piarflow.com)
-TRAFSLY_KEY = ""     # Trafsly (токен бота at_... из @TrafslyBot)
-TRAFFY_KEY = ""      # Traffy (ключ pk_live_...)
+FLYER_KEY = "FL-NelisY-SRnApI-zNZkhB-XGGECE"       # Flyer (flyerhubs.com), тип ключа "tasks"
+TGRASS_KEY = "6d6e9e9701e7440a81fe099d360710d5"      # TGrass (tgrass.space)
+PIARFLOW_KEY = "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv"    # PiarFlow (piarflow.com)
+TRAFSLY_KEY = "at_99ddd0618296db80b905c92ff9adaa8c"     # Trafsly (токен бота at_... из @TrafslyBot)
+TRAFFY_KEY = "pk_live_iipu6bSNFs4PxIq9oF8he6trh8DUzqcL"      # Traffy (ключ pk_live_...)
 ADMIN_IDS = {619112100}  # ID админов через запятую, например {619112100, 123456789}
 # =====================================================================
 
