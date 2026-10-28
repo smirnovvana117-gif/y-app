@@ -39,11 +39,11 @@ from aiogram.types import (
 #  ВПИШИ СВОИ ИНТЕГРАЦИИ И АДМИН ID ПРЯМО ЗДЕСЬ (между кавычками)
 #  Если оставить пустым — ключ возьмётся из переменных окружения Vercel.
 # =====================================================================
-FLYER_KEY = "FL-NelisY-SRnApI-zNZkhB-XGGECE"       # Flyer (flyerhubs.com), тип ключа "tasks"
-TGRASS_KEY = "6d6e9e9701e7440a81fe099d360710d5"      # TGrass (tgrass.space)
-PIARFLOW_KEY = "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv"    # PiarFlow (piarflow.com)
-TRAFSLY_KEY = "at_99ddd0618296db80b905c92ff9adaa8c"     # Trafsly (токен бота at_... из @TrafslyBot)
-TRAFFY_KEY = "pk_live_iipu6bSNFs4PxIq9oF8he6trh8DUzqcL"      # Traffy (ключ pk_live_...)
+FLYER_KEY = ""       # Flyer (flyerhubs.com), тип ключа "tasks"
+TGRASS_KEY = ""      # TGrass (tgrass.space)
+PIARFLOW_KEY = ""    # PiarFlow (piarflow.com)
+TRAFSLY_KEY = ""     # Trafsly (токен бота at_... из @TrafslyBot)
+TRAFFY_KEY = ""      # Traffy (ключ pk_live_...)
 ADMIN_IDS = {619112100}  # ID админов через запятую, например {619112100, 123456789}
 # =====================================================================
 
@@ -804,6 +804,8 @@ async def check_unsubs(bot: Bot) -> list:
     deadline = time.monotonic() + UNSUB_BUDGET
 
     async def section(name, coro):
+        nonlocal deadline
+        deadline = time.monotonic() + UNSUB_BUDGET  # свой таймер на каждую секцию
         UNSUB_STATS["penalized"] = 0
         try:
             checked, info = await coro
@@ -820,9 +822,11 @@ async def check_unsubs(bot: Bot) -> list:
             "WHERE ut.status='done' AND ut.penalized=0 AND t.kind='channel' "
             "AND t.chat_id IS NOT NULL AND t.chat_id!='' AND u.referrer_id IS NOT NULL AND ut.day>=? ORDER BY RANDOM() LIMIT 100", (cutoff,))
         errs = 0
+        asked = 0
         for r in rows:
             if time.monotonic() > deadline:
                 break
+            asked += 1
             try:
                 m = await bot.get_chat_member(r["chat_id"], r["user_id"])
                 left = m.status in ("left", "kicked")
@@ -834,7 +838,10 @@ async def check_unsubs(bot: Bot) -> list:
                 await apply_unsub_penalty(bot, r["user_id"], r["url"] or str(r["chat_id"]),
                                           "user_tasks", "user_id=? AND task_id=?", (r["user_id"], r["task_id"]))
             await asyncio.sleep(0.1)
-        return len(rows), (f"ошибок проверки: {errs} — бот должен быть админом канала" if errs else "")
+        info = f"кандидатов {len(rows)}"
+        if errs:
+            info += f"; ошибок проверки: {errs} — бот должен быть админом канала"
+        return asked, info
 
     async def flyer():
         rows = await fetchall(
@@ -842,16 +849,21 @@ async def check_unsubs(bot: Bot) -> list:
             "WHERE f.status='done' AND f.penalized=0 AND f.task='subscribe channel' "
             "AND u.referrer_id IS NOT NULL AND f.day>=? ORDER BY RANDOM() LIMIT 100", (cutoff,))
         seen = set()
+        asked = 0
         for r in rows:
             if time.monotonic() > deadline:
                 break
             res = await flyer_call("check_task", {"signature": r["signature"]})
+            asked += 1
             seen.add(str(res.get("result") or res.get("error")))
             logging.info("unsub flyer user=%s result=%s", r["user_id"], res)
             if res.get("result") in ("incomplete", "abort"):
                 await apply_unsub_penalty(bot, r["user_id"], r["url"], "flyer_tasks", "id=?", (r["id"],))
             await asyncio.sleep(0.2)
-        return len(rows), ("ответы: " + ", ".join(sorted(seen))) if seen else ""
+        info = f"кандидатов {len(rows)}"
+        if seen:
+            info += "; ответы: " + ", ".join(sorted(seen))
+        return asked, info
 
     async def tgrass():
         rows = await fetchall(
@@ -859,16 +871,21 @@ async def check_unsubs(bot: Bot) -> list:
             "WHERE g.status='done' AND g.penalized=0 AND g.kind='channel' "
             "AND u.referrer_id IS NOT NULL AND g.day>=? ORDER BY RANDOM() LIMIT 100", (cutoff,))
         seen = set()
+        asked = 0
         for r in rows:
             if time.monotonic() > deadline:
                 break
             res = await tgrass_call("check", {"tg_user_id": r["user_id"], "offer_id": r["offer_id"]})
+            asked += 1
             seen.add(str(res.get("status") or res.get("error")))
             logging.info("unsub tgrass user=%s result=%s", r["user_id"], res)
             if res.get("status") == "not_subscribed":
                 await apply_unsub_penalty(bot, r["user_id"], r["link"], "tgrass_tasks", "id=?", (r["id"],))
             await asyncio.sleep(0.2)
-        return len(rows), ("ответы: " + ", ".join(sorted(seen))) if seen else ""
+        info = f"кандидатов {len(rows)}"
+        if seen:
+            info += "; ответы: " + ", ".join(sorted(seen))
+        return asked, info
 
     async def ext():
         rows = await fetchall(
@@ -876,16 +893,21 @@ async def check_unsubs(bot: Bot) -> list:
             "WHERE e.status='done' AND e.penalized=0 AND e.kind='channel' "
             "AND u.referrer_id IS NOT NULL AND e.day>=? ORDER BY RANDOM() LIMIT 100", (cutoff,))
         seen = set()
+        asked = 0
         for r in rows:
             if time.monotonic() > deadline:
                 break
             state, _ = await EXT_CHECK[r["provider"]](r["user_id"], r)
+            asked += 1
             seen.add(f"{r['provider']}:{state}")
             logging.info("unsub %s user=%s state=%s", r["provider"], r["user_id"], state)
             if state == "unsub":
                 await apply_unsub_penalty(bot, r["user_id"], r["link"], "ext_tasks", "id=?", (r["id"],))
             await asyncio.sleep(0.2)
-        return len(rows), ("ответы: " + ", ".join(sorted(seen))) if seen else ""
+        info = f"кандидатов {len(rows)}"
+        if seen:
+            info += "; ответы: " + ", ".join(sorted(seen))
+        return asked, info
 
     await section("Каналы админа", admin_tasks())
     if FLYER_KEY:
@@ -897,7 +919,9 @@ async def check_unsubs(bot: Bot) -> list:
     return report
 
 
-UNSUB_BUDGET = 15  # секунд на один вызов проверки: пока она идёт, база занята (cron гоняет её часто)
+# секунд на КАЖДУЮ секцию проверки (4 секции ≈ 40 с < DB_LOCK_TTL 55 с и maxDuration 60 с):
+# пока проверка идёт, база занята
+UNSUB_BUDGET = 10
 
 
 async def _ext_unsub(bot: Bot, provider: str, uid: int, cond: str, args: tuple) -> int:
@@ -1883,6 +1907,22 @@ async def a_flyer(m: Message):
 
     await m.answer(f"🛰 <b>Flyer get_me</b>\n<pre>{dump(me)}</pre>\n\n"
                    f"🛰 <b>Flyer get_tasks (для тебя)</b>\n<pre>{dump(tasks)}</pre>")
+
+
+@admin.message(Command("flyerdbg"))
+async def a_flyerdbg(m: Message):
+    """Показывает сырой ответ Flyer check_task по твоим последним выполненным заданиям."""
+    rows = await fetchall(
+        "SELECT * FROM flyer_tasks WHERE user_id=? AND status='done' ORDER BY id DESC LIMIT 5",
+        (m.from_user.id,))
+    if not rows:
+        return await m.answer("У тебя нет выполненных заданий Flyer")
+    out = []
+    for r in rows:
+        res = await flyer_call("check_task", {"signature": r["signature"]})
+        out.append(f"#{r['id']} {r['task']} day={r['day']} pen={r['penalized']}\n"
+                   f"{json.dumps(res, ensure_ascii=False)[:300]}")
+    await m.answer("<pre>" + html.escape("\n\n".join(out)) + "</pre>")
 
 
 @admin.message(Command("tgrass"))
