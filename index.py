@@ -2616,6 +2616,20 @@ async def provider_hook(provider: str, request: Request, key: str = ""):
 
 @app.api_route("/{full_path:path}", methods=["GET", "POST"], include_in_schema=False)
 async def fallback(request: Request, full_path: str):
-    """Диагностика: показывает, какой путь реально пришёл (значения query не выводятся)."""
+    """Страховка: если Vercel отдал приложению не тот путь (rewrite), определяем запрос по содержимому."""
+    if request.method == "POST":
+        try:
+            data = await request.json()
+        except Exception:
+            data = None
+        if isinstance(data, dict) and "update_id" in data:
+            return await webhook(request)  # апдейт от Telegram
+    else:
+        auth = request.headers.get("authorization", "")
+        if CRON_SECRET and same(auth, f"Bearer {CRON_SECRET}"):
+            return await cron(request)  # Vercel Cron
+        qkey = request.query_params.get("key", "")
+        if WEBHOOK_SECRET and same(qkey, WEBHOOK_SECRET):
+            return await set_webhook(request, key=qkey)  # установка вебхука
     return {"error": "no route", "seen_path": request.scope["path"],
             "query_keys": list(request.query_params.keys())}
