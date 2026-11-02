@@ -423,7 +423,7 @@ async def run(sql, args=()):
     return cur
 
 
-SCHEMA_V = "5"  # увеличь, если меняешь таблицы/настройки по умолчанию
+SCHEMA_V = "6"  # увеличь, если меняешь таблицы/настройки по умолчанию
 
 
 async def init_db():
@@ -473,8 +473,11 @@ async def init_db():
     if ver and ver["value"] == SCHEMA_V:
         return
     await migrate_db()
-    # окно обязательной подписки: все, кто уже был в базе при обновлении, считаются прошедшими
-    await db.execute("UPDATE users SET gate_ok=1 WHERE gate_ok IS NULL OR gate_ok=0")
+    # окно обязательной подписки: один раз сбрасываем всем старым пользователям — теперь окно покажут и им
+    if not await fetchone("SELECT 1 FROM settings WHERE key='gate_reset'"):
+        await db.execute("UPDATE users SET gate_ok=0")
+        await db.execute("DELETE FROM gate_items")
+        await db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('gate_reset','1')")
     # «живые» выполненные задания (без отписки) — по ним решаем, платить ли за реферала
     await db.executescript("""
     DROP VIEW IF EXISTS done_valid;
