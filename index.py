@@ -2,9 +2,17 @@
 """
 Реферальный бот со звёздами — версия для Vercel (webhook + хранение базы в Redis/Upstash).
 Работает через api/index.py (FastAPI). Локально не запускается (нет polling).
+
+Порядок спонсоров: 1 Flyer, 2 Flowly, 3 Traffy, 4 TGrass, 5 PiarFlow, 6 Trafsly.
+Награда за реферала: реферал выполняет задания спонсоров. Если выполнено N (по умолчанию 8) —
+награда сразу. Если сервисы выдали меньше (спонсоры закончились), награда платится только когда
+выполнено не меньше M (по умолчанию 4) заданий; 3 и меньше — награды нет.
+Отписка реферала хотя бы от одного канала: штраф рефералу, а пригласивший теряет ровно столько,
+сколько получил за этого реферала. Размер награды можно задать индивидуально (админ-панель → Пользователи).
 """
 import asyncio
 import base64
+import hashlib
 import time
 import html
 import json
@@ -38,8 +46,10 @@ from aiogram.types import (
 # =====================================================================
 #  ВПИШИ СВОИ ИНТЕГРАЦИИ И АДМИН ID ПРЯМО ЗДЕСЬ (между кавычками)
 #  Если оставить пустым — ключ возьмётся из переменных окружения Vercel.
+#  (Лучше хранить ключи в Environment Variables, а не в коде.)
 # =====================================================================
 FLYER_KEY = "FL-NelisY-SRnApI-zNZkhB-XGGECE"       # Flyer (flyerhubs.com), тип ключа "tasks"
+FLOWLY_KEY = "b3216391cd5b1dd7d43802d3555ef78a"      # Flowly (flowly.guru)
 TGRASS_KEY = "6d6e9e9701e7440a81fe099d360710d5"      # TGrass (tgrass.space)
 PIARFLOW_KEY = "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv"    # PiarFlow (piarflow.com)
 TRAFSLY_KEY = "at_99ddd0618296db80b905c92ff9adaa8c"     # Trafsly (токен бота at_... из @TrafslyBot)
@@ -56,9 +66,11 @@ def key(name: str) -> str:
 BOT_TOKEN = key("BOT_TOKEN")
 WEBHOOK_SECRET = key("WEBHOOK_SECRET")
 CRON_SECRET = key("CRON_SECRET")
+FLOWLY_WEBHOOK_SECRET = key("FLOWLY_WEBHOOK_SECRET")  # ключ подписи вебхуков Flowly (необязательно)
 
 # если в коде пусто — берём из окружения
 FLYER_KEY = FLYER_KEY.strip() or key("FLYER_KEY")
+FLOWLY_KEY = FLOWLY_KEY.strip() or key("FLOWLY_KEY")
 TGRASS_KEY = TGRASS_KEY.strip() or key("TGRASS_KEY")
 PIARFLOW_KEY = PIARFLOW_KEY.strip() or key("PIARFLOW_KEY")
 TRAFSLY_KEY = TRAFSLY_KEY.strip() or key("TRAFSLY_KEY")
@@ -68,6 +80,7 @@ ADMIN_IDS = set(ADMIN_IDS) | {int(x) for x in os.getenv("ADMIN_IDS", "").split("
 WITHDRAW_CHANNEL = "@AvoReputation"
 FLYER_URL = "https://api.flyerhubs.com"
 FLYER_LIMIT = 10  # сколько заданий Flyer закрепляет за пользователем (макс. 10)
+FLOWLY_URL = "https://flowly.guru/api/v1"
 TGRASS_URL = "https://tgrass.space"
 TGRASS_ENDPOINT = os.getenv("TGRASS_ENDPOINT", "tasks")  # "tasks" — для ботов с заданиями, "offers" — для обязательных офферов
 TGRASS_VERIFY_SSL = os.getenv("TGRASS_VERIFY_SSL", "1") != "0"
@@ -81,16 +94,20 @@ POST_PAYOUTS_TO_CHANNEL = False  # True -> после выплаты бот пи
 
 # Настройки по умолчанию (потом меняются в админке: ⚙️ Настройки)
 DEFAULT_SETTINGS = {
-    "ref_reward": "4.5",  # награда за реферала
-    "ref_tasks": "7",     # сколько заданий должен выполнить реферал, чтобы ты получил награду
-    "flyer_reward": "0.25",  # награда пользователю за одно задание от Flyer
+    "ref_reward": "5",        # награда за реферала
+    "ref_tasks": "8",         # на скольких спонсоров должен подписаться реферал
+    "ref_min": "4",           # минимум выполненных спонсоров, если сервисы выдали меньше N (3 и меньше — награды нет)
+    "flyer_reward": "0.25",   # награда пользователю за одно задание от Flyer
+    "flowly_reward": "0.25",  # награда за одно задание Flowly
     "tgrass_reward": "0.25",  # награда пользователю за одно задание от TGrass
     "trafsly_reward": "0.25",  # награда за одно задание Trafsly
     "piarflow_reward": "0.25",  # награда за одно задание PiarFlow
     "traffy_reward": "0.25",  # награда за одно задание Traffy
-    "unsub_penalty": "0.25",  # штраф рефералу за отписку от канала спонсора
+    "unsub_penalty": "5",     # штраф рефералу за отписку от канала спонсора
     "unsub_days": "3",        # сколько дней после выполнения задания следим за отпиской
 }
+# эти значения принудительно обновятся один раз при смене SCHEMA_V (потом меняются в админке)
+FORCE_SETTINGS = {}  # (в v3 уже применялись 5 / 8 / 4 / 5; теперь настройки из админки не трогаем)
 UNSUB_CHECK_INTERVAL = 5 * 60  # как часто проверять отписки (сек)
 DEFAULT_TASK_REWARD = 0.25
 
@@ -406,7 +423,7 @@ async def run(sql, args=()):
     return cur
 
 
-SCHEMA_V = "2"  # увеличь, если меняешь таблицы/настройки по умолчанию
+SCHEMA_V = "4"  # увеличь, если меняешь таблицы/настройки по умолчанию
 
 
 async def init_db():
@@ -455,8 +472,22 @@ async def init_db():
     if ver and ver["value"] == SCHEMA_V:
         return
     await migrate_db()
+    # «живые» выполненные задания (без отписки) — по ним решаем, платить ли за реферала
+    await db.executescript("""
+    DROP VIEW IF EXISTS done_valid;
+    CREATE VIEW done_valid AS
+        SELECT user_id, day FROM user_tasks WHERE status='done' AND COALESCE(penalized,0)=0
+        UNION ALL
+        SELECT user_id, day FROM flyer_tasks WHERE status='done' AND COALESCE(penalized,0)=0
+        UNION ALL
+        SELECT user_id, day FROM tgrass_tasks WHERE status='done' AND COALESCE(penalized,0)=0
+        UNION ALL
+        SELECT user_id, day FROM ext_tasks WHERE status='done' AND COALESCE(penalized,0)=0;
+    """)
     await db.batch([("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
                     for k, v in DEFAULT_SETTINGS.items()]
+                   + [("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (k, v))
+                      for k, v in FORCE_SETTINGS.items()]
                    + [("INSERT OR REPLACE INTO settings(key,value) VALUES('schema_v',?)", (SCHEMA_V,))])
 
 
@@ -467,6 +498,7 @@ REQUIRED_COLUMNS = {
         "balance": "REAL DEFAULT 0", "earned": "REAL DEFAULT 0", "withdrawn": "REAL DEFAULT 0",
         "ref_paid": "INTEGER DEFAULT 0", "banned": "INTEGER DEFAULT 0", "created_at": "TEXT",
         "ref_penalized": "INTEGER DEFAULT 0", "fresh": "INTEGER DEFAULT 0",
+        "ref_reward_custom": "REAL", "ref_paid_amount": "REAL DEFAULT 0",
     },
     "flyer_tasks": {"penalized": "INTEGER DEFAULT 0", "checked_at": "TEXT"},
     "tgrass_tasks": {"penalized": "INTEGER DEFAULT 0", "checked_at": "TEXT"},
@@ -570,8 +602,15 @@ def ref_link(code: str) -> str:
     return f"https://t.me/{BOT_USERNAME}?start={code}"
 
 
+async def ref_reward_for(u) -> float:
+    """Награда за реферала для пригласившего u: индивидуальная (если задана в админке) или общая."""
+    if u is not None and u["ref_reward_custom"] is not None:
+        return float(u["ref_reward_custom"])
+    return await get_setting("ref_reward")
+
+
 async def ref_text(u) -> str:
-    rr = fmt(await get_setting("ref_reward"))
+    rr = fmt(await ref_reward_for(u))
     need = int(await get_setting("ref_tasks"))
     cnt = await ref_count(u["id"])
     return (
@@ -582,7 +621,7 @@ async def ref_text(u) -> str:
         f"<b>Приглашено тобой:</b> {cnt} {USER_E}\n\n"
         f"{HEART}<b>Как это работает:</b>\n"
         f"╠ Отправь свою ссылку другу\n"
-        f"╠ Друг заходит и выполняет {need} заданий\n"
+        f"╠ Друг заходит и подпишется на {need} спонсоров\n"
         f"╚ Ты получаешь {rr}{STAR} сразу же!"
     )
 
@@ -669,10 +708,16 @@ async def next_task(uid: int):
 async def send_task(target: Message, uid: int, edit: bool = False, lang: str = None, tgu=None):
     FLYER_REWARD_CACHE["v"] = await get_setting("flyer_reward")
     TGRASS_REWARD_CACHE["v"] = await get_setting("tgrass_reward")
+    # порядок спонсоров: 1 Flyer, 2 Flowly, 3 Traffy, 4 TGrass, 5 PiarFlow, 6 Trafsly
     ft = await next_flyer_task(uid, lang)
-    gt = None if ft else await next_tgrass_task(tgu)
-    et = None if (ft or gt) else await next_ext_task(tgu)
-    t = None if (ft or gt or et) else await next_task(uid)
+    et = None if ft else await next_ext_task(tgu, ("flowly", "traffy"))
+    gt = None if (ft or et) else await next_tgrass_task(tgu)
+    if not (ft or et or gt):
+        et = await next_ext_task(tgu, ("piarflow", "trafsly"))
+    if not (ft or et or gt):
+        # спонсоры закончились: платим рефереру, если реферал выполнил не меньше ref_min заданий
+        await try_pay_referrer(target.bot, uid, exhausted=True)
+    t = None if (ft or gt or et) else await next_task(uid)  # свои задания админа — в последнюю очередь
     if ft:
         text, markup = flyer_task_text(ft), flyer_task_kb(ft)
     elif gt:
@@ -717,29 +762,39 @@ async def credit(uid: int, amount: float):
     await db.commit()
 
 
-async def after_task_done(bot: Bot, uid: int, reward: float):
-    """Начисляет награду за задание и, если нужно, награду рефереру."""
-    await credit(uid, reward)
+async def try_pay_referrer(bot: Bot, uid: int, exhausted: bool = False):
+    """Платит рефереру за реферала uid (один раз).
+    • выполнено ref_tasks (8) заданий спонсоров — платим сразу;
+    • exhausted=True (сервисы больше не выдают спонсоров) — платим, если выполнено не меньше ref_min (4);
+    • меньше ref_min — награды нет."""
     u = await get_user(uid)
-    if not u["referrer_id"] or u["ref_paid"]:
+    if not u or not u["referrer_id"] or u["ref_paid"]:
         return
     need = int(await get_setting("ref_tasks"))
-    done = (await fetchone("SELECT COUNT(*) c FROM done_tasks WHERE user_id=?", (uid,)))["c"]
-    if done < need:
+    min_ok = int(await get_setting("ref_min"))
+    valid = (await fetchone("SELECT COUNT(*) c FROM done_valid WHERE user_id=?", (uid,)))["c"]
+    if valid < need and not (exhausted and valid >= min_ok):
         return
-    cur = await db.execute("UPDATE users SET ref_paid=1 WHERE id=? AND ref_paid=0", (uid,))
+    referrer = await get_user(u["referrer_id"])
+    rr = await ref_reward_for(referrer)
+    cur = await db.execute("UPDATE users SET ref_paid=1, ref_paid_amount=? WHERE id=? AND ref_paid=0", (rr, uid))
     await db.commit()
     if cur.rowcount == 0:
         return
-    rr = await get_setting("ref_reward")
     await credit(u["referrer_id"], rr)
     try:
         await bot.send_message(
             u["referrer_id"],
-            f"{CHECK_E} Пользователь {uref(u)} выполнил нужное количество заданий!\n\n"
+            f"{CHECK_E} Пользователь {uref(u)} подписался на спонсоров!\n\n"
             f"Ты получаешь {fmt(rr)} {STAR}")
     except Exception:
         pass
+
+
+async def after_task_done(bot: Bot, uid: int, reward: float):
+    """Начисляет награду за задание и проверяет награду рефереру."""
+    await credit(uid, reward)
+    await try_pay_referrer(bot, uid)
 
 
 async def complete_task(bot: Bot, uid: int, t):
@@ -779,7 +834,8 @@ async def apply_unsub_penalty(bot: Bot, uid: int, link: str, table: str, where: 
         c2 = await db.execute("UPDATE users SET ref_penalized=1 WHERE id=? AND ref_penalized=0", (uid,))
         await db.commit()
         if c2.rowcount:
-            rr = await get_setting("ref_reward")
+            # пригласивший теряет ровно столько, сколько получил за этого реферала
+            rr = u["ref_paid_amount"] or await get_setting("ref_reward")
             await db.execute("UPDATE users SET balance=balance-?, earned=earned-? WHERE id=?",
                              (rr, rr, u["referrer_id"]))
             await db.commit()
@@ -787,7 +843,7 @@ async def apply_unsub_penalty(bot: Bot, uid: int, link: str, table: str, where: 
                 await bot.send_message(
                     u["referrer_id"],
                     f"⚠️ Штраф за реферала\n\n"
-                    f"Реферал {uref(u)} отписался от выполненных спонсоров.\n\n"
+                    f"Реферал {uref(u)} отписался от канала спонсора.\n\n"
                     f"С вашего баланса списано -{fmt(rr)} {STAR}\n"
                     f"Сумма равна награде за этого реферала.")
             except Exception:
@@ -903,8 +959,9 @@ async def check_unsubs(bot: Bot, budget: float = None) -> list:
             "AND u.referrer_id IS NOT NULL AND e.day>=? "
             "ORDER BY COALESCE(e.checked_at,'') ASC, e.id ASC LIMIT 200", (cutoff,))
         pairs = await probe(rows, lambda r: EXT_CHECK[r["provider"]](r["user_id"], r))
+        # у Flowly после выполнения «not_subscribed» означает, что пользователь ушёл
         return await settle("ext_tasks", rows, pairs, "link",
-                            lambda r, x: x[0] == "unsub",
+                            lambda r, x: x[0] == "unsub" or (r["provider"] == "flowly" and x[0] == "no"),
                             lambda r, x: f"{r['provider']}:{x[0]}")
 
     await section("Каналы админа", admin_tasks())
@@ -912,7 +969,7 @@ async def check_unsubs(bot: Bot, budget: float = None) -> list:
         await section("Flyer", flyer())
     if TGRASS_KEY:
         await section("TGrass", tgrass())
-    await section("PiarFlow/Trafsly/Traffy", ext())
+    await section("Flowly/PiarFlow/Trafsly/Traffy", ext())
     logging.info("unsub-check: %s", " | ".join(report))
     return report
 
@@ -937,9 +994,12 @@ async def _ext_unsub(bot: Bot, provider: str, uid: int, cond: str, args: tuple) 
 
 
 async def handle_provider_hook(bot: Bot, provider: str, p: dict) -> int:
-    """Вебхуки об отписках от PiarFlow / Trafsly / Traffy. Возвращает число оштрафованных заданий."""
+    """Вебхуки об отписках от Flowly / PiarFlow / Trafsly / Traffy. Возвращает число оштрафованных заданий."""
     n = 0
-    if provider == "piarflow":
+    if provider == "flowly":
+        if p.get("status") == "unsubscribed":
+            n += await _ext_unsub(bot, "flowly", int(p["tg_user_id"]), "e.link=?", (str(p.get("link")),))
+    elif provider == "piarflow":
         if not p.get("test") and p.get("status") == "unsubscribed":
             n += await _ext_unsub(bot, "piarflow", int(p["tg_user_id"]), "e.link=?", (str(p.get("offer_link")),))
     elif provider == "trafsly":
@@ -1139,15 +1199,15 @@ def tgrass_task_kb(gt) -> InlineKeyboardMarkup:
     )
 
 
-# ============== TRAFSLY / PIARFLOW / TRAFFY (общая таблица ext_tasks) ==============
-EXT_NAMES = {"trafsly": "Trafsly", "piarflow": "PiarFlow", "traffy": "Traffy"}
+# ======= FLOWLY / TRAFSLY / PIARFLOW / TRAFFY (общая таблица ext_tasks) =======
+EXT_NAMES = {"flowly": "Flowly", "trafsly": "Trafsly", "piarflow": "PiarFlow", "traffy": "Traffy"}
 
 
 async def ext_post(url: str, headers: dict, payload: dict):
     """Возвращает (http_status, json|{}). При сетевой ошибке (0, {})."""
     try:
         async with http.post(url, json=payload, headers=headers,
-                             timeout=aiohttp.ClientTimeout(total=10)) as r:
+                             timeout=aiohttp.ClientTimeout(total=6)) as r:
             data = await r.json(content_type=None)
             return r.status, (data if isinstance(data, dict) else {})
     except Exception as ex:
@@ -1179,6 +1239,55 @@ async def ext_get_or_create(uid: int, provider: str, ext_id: str, link: str, kin
         row = await fetchone("SELECT * FROM ext_tasks WHERE user_id=? AND provider=? AND ext_id=?",
                              (uid, provider, str(ext_id)))
     return row
+
+
+# ---------- Flowly ----------
+def _flowly_headers():
+    return {"Auth": FLOWLY_KEY, "Content-Type": "application/json"}
+
+
+async def next_flowly(tgu):
+    if not FLOWLY_KEY or tgu is None:
+        return None
+    payload = {"tg_user_id": tgu.id, "lang": tgu.language_code or "ru",
+               "is_premium": bool(tgu.is_premium), "offers_limit": 3}
+    for attempt in range(2):
+        code, data = await ext_post(f"{FLOWLY_URL}/offers", _flowly_headers(), payload)
+        if code != 200:
+            logging.info("flowly offers: %s %s", code, data)
+            return None
+        for o in data.get("offers") or []:
+            if o.get("subscribed") or not o.get("link") or o.get("offer_id") is None:
+                continue
+            row = await ext_get_or_create(tgu.id, "flowly", o["offer_id"], o["link"],
+                                          o.get("type") or guess_kind(o["link"]))
+            if row:
+                return row
+        if attempt == 0 and data.get("status") in ("ok", "not_ok"):
+            # всё выполнено или пропущено — просим Flowly выдать новые
+            await ext_post(f"{FLOWLY_URL}/reset_offers", _flowly_headers(), {"tg_user_id": tgu.id})
+            continue
+        break
+    return None
+
+
+async def check_flowly(uid: int, row):
+    oid = row["ext_id"]
+    oid = int(oid) if str(oid).isdigit() else oid
+    code, data = await ext_post(f"{FLOWLY_URL}/check", _flowly_headers(),
+                                {"tg_user_id": uid, "offer_id": oid})
+    if code in (404, 409):
+        return "gone", ""
+    if code != 200:
+        return "wait", ""   # 503 и т.п. — не засчитываем и не штрафуем
+    st = data.get("status")
+    if st == "subscribed":
+        return "ok", ""
+    if st == "not_subscribed":
+        return "no", ""
+    if st == "offer_unavailable":
+        return "gone", ""
+    return "wait", ""
 
 
 # ---------- Trafsly ----------
@@ -1321,14 +1430,14 @@ async def check_traffy(uid: int, row):
     return "gone", ""
 
 
-# порядок важен: сначала PiarFlow, потом Trafsly, потом Traffy
-EXT_NEXT = {"piarflow": next_piarflow, "trafsly": next_trafsly, "traffy": next_traffy}
-EXT_CHECK = {"trafsly": check_trafsly, "piarflow": check_piarflow, "traffy": check_traffy}
+EXT_NEXT = {"flowly": next_flowly, "traffy": next_traffy, "piarflow": next_piarflow, "trafsly": next_trafsly}
+EXT_CHECK = {"flowly": check_flowly, "trafsly": check_trafsly, "piarflow": check_piarflow, "traffy": check_traffy}
 
 
-async def next_ext_task(tgu):
-    for prov, fn in EXT_NEXT.items():
-        row = await fn(tgu)
+async def next_ext_task(tgu, providers=("flowly", "traffy", "piarflow", "trafsly")):
+    """Опрашивает сервисы строго в заданном порядке; возвращает первое найденное задание."""
+    for prov in providers:
+        row = await EXT_NEXT[prov](tgu)
         if row:
             return row
     return None
@@ -1339,6 +1448,8 @@ async def ext_task_text(et) -> str:
     link = html.escape(et["link"], quote=True)
     if et["kind"] == "bot":
         action = f'Запусти <a href="{link}">бота</a> и нажми «Подтвердить»'
+    elif et["kind"] == "resource":
+        action = f'Перейди по <a href="{link}">ссылке</a> и нажми «Подтвердить»'
     else:
         action = f'Подпишись на <a href="{link}">канал</a> и нажми «Подтвердить»'
     return (
@@ -1385,6 +1496,7 @@ class Cast(StatesGroup):
 class UserAdm(StatesGroup):
     find = State()
     amount = State()
+    custom = State()
 
 
 class SetSt(StatesGroup):
@@ -1418,12 +1530,12 @@ async def cmd_start(m: Message, command: CommandObject, state: FSMContext):
             u, is_new = await get_user(u["id"]), True
     if is_new and u["referrer_id"]:
         need = int(await get_setting("ref_tasks"))
-        rr = fmt(await get_setting("ref_reward"))
+        rr = fmt(await ref_reward_for(await get_user(u["referrer_id"])))
         try:
             await m.bot.send_message(
                 u["referrer_id"],
                 f"{BOLT} Пользователь {uref(u)} присоединился по твоей ссылке!\n\n"
-                f"Ты получишь {rr} {STAR}, как только он выполнит {need} заданий")
+                f"Ты получишь {rr} {STAR}, как только он подпишется на {need} спонсоров")
         except Exception:
             pass
     await set_menu(m)
@@ -1439,7 +1551,7 @@ async def cmd_reset(m: Message, state: FSMContext):
     u, _ = await get_or_create_user(m.from_user)
     uid = u["id"]
     await db.execute("UPDATE users SET balance=0, earned=0, withdrawn=0, referrer_id=NULL, ref_paid=0, "
-                     "ref_penalized=0, fresh=1 WHERE id=?", (uid,))
+                     "ref_penalized=0, ref_paid_amount=0, fresh=1 WHERE id=?", (uid,))
     for table in ("user_tasks", "flyer_tasks", "tgrass_tasks", "ext_tasks", "promo_uses"):
         await db.execute(f"DELETE FROM {table} WHERE user_id=?", (uid,))
     await db.commit()
@@ -1622,7 +1734,7 @@ async def tgrass_skip(c: CallbackQuery):
     await send_task(c.message, c.from_user.id, edit=True, lang=c.from_user.language_code, tgu=c.from_user)
 
 
-# ---------- Задания Trafsly / PiarFlow / Traffy ----------
+# ---------- Задания Flowly / Trafsly / PiarFlow / Traffy ----------
 @user.callback_query(F.data.startswith("ec:"))
 async def ext_confirm(c: CallbackQuery):
     lang = c.from_user.language_code
@@ -1643,8 +1755,12 @@ async def ext_confirm(c: CallbackQuery):
         await c.answer()
         return await send_task(c.message, c.from_user.id, edit=True, lang=lang, tgu=c.from_user)
     if state in ("no", "unsub"):
-        txt = "❌ Ты не запустил бота, которого требует задание" if row["kind"] == "bot" \
-            else "❌ Ты не подписался на канал, которого требует задание"
+        if row["kind"] == "bot":
+            txt = "❌ Ты не запустил бота, которого требует задание"
+        elif row["kind"] == "resource":
+            txt = "❌ Ты не выполнил задание — перейди по ссылке и повтори проверку"
+        else:
+            txt = "❌ Ты не подписался на канал, которого требует задание"
         return await c.answer(txt, show_alert=True)
     if state == "refresh":
         await c.answer("Обновляю задание…")
@@ -1924,6 +2040,19 @@ async def a_flyerdbg(m: Message):
     await m.answer("<pre>" + html.escape("\n\n".join(out)) + "</pre>")
 
 
+@admin.message(Command("flowly"))
+async def a_flowly(m: Message):
+    """Диагностика Flowly: сырой ответ /offers для тебя."""
+    if not FLOWLY_KEY:
+        return await m.answer("❌ <b>FLOWLY_KEY не задан.</b>\nВпиши ключ в начале кода: <code>FLOWLY_KEY = \"...\"</code>")
+    tgu = m.from_user
+    code, data = await ext_post(f"{FLOWLY_URL}/offers", _flowly_headers(),
+                                {"tg_user_id": tgu.id, "lang": tgu.language_code or "ru",
+                                 "is_premium": bool(tgu.is_premium), "offers_limit": 3})
+    text = html.escape(json.dumps(data, ensure_ascii=False, indent=1)[:2500])
+    await m.answer(f"📡 <b>Flowly /offers (для тебя)</b> HTTP {code}\n<pre>{text}</pre>")
+
+
 @admin.message(Command("tgrass"))
 async def a_tgrass(m: Message):
     if not TGRASS_KEY:
@@ -1950,6 +2079,7 @@ async def a_stats(c: CallbackQuery, state: FSMContext):
     done_today = await one("SELECT COUNT(*) FROM done_tasks WHERE day=?", (d,))
     fl = await one("SELECT COUNT(*) FROM flyer_tasks WHERE status='done'")
     tg = await one("SELECT COUNT(*) FROM tgrass_tasks WHERE status='done'")
+    fw = await one("SELECT COUNT(*) FROM ext_tasks WHERE status='done' AND provider='flowly'")
     bal = await one("SELECT SUM(balance) FROM users")
     wd_p = await one("SELECT COUNT(*) FROM withdrawals WHERE status='pending'")
     wd_ok = await one("SELECT COUNT(*) FROM withdrawals WHERE status='paid'")
@@ -1962,7 +2092,7 @@ async def a_stats(c: CallbackQuery, state: FSMContext):
         f"👥 Пользователей: <b>{total}</b> (сегодня +{new_today})\n"
         f"🔗 Пришло по рефералкам: <b>{refs}</b> (награда выдана: {refs_paid})\n\n"
         f"📋 Активных заданий: <b>{tasks}</b>\n"
-        f"✅ Выполнено заданий: <b>{done}</b> (сегодня {done_today}), из них Flyer: {fl}, TGrass: {tg}\n"
+        f"✅ Выполнено заданий: <b>{done}</b> (сегодня {done_today}), из них Flyer: {fl}, Flowly: {fw}, TGrass: {tg}\n"
         f"🎟 Промокодов: <b>{promos}</b>\n\n"
         f"💰 Сумма балансов: <b>{fmt(bal)}</b> ⭐\n"
         f"📥 Заявки: ожидают <b>{wd_p}</b> · выплачено <b>{wd_ok}</b> · отклонено <b>{wd_no}</b>\n"
@@ -2049,9 +2179,10 @@ async def tasks_view():
         kind = "📢" if t["kind"] == "channel" else "🤖"
         btns.append([btn(f"{icon} #{t['id']} {kind} +{fmt(t['reward'])}⭐ · выполнили: {done}", cb=f"a:tv:{t['id']}")])
     text = "📋 <b>Задания</b>\n\n" + (f"Всего своих: {len(rows)}. Нажми на задание, чтобы управлять 👇" if rows else "Своих заданий пока нет.") + \
-        f"\n\n🛰 Flyer: {'подключён ✅ (задания приходят автоматически)' if FLYER_KEY else 'не подключён (нет FLYER_KEY)'}" + \
-        f"\n🌿 TGrass: {'подключён ✅' if TGRASS_KEY else 'не подключён (нет TGRASS_KEY)'}" + \
-        f"\n📡 PiarFlow: {'✅' if PIARFLOW_KEY else '—'} · Trafsly: {'✅' if TRAFSLY_KEY else '—'} · Traffy: {'✅' if TRAFFY_KEY else '—'}"
+        "\n\n<b>Порядок спонсоров:</b> Flyer → Flowly → Traffy → TGrass → PiarFlow → Trafsly" + \
+        f"\n🛰 Flyer: {'подключён ✅' if FLYER_KEY else 'не подключён (нет FLYER_KEY)'}" + \
+        f"\n📡 Flowly: {'✅' if FLOWLY_KEY else '—'} · Traffy: {'✅' if TRAFFY_KEY else '—'}" + \
+        f"\n🌿 TGrass: {'✅' if TGRASS_KEY else '—'} · PiarFlow: {'✅' if PIARFLOW_KEY else '—'} · Trafsly: {'✅' if TRAFSLY_KEY else '—'}"
     btns.append([btn("➕ Добавить задание", cb="a:task_add", style="success")])
     btns.append(A_BACK)
     return text, kb(*btns)
@@ -2271,18 +2402,24 @@ async def user_card(uid: int):
         return None, None
     invited = await ref_count(uid)
     done = (await fetchone("SELECT COUNT(*) c FROM done_tasks WHERE user_id=?", (uid,)))["c"]
+    valid = (await fetchone("SELECT COUNT(*) c FROM done_valid WHERE user_id=?", (uid,)))["c"]
     uname = f"@{u['username']}" if u["username"] else "—"
+    custom = u["ref_reward_custom"]
+    rr_line = (f"🎁 Награда за реферала: <b>{fmt(custom)} ⭐</b> (индивидуальная)" if custom is not None
+               else f"🎁 Награда за реферала: {fmt(await get_setting('ref_reward'))} ⭐ (стандартная)")
     text = (f"👤 <b>{esc(u['full_name'])}</b> ({esc(uname)})\n"
             f"ID: <code>{uid}</code>\n"
             f"Регистрация: {u['created_at']}\n"
             f"Пригласил: {u['referrer_id'] or '—'}\n\n"
             f"💰 Баланс: {fmt(u['balance'])} ⭐\n"
             f"📈 Заработано: {fmt(u['earned'])} · 📤 Выведено: {fmt(u['withdrawn'])}\n"
-            f"👥 Рефералов: {invited} · ✅ Заданий: {done}\n"
+            f"👥 Рефералов: {invited} · ✅ Заданий: {done} (живых: {valid})\n"
+            f"{rr_line}\n"
             f"Статус: {'🚫 забанен' if u['banned'] else '✅ активен'}")
     markup = kb(
         [btn("➕ Начислить", cb=f"a:uadd:{uid}", style="success"),
          btn("➖ Списать", cb=f"a:usub:{uid}", style="danger")],
+        [btn("🎁 Награда за реферала", cb=f"a:ucr:{uid}", style="success")],
         [btn("✅ Разбанить" if u["banned"] else "🚫 Забанить", cb=f"a:uban:{uid}", style="primary")],
         [btn("◀️ Назад", cb="a:users")])
     return text, markup
@@ -2341,6 +2478,63 @@ async def a_user_amount(m: Message, state: FSMContext):
     await state.clear()
     text, markup = await user_card(d["uid"])
     await m.answer("✅ Баланс обновлён\n\n" + text, reply_markup=markup)
+
+
+# ---------- Индивидуальная награда за реферала ----------
+@admin.callback_query(F.data.startswith("a:ucr:"))
+async def a_user_custom(c: CallbackQuery, state: FSMContext):
+    uid = int(c.data.split(":")[2])
+    u = await get_user(uid)
+    if not u:
+        return await c.answer("Не найден")
+    await state.set_state(UserAdm.custom)
+    await state.update_data(uid=uid)
+    cur = f"{fmt(u['ref_reward_custom'])} ⭐" if u["ref_reward_custom"] is not None \
+        else f"стандартная ({fmt(await get_setting('ref_reward'))} ⭐)"
+    await edit(c, f"🎁 <b>Награда за реферала для {esc(u['full_name'])}</b>\n\n"
+                  f"Сейчас: {cur}\n\n"
+                  f"Введи, сколько ⭐ он будет получать за каждого приглашённого "
+                  f"(например <code>4</code> или <code>5</code>).\n"
+                  f"Действует на новые начисления; уже выданные не меняются.",
+               kb([btn("♻️ Вернуть стандартную", cb=f"a:ucrx:{uid}", style="danger")],
+                  [btn("✖️ Отмена", cb=f"a:ucrc:{uid}", style="primary")]))
+    await c.answer()
+
+
+@admin.callback_query(F.data.startswith("a:ucrc:"))
+async def a_user_custom_cancel(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    text, markup = await user_card(int(c.data.split(":")[2]))
+    await edit(c, text, markup)
+    await c.answer()
+
+
+@admin.callback_query(F.data.startswith("a:ucrx:"))
+async def a_user_custom_reset(c: CallbackQuery, state: FSMContext):
+    uid = int(c.data.split(":")[2])
+    await run("UPDATE users SET ref_reward_custom=NULL WHERE id=?", (uid,))
+    await state.clear()
+    text, markup = await user_card(uid)
+    await edit(c, text, markup)
+    await c.answer("Стандартная награда ♻️")
+
+
+@admin.message(UserAdm.custom, F.text)
+async def a_user_custom_value(m: Message, state: FSMContext):
+    v = m.text.strip().replace(",", ".")
+    d = await state.get_data()
+    if v == "-":
+        await run("UPDATE users SET ref_reward_custom=NULL WHERE id=?", (d["uid"],))
+    else:
+        try:
+            r = float(v)
+            assert r > 0
+        except Exception:
+            return await m.answer("❌ Введи число больше нуля (или «-» чтобы вернуть стандартную)")
+        await run("UPDATE users SET ref_reward_custom=? WHERE id=?", (r, d["uid"]))
+    await state.clear()
+    text, markup = await user_card(d["uid"])
+    await m.answer("✅ Сохранено\n\n" + text, reply_markup=markup)
 
 
 # ---------- Рассылка ----------
@@ -2418,23 +2612,28 @@ async def a_cast_go(c: CallbackQuery, state: FSMContext):
 # ---------- Настройки ----------
 async def settings_view():
     rr, rt = await get_setting("ref_reward"), int(await get_setting("ref_tasks"))
+    rm = int(await get_setting("ref_min"))
+    pen = await get_setting("unsub_penalty")
     fr = await get_setting("flyer_reward")
     gr = await get_setting("tgrass_reward")
     xr = {k: await get_setting(f"{k}_reward") for k in EXT_NAMES}
     text = (f"⚙️ <b>Настройки</b>\n\n"
             f"💰 Награда за реферала: <b>{fmt(rr)}</b> ⭐\n"
-            f"🎯 Заданий для получения награды: <b>{rt}</b>\n"
-            f"🛰 Награда за задание Flyer: <b>{fmt(fr)}</b> ⭐\n"
-            f"🌿 Награда за задание TGrass: <b>{fmt(gr)}</b> ⭐\n"
-            f"📡 Trafsly: <b>{fmt(xr['trafsly'])}</b> ⭐ · PiarFlow: <b>{fmt(xr['piarflow'])}</b> ⭐ · "
-            f"Traffy: <b>{fmt(xr['traffy'])}</b> ⭐")
+            f"🎯 Спонсоров для награды: <b>{rt}</b> (если выдано меньше — минимум: <b>{rm}</b>)\n"
+            f"😡 Штраф за отписку: <b>{fmt(pen)}</b> ⭐\n"
+            f"🛰 Flyer: <b>{fmt(fr)}</b> ⭐ · 🌿 TGrass: <b>{fmt(gr)}</b> ⭐\n"
+            f"📡 Flowly: <b>{fmt(xr['flowly'])}</b> ⭐ · Traffy: <b>{fmt(xr['traffy'])}</b> ⭐ · "
+            f"PiarFlow: <b>{fmt(xr['piarflow'])}</b> ⭐ · Trafsly: <b>{fmt(xr['trafsly'])}</b> ⭐")
     return text, kb([btn("💰 Награда за реферала", cb="a:set:ref_reward", style="primary")],
-                    [btn("🎯 Кол-во заданий", cb="a:set:ref_tasks", style="primary")],
-                    [btn("🛰 Награда за Flyer-задание", cb="a:set:flyer_reward", style="success")],
-                    [btn("🌿 Награда за TGrass-задание", cb="a:set:tgrass_reward", style="success")],
-                    [btn("📡 Trafsly", cb="a:set:trafsly_reward", style="success"),
+                    [btn("🎯 Кол-во спонсоров", cb="a:set:ref_tasks", style="primary"),
+                     btn("✅ Мин. спонсоров", cb="a:set:ref_min", style="primary")],
+                    [btn("😡 Штраф за отписку", cb="a:set:unsub_penalty", style="danger")],
+                    [btn("🛰 Flyer", cb="a:set:flyer_reward", style="success"),
+                     btn("🌿 TGrass", cb="a:set:tgrass_reward", style="success"),
+                     btn("📡 Flowly", cb="a:set:flowly_reward", style="success")],
+                    [btn("📡 Traffy", cb="a:set:traffy_reward", style="success"),
                      btn("📡 PiarFlow", cb="a:set:piarflow_reward", style="success"),
-                     btn("📡 Traffy", cb="a:set:traffy_reward", style="success")], A_BACK)
+                     btn("📡 Trafsly", cb="a:set:trafsly_reward", style="success")], A_BACK)
 
 
 @admin.callback_query(F.data == "a:set")
@@ -2450,8 +2649,11 @@ async def a_set_key(c: CallbackQuery, state: FSMContext):
     key = c.data.split(":")[2]
     await state.set_state(SetSt.value)
     await state.update_data(key=key)
-    label = {"ref_reward": "награду за реферала (⭐)", "ref_tasks": "количество заданий",
+    label = {"ref_reward": "награду за реферала (⭐)", "ref_tasks": "количество спонсоров",
+             "ref_min": "минимум спонсоров, при котором платим (шт.)",
+             "unsub_penalty": "штраф за отписку (⭐)",
              "flyer_reward": "награду за задание Flyer (⭐)",
+             "flowly_reward": "награду за задание Flowly (⭐)",
              "tgrass_reward": "награду за задание TGrass (⭐)",
              "trafsly_reward": "награду за задание Trafsly (⭐)",
              "piarflow_reward": "награду за задание PiarFlow (⭐)",
@@ -2466,11 +2668,11 @@ async def a_set_value(m: Message, state: FSMContext):
     try:
         v = float(m.text.strip().replace(",", "."))
         assert v > 0
-        if d["key"] == "ref_tasks":
+        if d["key"] in ("ref_tasks", "ref_min"):
             v = int(v)
     except Exception:
         return await m.answer("❌ Введи положительное число")
-    await run("UPDATE settings SET value=? WHERE key=?", (str(v), d["key"]))
+    await run("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (d["key"], str(v)))
     _SET_CACHE.clear()
     await state.clear()
     text, markup = await settings_view()
@@ -2596,12 +2798,21 @@ async def cron(request: Request):
 
 @app.post("/api/hook/{provider}")
 async def provider_hook(provider: str, request: Request, key: str = ""):
-    """Вебхуки отписок: /api/hook/piarflow?key=WEBHOOK_SECRET (так же для trafsly и traffy)."""
+    """Вебхуки отписок: /api/hook/flowly?key=WEBHOOK_SECRET (так же для piarflow, trafsly и traffy)."""
     if not same(key, WEBHOOK_SECRET):
         raise HTTPException(403, "bad key")
-    if provider not in ("piarflow", "trafsly", "traffy"):
+    if provider not in ("piarflow", "trafsly", "traffy", "flowly"):
         raise HTTPException(404, "unknown provider")
-    payload = await request.json()
+    raw = await request.body()
+    if provider == "flowly" and FLOWLY_WEBHOOK_SECRET:
+        # подпись Flowly: sha256=HMAC-SHA256(тело запроса, ключ подписи) в заголовке X-Flowly-Signature
+        exp = "sha256=" + hmac.new(FLOWLY_WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+        if not same(request.headers.get("X-Flowly-Signature", ""), exp):
+            raise HTTPException(403, "bad signature")
+    try:
+        payload = json.loads(raw or b"{}")
+    except Exception:
+        raise HTTPException(400, "bad json")
     bot = make_bot()
     try:
         async with db.session():
