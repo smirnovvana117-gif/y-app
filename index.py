@@ -423,7 +423,7 @@ async def run(sql, args=()):
     return cur
 
 
-SCHEMA_V = "4"  # увеличь, если меняешь таблицы/настройки по умолчанию
+SCHEMA_V = "5"  # увеличь, если меняешь таблицы/настройки по умолчанию
 
 
 async def init_db():
@@ -459,6 +459,7 @@ async def init_db():
         UNIQUE(user_id, provider, ext_id));
     CREATE TABLE IF NOT EXISTS fsm(k TEXT PRIMARY KEY, state TEXT, data TEXT);
     CREATE TABLE IF NOT EXISTS cast_log(ck TEXT, user_id INTEGER, ok INTEGER, PRIMARY KEY(ck, user_id));
+    CREATE TABLE IF NOT EXISTS gate_items(user_id INTEGER, src TEXT, row_id INTEGER, PRIMARY KEY(user_id, src, row_id));
     CREATE VIEW IF NOT EXISTS done_tasks AS
         SELECT user_id, day FROM user_tasks WHERE status='done'
         UNION ALL
@@ -472,6 +473,8 @@ async def init_db():
     if ver and ver["value"] == SCHEMA_V:
         return
     await migrate_db()
+    # окно обязательной подписки: все, кто уже был в базе при обновлении, считаются прошедшими
+    await db.execute("UPDATE users SET gate_ok=1 WHERE gate_ok IS NULL OR gate_ok=0")
     # «живые» выполненные задания (без отписки) — по ним решаем, платить ли за реферала
     await db.executescript("""
     DROP VIEW IF EXISTS done_valid;
@@ -498,7 +501,7 @@ REQUIRED_COLUMNS = {
         "balance": "REAL DEFAULT 0", "earned": "REAL DEFAULT 0", "withdrawn": "REAL DEFAULT 0",
         "ref_paid": "INTEGER DEFAULT 0", "banned": "INTEGER DEFAULT 0", "created_at": "TEXT",
         "ref_penalized": "INTEGER DEFAULT 0", "fresh": "INTEGER DEFAULT 0",
-        "ref_reward_custom": "REAL", "ref_paid_amount": "REAL DEFAULT 0",
+        "ref_reward_custom": "REAL", "ref_paid_amount": "REAL DEFAULT 0", "gate_ok": "INTEGER DEFAULT 0",
     },
     "flyer_tasks": {"penalized": "INTEGER DEFAULT 0", "checked_at": "TEXT"},
     "tgrass_tasks": {"penalized": "INTEGER DEFAULT 0", "checked_at": "TEXT"},
@@ -1467,6 +1470,290 @@ def ext_task_kb(et) -> InlineKeyboardMarkup:
     )
 
 
+# ============================== ОБЯЗАТЕЛЬНАЯ ПОДПИСКА (окно при /start) ==============================
+GATE_MAX = 8                 # максимум спонсоров в окне подписки
+GATE_PAYS_REWARD = False     # True — платить обычную награду за каждое задание из окна подписки
+GATE_TEXT = ('🤖 Для использования бота подпишись на каналы ниже\n\n'
+             '🔻 После подписки нажимай на кнопку "Проверить подписку"')
+GATE_TABLES = {"flyer": "flyer_tasks", "tgrass": "tgrass_tasks", "ext": "ext_tasks"}
+
+
+def gate_link(src: str, row) -> str:
+    return row["url"] if src == "flyer" else row["link"]
+
+
+def gate_reward_key(src: str, row) -> str:
+    return {"flyer": "flyer_reward", "tgrass": "tgrass_reward"}.get(src) or f"{row['provider']}_reward"
+
+
+async def g_flyer(tgu, lang, n):
+    if not FLYER_KEY:
+        return []
+    data = await flyer_call("get_tasks", {"user_id": tgu.id, "language_code": lang or "ru",
+                                          "limit": max(1, min(n, FLYER_LIMIT))})
+    out = []
+    for t in data.get("result") or []:
+        if len(out) >= n:
+            break
+        if t.get("status") != "incomplete" or not t.get("links"):
+            continue
+        row = await fetchone("SELECT * FROM flyer_tasks WHERE user_id=? AND signature=?", (tgu.id, t["signature"]))
+        if row and row["status"] in ("done", "skip"):
+            continue
+        if not row:
+            await run("INSERT OR IGNORE INTO flyer_tasks(user_id,signature,task,url,status) VALUES(?,?,?,?,'shown')",
+                      (tgu.id, t["signature"], t.get("task", ""), t["links"][0]))
+            row = await fetchone("SELECT * FROM flyer_tasks WHERE user_id=? AND signature=?", (tgu.id, t["signature"]))
+        out.append(("flyer", row))
+    return out
+
+
+async def g_flowly(tgu, lang, n):
+    if not FLOWLY_KEY:
+        return []
+    code, data = await ext_post(f"{FLOWLY_URL}/offers", _flowly_headers(),
+                                {"tg_user_id": tgu.id, "lang": tgu.language_code or "ru",
+                                 "is_premium": bool(tgu.is_premium), "offers_limit": n})
+    if code != 200:
+        return []
+    out = []
+    for o in data.get("offers") or []:
+        if len(out) >= n:
+            break
+        if o.get("subscribed") or not o.get("link") or o.get("offer_id") is None:
+            continue
+        row = await ext_get_or_create(tgu.id, "flowly", o["offer_id"], o["link"],
+                                      o.get("type") or guess_kind(o["link"]))
+        if row:
+            out.append(("ext", row))
+    return out
+
+
+async def g_traffy(tgu, lang, n):
+    if not TRAFFY_KEY:
+        return []
+    payload = {"telegram_id": tgu.id, "limit": n, "first_name": tgu.first_name or "",
+               "language_code": tgu.language_code or "ru"}
+    if tgu.username:
+        payload["username"] = tgu.username
+    code, data = await ext_post(f"{TRAFFY_URL}/tasks", _traffy_headers(), payload)
+    if code != 200 or not data.get("ok"):
+        return []
+    out = []
+    for t in data.get("tasks") or []:
+        if len(out) >= n:
+            break
+        if not t.get("assignment_id") or not t.get("target_link"):
+            continue
+        row = await ext_get_or_create(tgu.id, "traffy", t["assignment_id"], t["target_link"],
+                                      guess_kind(t["target_link"]))
+        if row:
+            out.append(("ext", row))
+    return out
+
+
+async def g_tgrass(tgu, lang, n):
+    if not TGRASS_KEY:
+        return []
+    data = await tgrass_offers(tgu)
+    if data.get("error"):
+        return []
+    out = []
+    for o in data.get("offers") or []:
+        if len(out) >= n:
+            break
+        if o.get("subscribed") or not o.get("link") or o.get("offer_id") is None:
+            continue
+        row = await fetchone("SELECT * FROM tgrass_tasks WHERE user_id=? AND offer_id=?", (tgu.id, o["offer_id"]))
+        if row and row["status"] in ("done", "skip"):
+            continue
+        if not row:
+            await run("INSERT OR IGNORE INTO tgrass_tasks(user_id,offer_id,link,kind,status) VALUES(?,?,?,?,'shown')",
+                      (tgu.id, o["offer_id"], o["link"], o.get("type", "")))
+            row = await fetchone("SELECT * FROM tgrass_tasks WHERE user_id=? AND offer_id=?", (tgu.id, o["offer_id"]))
+        out.append(("tgrass", row))
+    return out
+
+
+async def g_piarflow(tgu, lang, n):
+    if not PIARFLOW_KEY:
+        return []
+    payload = {"user_id": tgu.id, "chat_id": tgu.id, "max_sponsors": min(n, 5)}
+    if PIARFLOW_NO_TOKEN:
+        payload.update({"first_name": tgu.first_name, "username": tgu.username,
+                        "language_code": tgu.language_code, "bio": None})
+    code, data = await ext_post(f"{PIARFLOW_URL}/sponsors", _piar_headers(), payload)
+    if code != 200:
+        return []
+    out = []
+    for sp in data.get("sponsors") or []:
+        if len(out) >= n:
+            break
+        if sp.get("status") != "unsubscribed" or not sp.get("link"):
+            continue
+        row = await ext_get_or_create(tgu.id, "piarflow", sp["link"], sp["link"], guess_kind(sp["link"]))
+        if row:
+            out.append(("ext", row))
+    return out
+
+
+async def g_trafsly(tgu, lang, n):
+    if not TRAFSLY_KEY:
+        return []
+    payload = {"user_id": tgu.id, "first_name": tgu.first_name or "", "language_code": tgu.language_code or "ru",
+               "is_premium": bool(tgu.is_premium)}
+    if tgu.username:
+        payload["username"] = tgu.username
+    seen = await ext_seen_links(tgu.id, "trafsly")
+    if seen:
+        payload["exclude_links"] = seen
+    code, data = await ext_post(f"{TRAFSLY_URL}/get-sponsors", _trafsly_headers(), payload)
+    if code != 200:
+        return []
+    out = []
+    for sp in data.get("sponsors") or []:
+        if len(out) >= n:
+            break
+        if sp.get("status") != "unsubscribed" or not sp.get("link") or sp.get("ads_id") is None:
+            continue
+        row = await ext_get_or_create(tgu.id, "trafsly", sp["ads_id"], sp["link"],
+                                      sp.get("type") or guess_kind(sp["link"]))
+        if row:
+            out.append(("ext", row))
+    return out
+
+
+async def gate_collect(tgu, lang, limit: int = GATE_MAX):
+    """Набирает до `limit` спонсоров строго по порядку: Flyer → Flowly → Traffy → TGrass → PiarFlow → Trafsly."""
+    items, links = [], set()
+    for fn in (g_flyer, g_flowly, g_traffy, g_tgrass, g_piarflow, g_trafsly):
+        n = limit - len(items)
+        if n <= 0:
+            break
+        try:
+            got = await fn(tgu, lang, n)
+        except Exception:
+            logging.exception("gate collect %s", fn.__name__)
+            continue
+        for src, row in got:
+            lk = gate_link(src, row)
+            if lk in links:
+                continue
+            links.add(lk)
+            items.append((src, row))
+    return items[:limit]
+
+
+async def gate_pending(uid: int):
+    out = []
+    for g in await fetchall("SELECT * FROM gate_items WHERE user_id=? ORDER BY rowid", (uid,)):
+        r = await fetchone(f"SELECT * FROM {GATE_TABLES[g['src']]} WHERE id=?", (g["row_id"],))
+        if r and r["status"] == "shown":
+            out.append((g["src"], r))
+    return out
+
+
+def gate_kb(items) -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for src, r in items:
+        row.append(btn("✉️ Подписаться", url=gate_link(src, r)))
+        if len(row) == 2:  # по две кнопки в ряд
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([btn("Проверить подписку", cb="gate:check", style="success")])
+    return kb(*rows)
+
+
+async def gate_show(bot: Bot, tgu, chat_id: int) -> bool:
+    """Показывает окно подписки. Возвращает False, если спонсоров нет (тогда пускаем в бота)."""
+    items = await gate_pending(tgu.id)
+    if not items:
+        items = await gate_collect(tgu, tgu.language_code)
+        await db.execute("DELETE FROM gate_items WHERE user_id=?", (tgu.id,))
+        for src, r in items:
+            await db.execute("INSERT OR IGNORE INTO gate_items(user_id,src,row_id) VALUES(?,?,?)",
+                             (tgu.id, src, r["id"]))
+        await db.commit()
+    if not items:
+        await run("UPDATE users SET gate_ok=1 WHERE id=?", (tgu.id,))
+        return False
+    await bot.send_message(chat_id, GATE_TEXT, reply_markup=gate_kb(items))
+    return True
+
+
+async def gate_mark(src: str, row, status: str) -> int:
+    cur = await db.execute(f"UPDATE {GATE_TABLES[src]} SET status=?, day=? WHERE id=? AND status='shown'",
+                           (status, today(), row["id"]))
+    await db.commit()
+    return cur.rowcount
+
+
+async def gate_check_one(src: str, row, uid: int) -> str:
+    """-> ok / no / gone / wait"""
+    if src == "flyer":
+        st = (await flyer_call("check_task", {"signature": row["signature"]})).get("result")
+        if st in ("complete", "waiting"):
+            return "ok"
+        if st == "unavailable":
+            return "gone"
+        return "no" if st in ("incomplete", "abort") else "wait"
+    if src == "tgrass":
+        res = await tgrass_call("check", {"tg_user_id": uid, "offer_id": row["offer_id"]})
+        st = res.get("status")
+        if st == "subscribed":
+            return "gone" if res.get("is_fake") else "ok"
+        if st in ("offer_expired", "offer_not_found"):
+            return "gone"
+        return "no" if st == "not_subscribed" else "wait"
+    st, _ = await EXT_CHECK[row["provider"]](uid, row)
+    if st == "ok":
+        return "ok"
+    if st in ("no", "unsub", "refresh"):
+        return "no"
+    return "gone" if st == "gone" else "wait"
+
+
+async def enter_bot(target: Message, tgu):
+    """Нижнее меню + реферальный текст + первое задание (после прохождения окна подписки или сразу)."""
+    u = await get_user(tgu.id)
+    try:
+        await target.answer("\u2800", reply_markup=main_kb(tgu.id))
+    except TelegramBadRequest:
+        await target.answer("⭐", reply_markup=main_kb(tgu.id))
+    await target.answer(await ref_text(u), reply_markup=ref_kb(u))
+    await send_task(target, tgu.id, lang=tgu.language_code, tgu=tgu)
+
+
+class GateMiddleware(BaseMiddleware):
+    """Пока пользователь не прошёл окно подписки, всё, кроме /start, ведёт обратно на окно."""
+
+    async def __call__(self, handler, event, data):
+        tg = data.get("event_from_user")
+        if not tg or tg.id in ADMIN_IDS:
+            return await handler(event, data)
+        if isinstance(event, Message):
+            cmd = ((event.text or "").split() or [""])[0].split("@")[0]
+            if cmd in ("/start", "/e"):
+                return await handler(event, data)
+        if isinstance(event, CallbackQuery) and (event.data or "").startswith("gate:"):
+            return await handler(event, data)
+        row = await fetchone("SELECT gate_ok FROM users WHERE id=?", (tg.id,))
+        if row is None:
+            await get_or_create_user(tg)
+            row = {"gate_ok": 0}
+        if row["gate_ok"]:
+            return await handler(event, data)
+        msg = event if isinstance(event, Message) else event.message
+        if isinstance(event, CallbackQuery):
+            await event.answer()
+        if msg is not None:
+            if not await gate_show(data["bot"], tg, msg.chat.id):
+                return await handler(event, data)  # спонсоров нет — пускаем
+        return None
+
+
 # ============================== FSM ==============================
 class PromoSt(StatesGroup):
     code = State()
@@ -1538,9 +1825,10 @@ async def cmd_start(m: Message, command: CommandObject, state: FSMContext):
                 f"Ты получишь {rr} {STAR}, как только он подпишется на {need} спонсоров")
         except Exception:
             pass
-    await set_menu(m)
-    await m.answer(await ref_text(u), reply_markup=ref_kb(u))
-    await send_task(m, u["id"], lang=m.from_user.language_code, tgu=m.from_user)
+    if not u["gate_ok"] and m.from_user.id not in ADMIN_IDS:
+        if await gate_show(m.bot, m.from_user, m.chat.id):
+            return  # ждём подписки на спонсоров
+    await enter_bot(m, m.from_user)
 
 
 @user.message(Command("e"))
@@ -1551,8 +1839,8 @@ async def cmd_reset(m: Message, state: FSMContext):
     u, _ = await get_or_create_user(m.from_user)
     uid = u["id"]
     await db.execute("UPDATE users SET balance=0, earned=0, withdrawn=0, referrer_id=NULL, ref_paid=0, "
-                     "ref_penalized=0, ref_paid_amount=0, fresh=1 WHERE id=?", (uid,))
-    for table in ("user_tasks", "flyer_tasks", "tgrass_tasks", "ext_tasks", "promo_uses"):
+                     "ref_penalized=0, ref_paid_amount=0, gate_ok=0, fresh=1 WHERE id=?", (uid,))
+    for table in ("user_tasks", "flyer_tasks", "tgrass_tasks", "ext_tasks", "promo_uses", "gate_items"):
         await db.execute(f"DELETE FROM {table} WHERE user_id=?", (uid,))
     await db.commit()
     await m.answer("♻️ Аккаунт сброшен: заработок, задания и привязка к рефереру обнулены.\n"
@@ -1778,6 +2066,50 @@ async def ext_skip(c: CallbackQuery):
               (today(), int(c.data[3:]), c.from_user.id))
     await c.answer("Задание пропущено")
     await send_task(c.message, c.from_user.id, edit=True, lang=c.from_user.language_code, tgu=c.from_user)
+
+
+# ---------- Окно подписки: «Проверить подписку» ----------
+@user.callback_query(F.data == "gate:check")
+async def gate_check(c: CallbackQuery):
+    uid = c.from_user.id
+    u = await get_user(uid)
+    if u and u["gate_ok"]:
+        return await c.answer()
+    items = await gate_pending(uid)
+    results = await asyncio.gather(*(gate_check_one(src, r, uid) for src, r in items), return_exceptions=True)
+    no = 0
+    for (src, r), st in zip(items, results):
+        if isinstance(st, BaseException):
+            st = "wait"
+        if st == "ok":
+            if await gate_mark(src, r, "done") and GATE_PAYS_REWARD:
+                await credit(uid, await get_setting(gate_reward_key(src, r)))
+        elif st == "gone":
+            await gate_mark(src, r, "skip")
+        elif st == "no":
+            no += 1
+    await try_pay_referrer(c.bot, uid)
+    remaining = await gate_pending(uid)
+    if remaining:
+        await c.answer("❌ Ты подписался не на все каналы. Подпишись и нажми «Проверить подписку» ещё раз"
+                       if no else "⚠️ Не удалось проверить подписку, попробуй через минуту", show_alert=True)
+        try:
+            await c.message.edit_text(GATE_TEXT, reply_markup=gate_kb(remaining))
+        except TelegramBadRequest:
+            pass
+        return
+    await db.execute("UPDATE users SET gate_ok=1 WHERE id=?", (uid,))
+    await db.execute("DELETE FROM gate_items WHERE user_id=?", (uid,))
+    await db.commit()
+    days = int(await get_setting("unsub_days"))
+    text = (f"{CHECK_E} Спасибо за подписку!\n\n{WARN_E} Не отписывайся от каналов в течение как минимум {days} дней. "
+            f"В противном случае, ты получишь штраф или блокировку аккаунта.")
+    try:
+        await c.message.edit_text(text, reply_markup=None)
+    except TelegramBadRequest:
+        await c.message.answer(text)
+    await c.answer()
+    await enter_bot(c.message, c.from_user)
 
 
 # ---------- Профиль / Топ ----------
@@ -2715,6 +3047,8 @@ app.add_middleware(PathFix)
 dp = Dispatcher(storage=TursoStorage())
 dp.message.middleware(BanMiddleware())
 dp.callback_query.middleware(BanMiddleware())
+dp.message.middleware(GateMiddleware())
+dp.callback_query.middleware(GateMiddleware())
 dp.include_router(admin)
 dp.include_router(user)
 
