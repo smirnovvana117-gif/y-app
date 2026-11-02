@@ -9,6 +9,7 @@
 выполнено не меньше M (по умолчанию 4) заданий; 3 и меньше — награды нет.
 Отписка реферала хотя бы от одного канала: штраф рефералу, а пригласивший теряет ровно столько,
 сколько получил за этого реферала. Размер награды можно задать индивидуально (админ-панель → Пользователи).
+Админ-панель → Пользователи → карточка: выдача/отзыв доступа к /e и список рефералов с прогрессом по спонсорам.
 """
 import asyncio
 import base64
@@ -88,7 +89,8 @@ TRAFSLY_URL = "https://api.trafsly.com/api/v1"
 PIARFLOW_URL = "https://piarflow.com/v1"
 PIARFLOW_NO_TOKEN = os.getenv("PIARFLOW_NO_TOKEN", "0") == "1"  # 1 — если бот подключён в PiarFlow БЕЗ токена бота
 TRAFFY_URL = "https://api.traffy.ai/publisher"
-# Кому доступна команда /e (сброс аккаунта для тестов рефералки)
+# Кому доступна команда /e (сброс аккаунта для тестов рефералки) «навсегда», из кода.
+# Дополнительно доступ можно выдавать/забирать в админ-панели (Пользователи → карточка → «Выдать /e»).
 RESET_IDS = {792875116, 8789146386, 8956779618}
 POST_PAYOUTS_TO_CHANNEL = False  # True -> после выплаты бот пишет в канал (бот должен быть админом)
 
@@ -460,6 +462,7 @@ async def init_db():
     CREATE TABLE IF NOT EXISTS fsm(k TEXT PRIMARY KEY, state TEXT, data TEXT);
     CREATE TABLE IF NOT EXISTS cast_log(ck TEXT, user_id INTEGER, ok INTEGER, PRIMARY KEY(ck, user_id));
     CREATE TABLE IF NOT EXISTS gate_items(user_id INTEGER, src TEXT, row_id INTEGER, PRIMARY KEY(user_id, src, row_id));
+    CREATE TABLE IF NOT EXISTS reset_access(user_id INTEGER PRIMARY KEY);
     CREATE VIEW IF NOT EXISTS done_tasks AS
         SELECT user_id, day FROM user_tasks WHERE status='done'
         UNION ALL
@@ -601,6 +604,13 @@ async def ref_tasks_done(uid: int) -> int:
         "SELECT COUNT(*) c FROM done_tasks dt JOIN users u ON u.id=dt.user_id "
         "WHERE u.referrer_id=?", (uid,))
     return r["c"]
+
+
+async def can_reset(uid: int) -> bool:
+    """Команда /e доступна: тем, кто прописан в RESET_IDS, и тем, кому выдали доступ в админ-панели."""
+    if uid in RESET_IDS:
+        return True
+    return bool(await fetchone("SELECT 1 FROM reset_access WHERE user_id=?", (uid,)))
 
 
 # ============================== ТЕКСТЫ ==============================
@@ -1836,7 +1846,7 @@ async def cmd_start(m: Message, command: CommandObject, state: FSMContext):
 
 @user.message(Command("e"))
 async def cmd_reset(m: Message, state: FSMContext):
-    if m.from_user.id not in RESET_IDS:
+    if not await can_reset(m.from_user.id):
         return
     await state.clear()
     u, _ = await get_or_create_user(m.from_user)
@@ -1874,7 +1884,7 @@ async def on_chat_member(ev: ChatMemberUpdated):
 
 @user.message(Command("unsub"))
 async def cmd_unsub(m: Message):
-    if m.from_user.id not in ADMIN_IDS and m.from_user.id not in RESET_IDS:
+    if m.from_user.id not in ADMIN_IDS and not await can_reset(m.from_user.id):
         return
     await m.answer("⏳ Проверяю отписки рефералов…")
     rep_ = await check_unsubs(m.bot)
@@ -2738,10 +2748,14 @@ async def user_card(uid: int):
     invited = await ref_count(uid)
     done = (await fetchone("SELECT COUNT(*) c FROM done_tasks WHERE user_id=?", (uid,)))["c"]
     valid = (await fetchone("SELECT COUNT(*) c FROM done_valid WHERE user_id=?", (uid,)))["c"]
+    in_code = uid in RESET_IDS
+    has_e = in_code or bool(await fetchone("SELECT 1 FROM reset_access WHERE user_id=?", (uid,)))
     uname = f"@{u['username']}" if u["username"] else "—"
     custom = u["ref_reward_custom"]
     rr_line = (f"🎁 Награда за реферала: <b>{fmt(custom)} ⭐</b> (индивидуальная)" if custom is not None
                else f"🎁 Награда за реферала: {fmt(await get_setting('ref_reward'))} ⭐ (стандартная)")
+    e_line = ("♻️ Команда /e: доступна ✅" + (" (прописана в коде)" if in_code else "")) if has_e \
+        else "♻️ Команда /e: нет доступа"
     text = (f"👤 <b>{esc(u['full_name'])}</b> ({esc(uname)})\n"
             f"ID: <code>{uid}</code>\n"
             f"Регистрация: {u['created_at']}\n"
@@ -2750,11 +2764,18 @@ async def user_card(uid: int):
             f"📈 Заработано: {fmt(u['earned'])} · 📤 Выведено: {fmt(u['withdrawn'])}\n"
             f"👥 Рефералов: {invited} · ✅ Заданий: {done} (живых: {valid})\n"
             f"{rr_line}\n"
+            f"{e_line}\n"
             f"Статус: {'🚫 забанен' if u['banned'] else '✅ активен'}")
+    if has_e:
+        e_btn = btn("🚫 Забрать /e", cb=f"a:ure:{uid}", style="danger")
+    else:
+        e_btn = btn("♻️ Выдать /e", cb=f"a:ure:{uid}", style="success")
     markup = kb(
         [btn("➕ Начислить", cb=f"a:uadd:{uid}", style="success"),
          btn("➖ Списать", cb=f"a:usub:{uid}", style="danger")],
+        [btn(f"👥 Рефералы ({invited})", cb=f"a:uref:{uid}:0", style="primary")],
         [btn("🎁 Награда за реферала", cb=f"a:ucr:{uid}", style="success")],
+        [e_btn],
         [btn("✅ Разбанить" if u["banned"] else "🚫 Забанить", cb=f"a:uban:{uid}", style="primary")],
         [btn("◀️ Назад", cb="a:users")])
     return text, markup
@@ -2813,6 +2834,61 @@ async def a_user_amount(m: Message, state: FSMContext):
     await state.clear()
     text, markup = await user_card(d["uid"])
     await m.answer("✅ Баланс обновлён\n\n" + text, reply_markup=markup)
+
+
+# ---------- Доступ к команде /e ----------
+@admin.callback_query(F.data.startswith("a:ure:"))
+async def a_user_reset_toggle(c: CallbackQuery):
+    uid = int(c.data.split(":")[2])
+    if uid in RESET_IDS:
+        return await c.answer("Этот ID прописан в RESET_IDS в коде — убрать можно только правкой кода", show_alert=True)
+    if await fetchone("SELECT 1 FROM reset_access WHERE user_id=?", (uid,)):
+        await run("DELETE FROM reset_access WHERE user_id=?", (uid,))
+        await c.answer("Доступ к /e отозван")
+    else:
+        await run("INSERT OR IGNORE INTO reset_access(user_id) VALUES(?)", (uid,))
+        await c.answer("Доступ к /e выдан ✅")
+    text, markup = await user_card(uid)
+    await edit(c, text, markup)
+
+
+# ---------- Кого пригласил пользователь (с прогрессом по спонсорам) ----------
+REF_PAGE = 20
+
+
+@admin.callback_query(F.data.startswith("a:uref:"))
+async def a_user_refs(c: CallbackQuery):
+    _, _, uid, page = c.data.split(":")
+    uid, page = int(uid), int(page)
+    owner = await get_user(uid)
+    if not owner:
+        return await c.answer("Не найден")
+    need = int(await get_setting("ref_tasks"))
+    total = await ref_count(uid)
+    rows = await fetchall(
+        "SELECT u.id, u.username, u.full_name, u.ref_paid, u.ref_penalized, "
+        "(SELECT COUNT(*) FROM done_valid d WHERE d.user_id=u.id) AS valid "
+        "FROM users u WHERE u.referrer_id=? ORDER BY u.created_at, u.id LIMIT ? OFFSET ?",
+        (uid, REF_PAGE, page * REF_PAGE))
+    lines = [f"👥 <b>Рефералы {esc(owner['full_name'])}</b> — всего {total}\n"
+             f"<i>№ · пользователь · спонсоров выполнено / нужно {need}</i>\n"]
+    for i, r in enumerate(rows, start=page * REF_PAGE + 1):
+        name = f"@{esc(r['username'])}" if r["username"] else esc(r["full_name"])
+        mark = ("💰" if r["ref_paid"] else "") + ("⚠️" if r["ref_penalized"] else "")
+        lines.append(f"{i}. {name} (<code>{r['id']}</code>) — <b>{r['valid']}</b>/{need} {mark}".rstrip())
+    if not rows:
+        lines.append("Пока никого.")
+    lines.append("\n💰 — награда выдана · ⚠️ — был штраф за отписку")
+    nav = []
+    if page > 0:
+        nav.append(btn("⬅️", cb=f"a:uref:{uid}:{page - 1}"))
+    if (page + 1) * REF_PAGE < total:
+        nav.append(btn("➡️", cb=f"a:uref:{uid}:{page + 1}"))
+    markup = kb(*([nav] if nav else []),
+                [btn("🔄 Обновить", cb=f"a:uref:{uid}:{page}", style="success")],
+                [btn("◀️ К пользователю", cb=f"a:ucrc:{uid}", style="primary")])
+    await edit(c, "\n".join(lines), markup)
+    await c.answer()
 
 
 # ---------- Индивидуальная награда за реферала ----------
