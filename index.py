@@ -3,7 +3,8 @@
 Реферальный бот со звёздами — версия для Vercel (webhook + хранение базы в Redis/Upstash).
 Работает через api/index.py (FastAPI). Локально не запускается (нет polling).
 
-Порядок спонсоров: 1 Flyer, 2 Flowly, 3 Traffy, 4 TGrass, 5 PiarFlow, 6 Trafsly.
+Порядок спонсоров в ОКНЕ ПОДПИСКИ (/start): 1 Flyer, 2 Flowly, 3 Traffy, 4 TGrass, 5 PiarFlow, 6 Trafsly.
+Раздел «💎 Задание» (и задания после окна подписки): только Flowly и TGrass (+ свои задания админа в последнюю очередь).
 Награда за реферала: реферал выполняет задания спонсоров. Если выполнено N (по умолчанию 8) —
 награда сразу. Если сервисы выдали меньше (спонсоры закончились), награда платится только когда
 выполнено не меньше M (по умолчанию 4) заданий; 3 и меньше — награды нет.
@@ -13,6 +14,7 @@
 Админ-панель → Пользователи → карточка: выдача/отзыв доступа к /e и список рефералов с прогрессом по спонсорам.
 
 ИЗМЕНЕНИЯ ЭТОЙ ВЕРСИИ:
+ • Окно подписки берёт спонсоров у всех сервисов, а «💎 Задание» выдаёт задания только от TGrass и Flowly.
  • Админ-панель → «📥 Импорт пользователей»: загрузка старых пользователей (файл/список ID или прямо из старой
    базы Turso) в текущую базу Redis — чтобы рассылка доходила до всех.
  • Проверка подписки на каналы, добавленные админом: учитывается статус restricted, числовой chat_id,
@@ -745,22 +747,21 @@ async def next_task(uid: int):
         "(SELECT 1 FROM user_tasks u WHERE u.user_id=? AND u.task_id=t.id) ORDER BY id LIMIT 1", (uid,))
 
 
+# Сервисы, которые выдают задания в разделе «💎 Задание» (в окне подписки работают все сервисы)
+TASK_PROVIDERS_EXT = ("flowly",)   # из таблицы ext_tasks
+TASK_USE_TGRASS = True
+
+
 async def send_task(target: Message, uid: int, edit: bool = False, lang: str = None, tgu=None):
-    FLYER_REWARD_CACHE["v"] = await get_setting("flyer_reward")
     TGRASS_REWARD_CACHE["v"] = await get_setting("tgrass_reward")
-    # порядок спонсоров: 1 Flyer, 2 Flowly, 3 Traffy, 4 TGrass, 5 PiarFlow, 6 Trafsly
-    ft = await next_flyer_task(uid, lang)
-    et = None if ft else await next_ext_task(tgu, ("flowly", "traffy"))
-    gt = None if (ft or et) else await next_tgrass_task(tgu)
-    if not (ft or et or gt):
-        et = await next_ext_task(tgu, ("piarflow", "trafsly"))
-    if not (ft or et or gt):
+    # в разделе «Задание»: сначала Flowly, затем TGrass (остальные сервисы — только в окне подписки)
+    et = await next_ext_task(tgu, TASK_PROVIDERS_EXT)
+    gt = None if et else (await next_tgrass_task(tgu) if TASK_USE_TGRASS else None)
+    if not (et or gt):
         # спонсоры закончились: платим рефереру, если реферал выполнил не меньше ref_min заданий
         await try_pay_referrer(target.bot, uid, exhausted=True)
-    t = None if (ft or gt or et) else await next_task(uid)  # свои задания админа — в последнюю очередь
-    if ft:
-        text, markup = flyer_task_text(ft), flyer_task_kb(ft)
-    elif gt:
+    t = None if (gt or et) else await next_task(uid)  # свои задания админа — в последнюю очередь
+    if gt:
         text, markup = tgrass_task_text(gt), tgrass_task_kb(gt)
     elif et:
         text, markup = await ext_task_text(et), ext_task_kb(et)
@@ -2007,7 +2008,7 @@ async def task_skip(c: CallbackQuery):
     await send_task(c.message, c.from_user.id, edit=True, lang=c.from_user.language_code, tgu=c.from_user)
 
 
-# ---------- Задания Flyer ----------
+# ---------- Задания Flyer (старые сообщения; в разделе «Задание» Flyer больше не выдаётся) ----------
 @user.callback_query(F.data.startswith("fc:"))
 async def flyer_confirm(c: CallbackQuery):
     lang = c.from_user.language_code
@@ -2815,7 +2816,8 @@ async def tasks_view():
         kind = "📢" if t["kind"] == "channel" else "🤖"
         btns.append([btn(f"{icon} #{t['id']} {kind} +{fmt(t['reward'])}⭐ · выполнили: {done}", cb=f"a:tv:{t['id']}")])
     text = "📋 <b>Задания</b>\n\n" + (f"Всего своих: {len(rows)}. Нажми на задание, чтобы управлять 👇" if rows else "Своих заданий пока нет.") + \
-        "\n\n<b>Порядок спонсоров:</b> Flyer → Flowly → Traffy → TGrass → PiarFlow → Trafsly" + \
+        "\n\n<b>Окно подписки (/start):</b> Flyer → Flowly → Traffy → TGrass → PiarFlow → Trafsly" + \
+        "\n<b>Раздел «💎 Задание»:</b> Flowly → TGrass → свои задания" + \
         f"\n🛰 Flyer: {'подключён ✅' if FLYER_KEY else 'не подключён (нет FLYER_KEY)'}" + \
         f"\n📡 Flowly: {'✅' if FLOWLY_KEY else '—'} · Traffy: {'✅' if TRAFFY_KEY else '—'}" + \
         f"\n🌿 TGrass: {'✅' if TGRASS_KEY else '—'} · PiarFlow: {'✅' if PIARFLOW_KEY else '—'} · Trafsly: {'✅' if TRAFSLY_KEY else '—'}" + \
