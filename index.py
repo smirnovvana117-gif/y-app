@@ -2599,6 +2599,88 @@ async def import_user_rows(rows: list) -> tuple:
     return added, len(rows) - added
 
 
+# ---- импорт из старых ключей user:<ID> (HASH) в этом же Redis ----
+async def redis_pipeline(cmds: list) -> list:
+    async with http.post(f"{REDIS_URL}/pipeline", json=[[str(x) for x in c] for c in cmds],
+                         headers={"Authorization": f"Bearer {REDIS_TOKEN}"},
+                         timeout=aiohttp.ClientTimeout(total=30)) as r:
+        data = await r.json(content_type=None)
+        if r.status != 200:
+            raise RuntimeError(f"Redis HTTP {r.status}: {str(data)[:200]}")
+    return [x.get("result") if isinstance(x, dict) else x for x in data]
+
+
+def _fl(v):
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _old_user_row(uid: int, h):
+    if isinstance(h, list):
+        h = dict(zip(h[0::2], h[1::2]))
+    if not isinstance(h, dict) or not h:
+        return None
+    row = {"id": uid, "full_name": h.get("name") or None,
+           "username": (h.get("username") or "").lstrip("@") or None}
+    bal = _fl(h.get("balance"))
+    if bal is not None:
+        row["balance"] = bal
+    ts = _fl(h.get("join_ts"))
+    if ts:
+        try:
+            row["created_at"] = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pass
+    return row
+
+
+async def import_old_redis(budget: float = 40):
+    """Переносит пользователей из ключей user:<ID> в базу бота. Повторный запуск безопасен."""
+    deadline = time.monotonic() + budget
+    keys, cursor = [], "0"
+    while True:
+        res = await redis_cmd("SCAN", cursor, "MATCH", "user:*", "COUNT", 1000, retries=3)
+        cursor = str(res[0])
+        keys += res[1]
+        if cursor == "0":
+            break
+        if time.monotonic() > deadline:
+            raise RuntimeError("перебор ключей занял слишком много времени")
+    ids = sorted({int(m.group(1)) for k in keys if (m := re.fullmatch(r"user:(\d+)", k))})
+    added = done = 0
+    partial = False
+    for i in range(0, len(ids), 500):
+        if time.monotonic() > deadline:
+            partial = True
+            break
+        part = ids[i:i + 500]
+        res = await redis_pipeline([["HGETALL", f"user:{u}"] for u in part])
+        rows = [r for r in (_old_user_row(u, h) for u, h in zip(part, res)) if r]
+        a, _ = await import_user_rows(rows)
+        added += a
+        done += len(part)
+    return len(ids), done, added, partial
+
+
+@admin.callback_query(F.data == "a:imp_redis")
+async def a_import_redis(c: CallbackQuery, state: FSMContext):
+    await c.answer("Импортирую…")
+    await edit(c, "⏳ Переношу старых пользователей из ключей <code>user:*</code>…")
+    try:
+        total, done, added, partial = await import_old_redis()
+    except Exception as ex:
+        logging.exception("import old redis")
+        return await edit(c, f"❌ Ошибка импорта:\n<code>{esc(str(ex)[:500])}</code>", kb(A_BACK))
+    n = (await fetchone("SELECT COUNT(*) c FROM users"))["c"]
+    await state.clear()
+    tail = "\n\n⏳ Не успел всё за один раз — нажми кнопку импорта ещё раз." if partial else ""
+    await edit(c, f"✅ <b>Импорт из старых ключей</b>\n\nНайдено user:*: {total}\nОбработано: {done}\n"
+                  f"Добавлено новых: <b>{added}</b>\nВсего в базе теперь: <b>{n}</b>{tail}",
+               kb([btn("🔁 Ещё раз", cb="a:imp_redis", style="success")], A_BACK))
+
+
 @admin.callback_query(F.data == "a:imp")
 async def a_import(c: CallbackQuery, state: FSMContext):
     total = (await fetchone("SELECT COUNT(*) c FROM users"))["c"]
@@ -2607,12 +2689,14 @@ async def a_import(c: CallbackQuery, state: FSMContext):
     await edit(c,
                f"📥 <b>Импорт пользователей</b>\n\n"
                f"Сейчас в базе: <b>{total}</b>. Рассылка идёт только тем, кто есть в базе.\n\n"
+               f"<b>Способ 0 (твой случай).</b> Из старых ключей <code>user:ID</code> в этом же Redis — кнопка ниже.\n\n"
                f"<b>Способ 1.</b> Из старой базы Turso (с балансами и рефералами): {turso}\n\n"
                f"<b>Способ 2.</b> Пришли сюда <b>файл .txt/.csv/.json</b> со списком Telegram ID "
                f"(или просто текстом, через пробел/запятую/с новой строки). Берутся все числа от 5 цифр, "
                f"поэтому в файле должны быть только ID.\n\n"
                f"Уже существующие пользователи не перезаписываются.",
-               kb([btn("📡 Импорт из Turso", cb="a:imp_turso", style="success")], A_BACK))
+               kb([btn("🗄 Импорт из старых ключей user:*", cb="a:imp_redis", style="success")],
+                  [btn("📡 Импорт из Turso", cb="a:imp_turso", style="primary")], A_BACK))
     await c.answer()
 
 
