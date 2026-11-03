@@ -7,9 +7,19 @@
 Награда за реферала: реферал выполняет задания спонсоров. Если выполнено N (по умолчанию 8) —
 награда сразу. Если сервисы выдали меньше (спонсоры закончились), награда платится только когда
 выполнено не меньше M (по умолчанию 4) заданий; 3 и меньше — награды нет.
-Отписка реферала хотя бы от одного канала: штраф рефералу, а пригласивший теряет ровно столько,
-сколько получил за этого реферала. Размер награды можно задать индивидуально (админ-панель → Пользователи).
+Отписка от канала: штраф самому пользователю; если это реферал и награда за него уже выдана —
+пригласивший теряет ровно столько, сколько получил за этого реферала.
+Размер награды можно задать индивидуально (админ-панель → Пользователи).
 Админ-панель → Пользователи → карточка: выдача/отзыв доступа к /e и список рефералов с прогрессом по спонсорам.
+
+ИЗМЕНЕНИЯ ЭТОЙ ВЕРСИИ:
+ • Админ-панель → «📥 Импорт пользователей»: загрузка старых пользователей (файл/список ID или прямо из старой
+   базы Turso) в текущую базу Redis — чтобы рассылка доходила до всех.
+ • Проверка подписки на каналы, добавленные админом: учитывается статус restricted, числовой chat_id,
+   при ошибке проверки (бот не админ канала) пользователю показывается «не удалось проверить», а админам
+   приходит уведомление с причиной.
+ • Штрафы за отписку теперь выдаются всем (UNSUB_ALL = True), а не только рефералам; регистр @username
+   в chat_member больше не мешает.
 """
 import asyncio
 import base64
@@ -69,6 +79,10 @@ WEBHOOK_SECRET = key("WEBHOOK_SECRET")
 CRON_SECRET = key("CRON_SECRET")
 FLOWLY_WEBHOOK_SECRET = key("FLOWLY_WEBHOOK_SECRET")  # ключ подписи вебхуков Flowly (необязательно)
 
+# Старая база Turso (нужна только для импорта старых пользователей: Админ-панель → Импорт пользователей)
+TURSO_URL = key("TURSO_URL") or key("TURSO_DATABASE_URL")      # libsql://имя-базы.turso.io
+TURSO_TOKEN = key("TURSO_TOKEN") or key("TURSO_AUTH_TOKEN")    # токен доступа к базе
+
 # если в коде пусто — берём из окружения
 FLYER_KEY = FLYER_KEY.strip() or key("FLYER_KEY")
 FLOWLY_KEY = FLOWLY_KEY.strip() or key("FLOWLY_KEY")
@@ -112,6 +126,10 @@ DEFAULT_SETTINGS = {
 FORCE_SETTINGS = {}  # (в v3 уже применялись 5 / 8 / 4 / 5; теперь настройки из админки не трогаем)
 UNSUB_CHECK_INTERVAL = 5 * 60  # как часто проверять отписки (сек)
 DEFAULT_TASK_REWARD = 0.25
+
+# True — штрафовать за отписку ВСЕХ пользователей; False — только тех, кто пришёл по реферальной ссылке
+UNSUB_ALL = True
+REFC = "" if UNSUB_ALL else "AND u.referrer_id IS NOT NULL"
 
 # (цена, название, эмодзи)
 GIFTS = [
@@ -565,6 +583,12 @@ def esc(s) -> str:
     return html.escape(str(s or ""))
 
 
+def tg_chat(v):
+    """chat_id для Bot API: числовой ID -> int, иначе @username как есть."""
+    s = str(v).strip()
+    return int(s) if re.fullmatch(r"-?\d+", s) else s
+
+
 async def get_user(uid: int):
     return await fetchone("SELECT * FROM users WHERE id=?", (uid,))
 
@@ -753,17 +777,38 @@ async def send_task(target: Message, uid: int, edit: bool = False, lang: str = N
         await target.answer(text, reply_markup=markup)
 
 
-async def check_task(bot: Bot, uid: int, t) -> bool:
-    """Проверка выполнения. Для каналов — через get_chat_member (бот должен быть админом канала)."""
+_CHK_ERR_NOTIFIED = {}
+
+
+async def check_task(bot: Bot, uid: int, t):
+    """Проверка выполнения. Возвращает True / False / None (None — не удалось проверить).
+    Для каналов — через get_chat_member (бот должен быть админом канала)."""
     if t["kind"] == "channel":
         if not t["chat_id"]:
             return True
         try:
-            m = await bot.get_chat_member(t["chat_id"], uid)
-            return m.status in ("member", "administrator", "creator")
+            m = await bot.get_chat_member(tg_chat(t["chat_id"]), uid)
+            if m.status in ("member", "administrator", "creator"):
+                return True
+            # restricted — это участник с ограничениями, если is_member=True
+            return m.status == "restricted" and bool(getattr(m, "is_member", False))
         except Exception as ex:
-            logging.warning("check_task error: %s", ex)
-            return False
+            logging.warning("check_task error chat=%s: %s", t["chat_id"], ex)
+            # предупреждаем админов (не чаще раза в 10 минут по каждому заданию)
+            if time.monotonic() - _CHK_ERR_NOTIFIED.get(t["id"], -1e9) > 600:
+                _CHK_ERR_NOTIFIED[t["id"]] = time.monotonic()
+                for aid in ADMIN_IDS:
+                    try:
+                        await bot.send_message(
+                            aid,
+                            f"⚠️ <b>Не могу проверить подписку по заданию #{t['id']}</b>\n"
+                            f"Канал: {esc(t['url'])}\nchat_id: <code>{esc(t['chat_id'])}</code>\n"
+                            f"Ошибка: <code>{esc(str(ex)[:300])}</code>\n\n"
+                            f"Проверь: бот добавлен в канал <b>администратором</b>, а chat_id указан верно "
+                            f"(@username публичного канала или -100…).")
+                    except Exception:
+                        pass
+            return None
     # Задание «запустить бота»: Bot API не позволяет проверить запуск чужого бота.
     # Сюда подключается API спонсорской платформы (Subgram и т.п.). Пока — считаем выполненным.
     return True
@@ -825,7 +870,7 @@ async def complete_task(bot: Bot, uid: int, t):
 
 # ============================== ШТРАФЫ ЗА ОТПИСКУ ==============================
 async def apply_unsub_penalty(bot: Bot, uid: int, link: str, table: str, where: str, args: tuple):
-    """Один раз штрафует реферала за отписку от канала и (если награда уже выдана) — пригласившего."""
+    """Один раз штрафует пользователя за отписку от канала и (если награда уже выдана) — пригласившего."""
     cur = await db.execute(f"UPDATE {table} SET penalized=1 WHERE {where} AND penalized=0", args)
     await db.commit()
     if cur.rowcount == 0:
@@ -834,7 +879,7 @@ async def apply_unsub_penalty(bot: Bot, uid: int, link: str, table: str, where: 
     u = await get_user(uid)
     if not u:
         return
-    # штраф самому рефералу
+    # штраф самому пользователю
     pen = await get_setting("unsub_penalty")
     await db.execute("UPDATE users SET balance=MAX(0, balance-?) WHERE id=?", (pen, uid))
     await db.commit()
@@ -870,7 +915,7 @@ UNSUB_STATS = {"penalized": 0}
 
 
 async def check_unsubs(bot: Bot, budget: float = None) -> list:
-    """Проверяет отписки рефералов. Возвращает строки отчёта (для /unsub и логов)."""
+    """Проверяет отписки. Возвращает строки отчёта (для /unsub и логов)."""
     days = int(await get_setting("unsub_days"))
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     budget = budget or UNSUB_BUDGET
@@ -894,18 +939,22 @@ async def check_unsubs(bot: Bot, budget: float = None) -> list:
             "SELECT ut.user_id, ut.task_id, t.chat_id, t.url FROM user_tasks ut "
             "JOIN tasks t ON t.id=ut.task_id JOIN users u ON u.id=ut.user_id "
             "WHERE ut.status='done' AND ut.penalized=0 AND t.kind='channel' "
-            "AND t.chat_id IS NOT NULL AND t.chat_id!='' AND u.referrer_id IS NOT NULL AND ut.day>=? ORDER BY RANDOM() LIMIT 100", (cutoff,))
+            f"AND t.chat_id IS NOT NULL AND t.chat_id!='' {REFC} AND ut.day>=? "
+            "ORDER BY COALESCE(ut.day,'') ASC, RANDOM() LIMIT 100", (cutoff,))
         errs = 0
         asked = 0
+        last_err = ""
         for r in rows:
             if time.monotonic() > deadline:
                 break
             asked += 1
             try:
-                m = await bot.get_chat_member(r["chat_id"], r["user_id"])
-                left = m.status in ("left", "kicked")
+                m = await bot.get_chat_member(tg_chat(r["chat_id"]), r["user_id"])
+                left = m.status in ("left", "kicked") or (
+                    m.status == "restricted" and not getattr(m, "is_member", True))
             except Exception as ex:
                 errs += 1
+                last_err = str(ex)[:120]
                 logging.info("unsub admin-task get_chat_member %s: %s", r["chat_id"], ex)
                 left = False  # при ошибке не штрафуем
             if left:
@@ -914,7 +963,7 @@ async def check_unsubs(bot: Bot, budget: float = None) -> list:
             await asyncio.sleep(0.1)
         info = f"кандидатов {len(rows)}"
         if errs:
-            info += f"; ошибок проверки: {errs} — бот должен быть админом канала"
+            info += f"; ошибок проверки: {errs} ({last_err}) — бот должен быть админом канала"
         return asked, info
 
     async def probe(rows, fn):
@@ -950,7 +999,7 @@ async def check_unsubs(bot: Bot, budget: float = None) -> list:
         rows = await fetchall(
             "SELECT f.* FROM flyer_tasks f JOIN users u ON u.id=f.user_id "
             "WHERE f.status='done' AND f.penalized=0 AND f.task='subscribe channel' "
-            "AND u.referrer_id IS NOT NULL AND f.day>=? "
+            f"{REFC} AND f.day>=? "
             "ORDER BY COALESCE(f.checked_at,'') ASC, f.id ASC LIMIT 200", (cutoff,))
         pairs = await probe(rows, lambda r: flyer_call("check_task", {"signature": r["signature"]}))
         return await settle("flyer_tasks", rows, pairs, "url",
@@ -961,7 +1010,7 @@ async def check_unsubs(bot: Bot, budget: float = None) -> list:
         rows = await fetchall(
             "SELECT g.* FROM tgrass_tasks g JOIN users u ON u.id=g.user_id "
             "WHERE g.status='done' AND g.penalized=0 AND g.kind='channel' "
-            "AND u.referrer_id IS NOT NULL AND g.day>=? "
+            f"{REFC} AND g.day>=? "
             "ORDER BY COALESCE(g.checked_at,'') ASC, g.id ASC LIMIT 200", (cutoff,))
         pairs = await probe(rows, lambda r: tgrass_call("check", {"tg_user_id": r["user_id"], "offer_id": r["offer_id"]}))
         return await settle("tgrass_tasks", rows, pairs, "link",
@@ -972,7 +1021,7 @@ async def check_unsubs(bot: Bot, budget: float = None) -> list:
         rows = await fetchall(
             "SELECT e.* FROM ext_tasks e JOIN users u ON u.id=e.user_id "
             "WHERE e.status='done' AND e.penalized=0 AND e.kind='channel' "
-            "AND u.referrer_id IS NOT NULL AND e.day>=? "
+            f"{REFC} AND e.day>=? "
             "ORDER BY COALESCE(e.checked_at,'') ASC, e.id ASC LIMIT 200", (cutoff,))
         pairs = await probe(rows, lambda r: EXT_CHECK[r["provider"]](r["user_id"], r))
         # у Flowly после выполнения «not_subscribed» означает, что пользователь ушёл
@@ -997,13 +1046,13 @@ CRON_BUDGET = 4  # cron дёргают каждую минуту: коротки
 
 
 async def _ext_unsub(bot: Bot, provider: str, uid: int, cond: str, args: tuple) -> int:
-    """Штраф по событию-вебхуку от сервиса (только рефералы, задания за последние unsub_days дней)."""
+    """Штраф по событию-вебхуку от сервиса (задания за последние unsub_days дней)."""
     days = int(await get_setting("unsub_days"))
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     rows = await fetchall(
         "SELECT e.id, e.link FROM ext_tasks e JOIN users u ON u.id=e.user_id "
         "WHERE e.provider=? AND e.user_id=? AND e.status='done' AND e.penalized=0 "
-        f"AND u.referrer_id IS NOT NULL AND e.day>=? AND {cond}", (provider, uid, cutoff, *args))
+        f"{REFC} AND e.day>=? AND {cond}", (provider, uid, cutoff, *args))
     for r in rows:
         await apply_unsub_penalty(bot, uid, r["link"], "ext_tasks", "id=?", (r["id"],))
     return len(rows)
@@ -1803,6 +1852,10 @@ class SetSt(StatesGroup):
     value = State()
 
 
+class ImpSt(StatesGroup):
+    data = State()
+
+
 class BanMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
         u = data.get("event_from_user")
@@ -1862,20 +1915,22 @@ async def cmd_reset(m: Message, state: FSMContext):
 
 @user.chat_member()
 async def on_chat_member(ev: ChatMemberUpdated):
-    """Мгновенный штраф, если реферал вышел из канала, где бот — админ (задания, добавленные админом)."""
-    if ev.new_chat_member.status not in ("left", "kicked"):
+    """Мгновенный штраф, если пользователь вышел из канала, где бот — админ (задания, добавленные админом)."""
+    st = ev.new_chat_member.status
+    left = st in ("left", "kicked") or (st == "restricted" and not getattr(ev.new_chat_member, "is_member", True))
+    if not left:
         return
     uid = ev.new_chat_member.user.id
     ids = [str(ev.chat.id)]
     if ev.chat.username:
-        ids += ["@" + ev.chat.username, ev.chat.username]
+        ids += ["@" + ev.chat.username.lower(), ev.chat.username.lower()]
     days = int(await get_setting("unsub_days"))
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     q = ",".join("?" * len(ids))
     rows = await fetchall(
         "SELECT ut.task_id, t.url, t.chat_id FROM user_tasks ut JOIN tasks t ON t.id=ut.task_id "
         "JOIN users u ON u.id=ut.user_id WHERE ut.user_id=? AND ut.status='done' AND ut.penalized=0 "
-        f"AND t.kind='channel' AND u.referrer_id IS NOT NULL AND ut.day>=? AND t.chat_id IN ({q})",
+        f"AND t.kind='channel' {REFC} AND ut.day>=? AND LOWER(TRIM(t.chat_id)) IN ({q})",
         (uid, cutoff, *ids))
     for r in rows:
         await apply_unsub_penalty(ev.bot, uid, r["url"] or str(r["chat_id"]),
@@ -1886,11 +1941,11 @@ async def on_chat_member(ev: ChatMemberUpdated):
 async def cmd_unsub(m: Message):
     if m.from_user.id not in ADMIN_IDS and not await can_reset(m.from_user.id):
         return
-    await m.answer("⏳ Проверяю отписки рефералов…")
+    await m.answer("⏳ Проверяю отписки…")
     rep_ = await check_unsubs(m.bot)
     days = int(await get_setting("unsub_days"))
     await m.answer("🔎 <b>Проверка отписок</b> (задания за последние "
-                   f"{days} дн., только рефералы)\n\n" + "\n".join(esc(x) for x in rep_))
+                   f"{days} дн.)\n\n" + "\n".join(esc(x) for x in rep_))
 
 
 @user.message(F.text == B_EARN)
@@ -1931,7 +1986,11 @@ async def task_confirm(c: CallbackQuery):
     if await fetchone("SELECT 1 FROM user_tasks WHERE user_id=? AND task_id=?", (c.from_user.id, t["id"])):
         await c.answer()
         return await send_task(c.message, c.from_user.id, edit=True, lang=c.from_user.language_code, tgu=c.from_user)
-    if not await check_task(c.bot, c.from_user.id, t):
+    ok = await check_task(c.bot, c.from_user.id, t)
+    if ok is None:
+        return await c.answer("⚠️ Не удалось проверить подписку, попробуй чуть позже. "
+                              "Мы уже сообщили администратору.", show_alert=True)
+    if not ok:
         txt = "❌ Ты не запустил бота, которого требует задание" if t["kind"] == "bot" \
             else "❌ Ты не подписался на канал, которого требует задание"
         return await c.answer(txt, show_alert=True)
@@ -2325,6 +2384,7 @@ def admin_menu():
                 btn("🎟 Промокоды", cb="a:promos", style="success")],
                [btn("📥 Заявки на вывод", cb="a:wd", style="primary"),
                 btn("📨 Рассылка", cb="a:cast", style="danger")],
+               [btn("📥 Импорт пользователей", cb="a:imp", style="success")],
                [btn("⚙️ Настройки", cb="a:set")],
                [btn("✖️ Закрыть", cb="a:close")]))
 
@@ -2407,6 +2467,24 @@ async def a_tgrass(m: Message):
     await m.answer(f"🌿 <b>TGrass /{TGRASS_ENDPOINT} (для тебя)</b>\n<pre>{text}</pre>")
 
 
+@admin.message(Command("chk"))
+async def a_chk(m: Message):
+    """Диагностика заданий-каналов админа: /chk — для всех своих заданий показывает, что видит бот."""
+    rows = await fetchall("SELECT * FROM tasks WHERE kind='channel' AND chat_id IS NOT NULL AND chat_id!='' ORDER BY id")
+    if not rows:
+        return await m.answer("Нет заданий-каналов с проверкой подписки.")
+    me = await m.bot.get_me()
+    out = []
+    for t in rows:
+        try:
+            mem = await m.bot.get_chat_member(tg_chat(t["chat_id"]), m.from_user.id)
+            bot_mem = await m.bot.get_chat_member(tg_chat(t["chat_id"]), me.id)
+            out.append(f"#{t['id']} {t['chat_id']}: ты — {mem.status}; бот — {bot_mem.status}")
+        except Exception as ex:
+            out.append(f"#{t['id']} {t['chat_id']}: ОШИБКА {str(ex)[:150]}")
+    await m.answer("<pre>" + html.escape("\n".join(out)) + "</pre>")
+
+
 # ---------- Статистика ----------
 @admin.callback_query(F.data == "a:stats")
 async def a_stats(c: CallbackQuery, state: FSMContext):
@@ -2445,6 +2523,135 @@ async def a_stats(c: CallbackQuery, state: FSMContext):
     )
     await edit(c, text, kb([btn("🔄 Обновить", cb="a:stats", style="success")], A_BACK))
     await c.answer()
+
+
+# ---------- Импорт пользователей (чтобы рассылка дошла до всех) ----------
+IMPORT_COLS = ["id", "username", "full_name", "ref_code", "referrer_id", "balance", "earned",
+               "withdrawn", "ref_paid", "banned", "created_at"]
+
+
+def _turso_val(v):
+    if not isinstance(v, dict):
+        return v
+    t, val = v.get("type"), v.get("value")
+    if t == "null":
+        return None
+    if t == "integer":
+        return int(val)
+    if t == "float":
+        return float(val)
+    return val
+
+
+async def turso_fetch_users() -> list:
+    """Читает таблицу users из старой базы Turso через HTTP API. Возвращает список словарей."""
+    if not TURSO_URL or not TURSO_TOKEN:
+        raise RuntimeError("TURSO_URL / TURSO_TOKEN не заданы в Environment Variables Vercel")
+    base = TURSO_URL.replace("libsql://", "https://").replace("wss://", "https://").rstrip("/")
+    body = {"requests": [{"type": "execute", "stmt": {"sql": "SELECT * FROM users"}}, {"type": "close"}]}
+    async with http.post(f"{base}/v2/pipeline", json=body,
+                         headers={"Authorization": f"Bearer {TURSO_TOKEN}", "Content-Type": "application/json"},
+                         timeout=aiohttp.ClientTimeout(total=40)) as r:
+        data = await r.json(content_type=None)
+        if r.status != 200:
+            raise RuntimeError(f"Turso HTTP {r.status}: {str(data)[:200]}")
+    res = data["results"][0]
+    if res.get("type") == "error":
+        raise RuntimeError(f"Turso: {res.get('error')}")
+    result = res["response"]["result"]
+    cols = [c["name"] for c in result["cols"]]
+    return [dict(zip(cols, (_turso_val(v) for v in row))) for row in result["rows"]]
+
+
+async def import_user_rows(rows: list) -> tuple:
+    """Добавляет пользователей, которых ещё нет в базе. Существующих не трогает. -> (добавлено, уже были)."""
+    have = {r["id"] for r in await fetchall("SELECT id FROM users")}
+    codes = {r["ref_code"] for r in await fetchall("SELECT ref_code FROM users WHERE ref_code IS NOT NULL")}
+    stmts, added, seen = [], 0, set()
+    for row in rows:
+        try:
+            uid = int(row["id"])
+        except Exception:
+            continue
+        if uid in have or uid in seen:
+            continue
+        seen.add(uid)
+        data = {k: row.get(k) for k in IMPORT_COLS if k in row}
+        data["id"] = uid
+        code = data.get("ref_code")
+        if not code or code in codes:
+            while True:
+                code = gen_code()
+                if code not in codes:
+                    break
+        codes.add(code)
+        data["ref_code"] = code
+        data["created_at"] = data.get("created_at") or now()
+        for k in ("balance", "earned", "withdrawn", "ref_paid", "banned"):
+            if data.get(k) is None:
+                data.pop(k, None)
+        cols = list(data)
+        stmts.append((f"INSERT OR IGNORE INTO users({','.join(cols)}) VALUES({','.join('?' * len(cols))})",
+                      tuple(data[c] for c in cols)))
+        added += 1
+    for i in range(0, len(stmts), 500):
+        await db.batch(stmts[i:i + 500])
+    return added, len(rows) - added
+
+
+@admin.callback_query(F.data == "a:imp")
+async def a_import(c: CallbackQuery, state: FSMContext):
+    total = (await fetchone("SELECT COUNT(*) c FROM users"))["c"]
+    await state.set_state(ImpSt.data)
+    turso = "✅ настроена" if (TURSO_URL and TURSO_TOKEN) else "❌ не настроена (нужны TURSO_URL и TURSO_TOKEN в Vercel)"
+    await edit(c,
+               f"📥 <b>Импорт пользователей</b>\n\n"
+               f"Сейчас в базе: <b>{total}</b>. Рассылка идёт только тем, кто есть в базе.\n\n"
+               f"<b>Способ 1.</b> Из старой базы Turso (с балансами и рефералами): {turso}\n\n"
+               f"<b>Способ 2.</b> Пришли сюда <b>файл .txt/.csv/.json</b> со списком Telegram ID "
+               f"(или просто текстом, через пробел/запятую/с новой строки). Берутся все числа от 5 цифр, "
+               f"поэтому в файле должны быть только ID.\n\n"
+               f"Уже существующие пользователи не перезаписываются.",
+               kb([btn("📡 Импорт из Turso", cb="a:imp_turso", style="success")], A_BACK))
+    await c.answer()
+
+
+@admin.callback_query(F.data == "a:imp_turso")
+async def a_import_turso(c: CallbackQuery, state: FSMContext):
+    await c.answer("Загружаю…")
+    try:
+        rows = await turso_fetch_users()
+    except Exception as ex:
+        return await edit(c, f"❌ Не удалось прочитать Turso:\n<code>{esc(str(ex)[:500])}</code>",
+                          kb(A_BACK))
+    added, _ = await import_user_rows(rows)
+    total = (await fetchone("SELECT COUNT(*) c FROM users"))["c"]
+    await state.clear()
+    await edit(c, f"✅ <b>Импорт из Turso завершён</b>\n\nНайдено в Turso: {len(rows)}\n"
+                  f"Добавлено новых: <b>{added}</b>\nВсего в базе теперь: <b>{total}</b>", kb(A_BACK))
+
+
+@admin.message(ImpSt.data)
+async def a_import_data(m: Message, state: FSMContext):
+    text = ""
+    if m.document:
+        if (m.document.file_size or 0) > 15 * 1024 * 1024:
+            return await m.answer("❌ Файл слишком большой (максимум 15 МБ)", reply_markup=kb(A_BACK))
+        buf = await m.bot.download(m.document)
+        text = buf.read().decode("utf-8", "ignore")
+    elif m.text:
+        text = m.text
+    else:
+        return await m.answer("Пришли файл или текст со списком ID", reply_markup=kb(A_BACK))
+    ids = {int(x) for x in re.findall(r"\d{5,13}", text) if int(x) > 0}
+    if not ids:
+        return await m.answer("❌ Не нашёл ни одного ID. Пришли ещё раз:", reply_markup=kb(A_BACK))
+    added, _ = await import_user_rows([{"id": i} for i in ids])
+    total = (await fetchone("SELECT COUNT(*) c FROM users"))["c"]
+    await state.clear()
+    await m.answer(f"✅ <b>Импорт завершён</b>\n\nID в файле: {len(ids)}\nДобавлено новых: <b>{added}</b>\n"
+                   f"Уже были в базе: {len(ids) - added}\nВсего в базе теперь: <b>{total}</b>",
+                   reply_markup=kb(A_BACK))
 
 
 # ---------- Заявки на вывод ----------
@@ -2527,7 +2734,8 @@ async def tasks_view():
         "\n\n<b>Порядок спонсоров:</b> Flyer → Flowly → Traffy → TGrass → PiarFlow → Trafsly" + \
         f"\n🛰 Flyer: {'подключён ✅' if FLYER_KEY else 'не подключён (нет FLYER_KEY)'}" + \
         f"\n📡 Flowly: {'✅' if FLOWLY_KEY else '—'} · Traffy: {'✅' if TRAFFY_KEY else '—'}" + \
-        f"\n🌿 TGrass: {'✅' if TGRASS_KEY else '—'} · PiarFlow: {'✅' if PIARFLOW_KEY else '—'} · Trafsly: {'✅' if TRAFSLY_KEY else '—'}"
+        f"\n🌿 TGrass: {'✅' if TGRASS_KEY else '—'} · PiarFlow: {'✅' if PIARFLOW_KEY else '—'} · Trafsly: {'✅' if TRAFSLY_KEY else '—'}" + \
+        "\n\n<i>Диагностика проверки каналов: команда /chk</i>"
     btns.append([btn("➕ Добавить задание", cb="a:task_add", style="success")])
     btns.append(A_BACK)
     return text, kb(*btns)
@@ -2605,7 +2813,7 @@ async def a_task_url(m: Message, state: FSMContext):
     data = await state.get_data()
     await state.update_data(url=url)
     if data["kind"] == "channel":
-        pub = re.match(r"https?://t\.me/([A-Za-z][A-Za-z0-9_]{3,})/?$", url)
+        pub = re.match(r"https?://t\.me/([A-Za-z][A-Za-z0-9_]{3,})/?(?:\?.*)?$", url)
         if pub:
             await state.update_data(chat="@" + pub.group(1))
         else:
@@ -2952,7 +3160,10 @@ async def a_user_custom_value(m: Message, state: FSMContext):
 @admin.callback_query(F.data == "a:cast")
 async def a_cast(c: CallbackQuery, state: FSMContext):
     await state.set_state(Cast.msg)
-    await edit(c, "📨 <b>Рассылка</b>\n\nОтправь сообщение для рассылки (текст, фото, видео — что угодно, "
+    total = (await fetchone("SELECT COUNT(*) c FROM users WHERE banned=0"))["c"]
+    await edit(c, f"📨 <b>Рассылка</b>\n\nВ базе сейчас <b>{total}</b> пользователей. Если старые пользователи "
+                  f"не видны — сначала «📥 Импорт пользователей» в главном меню админки.\n\n"
+                  "Отправь сообщение для рассылки (текст, фото, видео — что угодно, "
                   "форматирование сохранится):", kb(A_BACK))
     await c.answer()
 
@@ -2989,7 +3200,8 @@ async def a_cast_go(c: CallbackQuery, state: FSMContext):
         return await c.answer("Сессия устарела", show_alert=True)
     ck = f"{d['chat']}:{d['mid']}"
     ids = [r["id"] for r in await fetchall(
-        "SELECT id FROM users WHERE banned=0 AND id NOT IN (SELECT user_id FROM cast_log WHERE ck=?) LIMIT 5000", (ck,))]
+        "SELECT id FROM users WHERE banned=0 AND id NOT IN (SELECT user_id FROM cast_log WHERE ck=?) "
+        "ORDER BY id", (ck,))]
     await edit(c, f"⏳ Рассылка идёт… осталось {len(ids)}")
     deadline = time.monotonic() + 40
     i = 0
