@@ -14,6 +14,13 @@
 Отписка от канала: штраф самому пользователю; если это реферал и награда за него уже выдана —
 пригласивший теряет ровно столько, сколько получил за этого реферала.
 Размер награды можно задать индивидуально (админ-панель → Пользователи).
+
+КАК ПРИВЯЗАТЬ СВОЙ КАНАЛ (любой из способов):
+ 1) добавь бота АДМИНОМ в канал — если ID ещё не задан, бот сам его запомнит;
+ 2) перешли боту (с аккаунта админа) любой пост из канала;
+ 3) отправь /setown -100XXXXXXXXXX;
+ 4) впиши OWN_CHANNEL_ID ниже или в переменные окружения Vercel.
+После деплоя ОБЯЗАТЕЛЬНО открой заново /api/set_webhook?key=... (чтобы пришли события chat_member).
 """
 import asyncio
 import base64
@@ -38,7 +45,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
-from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import BaseStorage
@@ -65,16 +72,30 @@ ADMIN_IDS = {619112100}  # ID админов через запятую, напр
 OWN_CHANNEL_URL = "https://t.me/+w9k9vVbVOgc0ZWVl"   # ссылка-приглашение на твой канал
 # ЧИСЛОВОЙ ID канала вида -1001234567890 (у приватного канала нет @username, без ID проверить
 # подписку и штрафовать за отписку невозможно). БОТ ДОЛЖЕН БЫТЬ АДМИНОМ КАНАЛА.
-# Можно задать здесь или в переменной окружения OWN_CHANNEL_ID.
+# Можно задать здесь, в переменной окружения OWN_CHANNEL_ID, командой /setown,
+# пересылкой поста из канала боту, либо бот запомнит его сам при добавлении админом.
 OWN_CHANNEL_ID = ""
 # False — админы ТОЖЕ проходят окно подписки (нужно, чтобы тестировать штрафы на себе).
 # True — админов окно подписки не трогает.
 ADMIN_SKIP_GATE = False
+# True — штраф можно списать «в минус» (если баланс меньше штрафа, баланс уйдёт в долг).
+# False — баланс не опускается ниже 0 (тогда при нулевом балансе штраф незаметен).
+PENALTY_ALLOW_NEGATIVE = True
 # =====================================================================
 
 
 def key(name: str) -> str:
     return os.getenv(name, "").strip()
+
+
+def norm_chat_id(v) -> str:
+    """Приводит ID канала к виду -100XXXXXXXXXX. @username и уже правильные ID не трогает."""
+    s = str(v or "").strip()
+    if re.fullmatch(r"\d{6,}", s):
+        return "-100" + s
+    if re.fullmatch(r"-\d{6,}", s) and not s.startswith("-100"):
+        return "-100" + s[1:]
+    return s
 
 
 # остальные секреты — из переменных окружения Vercel
@@ -95,7 +116,7 @@ PIARFLOW_KEY = PIARFLOW_KEY.strip() or key("PIARFLOW_KEY")
 TRAFSLY_KEY = TRAFSLY_KEY.strip() or key("TRAFSLY_KEY")
 TRAFFY_KEY = TRAFFY_KEY.strip() or key("TRAFFY_KEY")
 OWN_CHANNEL_URL = OWN_CHANNEL_URL.strip() or key("OWN_CHANNEL_URL")
-OWN_CHANNEL_ID = OWN_CHANNEL_ID.strip() or key("OWN_CHANNEL_ID")
+OWN_CHANNEL_ID = norm_chat_id(OWN_CHANNEL_ID.strip() or key("OWN_CHANNEL_ID"))
 ADMIN_IDS = set(ADMIN_IDS) | {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
 WITHDRAW_CHANNEL = "@AvoReputation"
@@ -821,15 +842,17 @@ async def check_task(bot: Bot, uid: int, t):
                         try:
                             await bot.send_message(
                                 aid, "⚠️ <b>Не задан ID твоего канала</b> — подписку проверить нельзя, "
-                                     "пользователи застрянут на окне подписки.\n"
-                                     "Добавь бота админом в канал и отправь <code>/setown -100…</code> "
-                                     "(или впиши OWN_CHANNEL_ID в коде).")
+                                     "пользователи застрянут на окне подписки.\n\n"
+                                     "Сделай любое из:\n"
+                                     "• перешли мне любой пост из канала (бот должен быть там админом);\n"
+                                     "• отправь <code>/setown -100…</code>;\n"
+                                     "• убери бота из админов и добавь снова — ID сохранится сам.")
                         except Exception:
                             pass
                 return None
             return True
         try:
-            m = await bot.get_chat_member(tg_chat(t["chat_id"]), uid)
+            m = await bot.get_chat_member(tg_chat(norm_chat_id(t["chat_id"])), uid)
             if m.status in ("member", "administrator", "creator"):
                 return True
             # restricted — это участник с ограничениями, если is_member=True
@@ -847,7 +870,8 @@ async def check_task(bot: Bot, uid: int, t):
                             f"Канал: {esc(t['url'])}\nchat_id: <code>{esc(t['chat_id'])}</code>\n"
                             f"Ошибка: <code>{esc(str(ex)[:300])}</code>\n\n"
                             f"Проверь: бот добавлен в канал <b>администратором</b>, а chat_id указан верно "
-                            f"(@username публичного канала или -100…).")
+                            f"(@username публичного канала или -100…). Если ID неверный — "
+                            f"перешли мне пост из канала или отправь <code>/setown -100…</code>.")
                     except Exception:
                         pass
             return None
@@ -921,9 +945,13 @@ async def apply_unsub_penalty(bot: Bot, uid: int, link: str, table: str, where: 
     u = await get_user(uid)
     if not u:
         return
+    logging.info("unsub penalty: user=%s link=%s table=%s", uid, link, table)
     # штраф самому пользователю
     pen = await get_setting("unsub_penalty")
-    await db.execute("UPDATE users SET balance=MAX(0, balance-?) WHERE id=?", (pen, uid))
+    if PENALTY_ALLOW_NEGATIVE:
+        await db.execute("UPDATE users SET balance=balance-? WHERE id=?", (pen, uid))
+    else:
+        await db.execute("UPDATE users SET balance=MAX(0, balance-?) WHERE id=?", (pen, uid))
     await db.commit()
     try:
         await bot.send_message(
@@ -991,7 +1019,7 @@ async def check_unsubs(bot: Bot, budget: float = None) -> list:
                 break
             asked += 1
             try:
-                m = await bot.get_chat_member(tg_chat(r["chat_id"]), r["user_id"])
+                m = await bot.get_chat_member(tg_chat(norm_chat_id(r["chat_id"])), r["user_id"])
                 left = m.status in ("left", "kicked") or (
                     m.status == "restricted" and not getattr(m, "is_member", True))
             except Exception as ex:
@@ -1149,12 +1177,36 @@ class TursoStorage(BaseStorage):
 
 
 # ---------- Свой канал в обязательной подписке: запись в таблице tasks ----------
+async def own_chat_id() -> str:
+    """ID своего канала: из кода/окружения, иначе сохранённый (через /setown, пересылку поста или автопривязку)."""
+    if OWN_CHANNEL_ID:
+        return OWN_CHANNEL_ID
+    stored = await fetchone("SELECT value FROM settings WHERE key='own_chat_id'")
+    return norm_chat_id(stored["value"]) if stored and stored["value"] else ""
+
+
+async def bind_own_channel(bot: Bot, cid: str):
+    """Сохраняет ID своего канала. Возвращает None при успехе, иначе текст ошибки."""
+    cid = norm_chat_id(cid)
+    try:
+        me = await bot.get_me()
+        bm = await bot.get_chat_member(tg_chat(cid), me.id)
+        if bm.status not in ("administrator", "creator"):
+            return f"Бот в этом канале не админ (статус: {bm.status}). Сделай его администратором."
+    except Exception as ex:
+        return f"Не могу обратиться к каналу: {str(ex)[:200]}"
+    await db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('own_chat_id',?)", (cid,))
+    await db.execute("UPDATE tasks SET chat_id=? WHERE url=?", (cid, OWN_CHANNEL_URL))
+    await db.commit()
+    _CHK_ERR_NOTIFIED.pop("own", None)
+    return None
+
+
 async def ensure_own_channel():
     """Гарантирует, что твой канал есть в tasks (чтобы работали проверка и штрафы за отписку)."""
     if not OWN_CHANNEL_URL:
         return
-    stored = await fetchone("SELECT value FROM settings WHERE key='own_chat_id'")
-    cid = OWN_CHANNEL_ID or (stored["value"] if stored else "")
+    cid = await own_chat_id()
     row = await fetchone("SELECT * FROM tasks WHERE url=?", (OWN_CHANNEL_URL,))
     if not row:
         await db.execute("INSERT INTO tasks(kind,url,chat_id,reward,active) VALUES('channel',?,?,?,1)",
@@ -2039,6 +2091,7 @@ async def on_chat_member(ev: ChatMemberUpdated):
     ids = [str(ev.chat.id)]
     if ev.chat.username:
         ids += ["@" + ev.chat.username.lower(), ev.chat.username.lower()]
+    logging.info("chat_member LEFT: user=%s chat=%s status=%s", uid, ev.chat.id, st)
     days = int(await get_setting("unsub_days"))
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     q = ",".join("?" * len(ids))
@@ -2047,6 +2100,8 @@ async def on_chat_member(ev: ChatMemberUpdated):
         "JOIN users u ON u.id=ut.user_id WHERE ut.user_id=? AND ut.status='done' AND ut.penalized=0 "
         f"AND t.kind='channel' {REFC} AND ut.day>=? AND LOWER(TRIM(t.chat_id)) IN ({q})",
         (uid, cutoff, *ids))
+    if not rows:
+        logging.info("chat_member LEFT: нет выполненных заданий-каналов для user=%s chat=%s", uid, ev.chat.id)
     for r in rows:
         await apply_unsub_penalty(ev.bot, uid, r["url"] or str(r["chat_id"]),
                                   "user_tasks", "user_id=? AND task_id=?", (uid, r["task_id"]))
@@ -2054,16 +2109,24 @@ async def on_chat_member(ev: ChatMemberUpdated):
 
 @user.my_chat_member()
 async def on_my_chat_member(ev: ChatMemberUpdated):
-    """Когда бота добавляют админом в канал — присылаем админам ID канала (для /setown)."""
+    """Когда бота добавляют админом в канал — если ID своего канала ещё не задан, запоминаем его сами
+    и присылаем админам уведомление."""
     if ev.chat.type != "channel" or ev.new_chat_member.status not in ("administrator", "member"):
         return
+    cid = str(ev.chat.id)
+    note = (f"\n\nЕсли это твой канал из обязательной подписки — отправь:\n<code>/setown {cid}</code>\n"
+            f"или перешли мне любой пост из канала.")
+    if OWN_CHANNEL_URL and ev.new_chat_member.status == "administrator" and not await own_chat_id():
+        err = await bind_own_channel(ev.bot, cid)
+        if err is None:
+            note = ("\n\n✅ ID своего канала ещё не был задан — я <b>сохранил этот канал как твой</b>. "
+                    "Подписка и штрафы за отписку теперь работают.\n"
+                    "Если это не тот канал — отправь <code>/setown -100…</code> с правильным ID.")
     for aid in ADMIN_IDS:
         try:
             await ev.bot.send_message(
                 aid, f"📢 Бот теперь в канале <b>{esc(ev.chat.title)}</b> ({esc(ev.new_chat_member.status)})\n"
-                     f"ID канала: <code>{ev.chat.id}</code>\n\n"
-                     f"Если это твой канал из обязательной подписки — отправь:\n"
-                     f"<code>/setown {ev.chat.id}</code>")
+                     f"ID канала: <code>{cid}</code>{note}")
         except Exception:
             pass
 
@@ -2603,20 +2666,31 @@ async def a_tgrass(m: Message):
 @admin.message(Command("setown"))
 async def a_setown(m: Message, command: CommandObject):
     """/setown -1001234567890 — задать ID твоего канала из обязательной подписки."""
-    v = (command.args or "").strip()
+    v = norm_chat_id(command.args or "")
     if not re.fullmatch(r"-100\d{5,}", v):
-        return await m.answer("Формат: <code>/setown -1001234567890</code>")
-    try:
-        me = await m.bot.get_me()
-        bm = await m.bot.get_chat_member(int(v), me.id)
-        if bm.status not in ("administrator", "creator"):
-            return await m.answer(f"❌ Бот в этом канале не админ (статус: {bm.status}). Сделай его администратором.")
-    except Exception as ex:
-        return await m.answer(f"❌ Не могу обратиться к каналу: <code>{esc(str(ex)[:200])}</code>")
-    await db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('own_chat_id',?)", (v,))
-    await db.execute("UPDATE tasks SET chat_id=? WHERE url=?", (v, OWN_CHANNEL_URL))
-    await db.commit()
+        cur = await own_chat_id()
+        return await m.answer(
+            f"Сейчас ID канала: <code>{esc(cur) or 'не задан'}</code>\n\n"
+            "Как задать (любой способ):\n"
+            "• <code>/setown -1001234567890</code>\n"
+            "• перешли мне любой пост из своего канала (бот должен быть там админом)\n"
+            "• убери бота из админов канала и добавь снова — ID сохранится сам")
+    err = await bind_own_channel(m.bot, v)
+    if err:
+        return await m.answer(f"❌ {esc(err)}")
     await m.answer(f"✅ ID канала сохранён: <code>{v}</code>. Подписка и штрафы за отписку теперь работают.")
+
+
+@admin.message(StateFilter(None), F.forward_origin.chat.type == "channel")
+async def a_forward_channel(m: Message):
+    """Админ пересылает боту пост из канала -> бот берёт ID канала и привязывает его как «свой»."""
+    ch = m.forward_origin.chat
+    cid = str(ch.id)
+    err = await bind_own_channel(m.bot, cid)
+    if err:
+        return await m.answer(f"📢 Канал <b>{esc(ch.title)}</b>, ID: <code>{cid}</code>\n\n❌ {esc(err)}")
+    await m.answer(f"✅ Канал <b>{esc(ch.title)}</b> привязан как твой.\nID: <code>{cid}</code>\n\n"
+                   f"Подписка и штрафы за отписку теперь работают.")
 
 
 @admin.message(Command("chk"))
@@ -2624,17 +2698,18 @@ async def a_chk(m: Message):
     """Диагностика заданий-каналов админа (в т.ч. твоего канала из окна подписки)."""
     rows = await fetchall("SELECT * FROM tasks WHERE kind='channel' AND chat_id IS NOT NULL AND chat_id!='' ORDER BY id")
     if OWN_CHANNEL_URL and not await fetchone("SELECT 1 FROM tasks WHERE url=? AND chat_id!=''", (OWN_CHANNEL_URL,)):
-        await m.answer("⚠️ <b>OWN_CHANNEL_ID не задан</b> — твой канал показывается в окне подписки, "
+        await m.answer("⚠️ <b>ID своего канала не задан</b> — канал показывается в окне подписки, "
                        "но подписку проверить и штрафовать за отписку нельзя. "
-                       "Отправь <code>/setown -100…</code> (или впиши OWN_CHANNEL_ID).")
+                       "Перешли мне пост из канала или отправь <code>/setown -100…</code>.")
     if not rows:
         return await m.answer("Нет заданий-каналов с проверкой подписки.")
     me = await m.bot.get_me()
     out = []
     for t in rows:
         try:
-            mem = await m.bot.get_chat_member(tg_chat(t["chat_id"]), m.from_user.id)
-            bot_mem = await m.bot.get_chat_member(tg_chat(t["chat_id"]), me.id)
+            cid = tg_chat(norm_chat_id(t["chat_id"]))
+            mem = await m.bot.get_chat_member(cid, m.from_user.id)
+            bot_mem = await m.bot.get_chat_member(cid, me.id)
             out.append(f"#{t['id']} {t['chat_id']}: ты — {mem.status}; бот — {bot_mem.status}")
         except Exception as ex:
             out.append(f"#{t['id']} {t['chat_id']}: ОШИБКА {str(ex)[:150]}")
@@ -2971,7 +3046,7 @@ async def tasks_view():
         kind = "📢" if t["kind"] == "channel" else "🤖"
         btns.append([btn(f"{icon} #{t['id']} {kind} +{fmt(t['reward'])}⭐ · выполнили: {done}", cb=f"a:tv:{t['id']}")])
     own_state = ("не задан" if not OWN_CHANNEL_URL else
-                 ("✅ с проверкой" if OWN_CHANNEL_ID else "⚠️ без OWN_CHANNEL_ID (проверка и штрафы не работают)"))
+                 ("✅ с проверкой" if await own_chat_id() else "⚠️ без ID канала (проверка и штрафы не работают) — перешли боту пост из канала"))
     text = "📋 <b>Задания</b>\n\n" + (f"Всего своих: {len(rows)}. Нажми на задание, чтобы управлять 👇" if rows else "Своих заданий пока нет.") + \
         "\n\n<b>Окно подписки (/start):</b> Flowly → TGrass → PiarFlow → Trafsly + твой канал" + \
         f"\n📌 Твой канал в окне подписки: {own_state}" + \
@@ -3075,7 +3150,7 @@ async def a_task_url(m: Message, state: FSMContext):
 @admin.message(TaskAdd.chat, F.text)
 async def a_task_chat(m: Message, state: FSMContext):
     v = m.text.strip()
-    await state.update_data(chat="" if v == "-" else v)
+    await state.update_data(chat="" if v == "-" else norm_chat_id(v))
     await state.set_state(TaskAdd.reward)
     await m.answer(f"💰 Награда за задание в ⭐ (например <code>0.25</code>) или «-» = {DEFAULT_TASK_REWARD}:",
                    reply_markup=CANCEL_TASKS)
@@ -3640,7 +3715,7 @@ async def set_webhook(request: Request, key: str = ""):
     url = f"https://{host}/api/webhook"
     bot = make_bot()
     try:
-        types = dp.resolve_used_update_types()  # включает chat_member -> мгновенные штрафы за отписку
+        types = dp.resolve_used_update_types()  # включает chat_member и my_chat_member -> мгновенные штрафы за отписку
         ok = await bot.set_webhook(url, secret_token=WEBHOOK_SECRET or None, allowed_updates=types)
     finally:
         await bot.session.close()
