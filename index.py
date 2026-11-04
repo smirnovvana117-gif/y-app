@@ -1354,14 +1354,15 @@ async def tgrass_call(method: str, payload: dict) -> dict:
     try:
         async with http.post(f"{TGRASS_URL}/{method}", json=payload,
                              headers={"Auth": TGRASS_KEY, "accept": "application/json"},
-                             timeout=aiohttp.ClientTimeout(total=4), ssl=TGRASS_VERIFY_SSL) as r:
+                             timeout=aiohttp.ClientTimeout(total=6), ssl=TGRASS_VERIFY_SSL) as r:
             data = await r.json(content_type=None)
             if r.status != 200:
                 return {"error": f"HTTP {r.status}: {data}"}
             return data if isinstance(data, dict) else {"error": f"bad response: {data!r}"}
     except Exception as ex:
-        logging.warning("tgrass %s failed: %s", method, ex)
-        return {"error": str(ex)}
+        err = f"{type(ex).__name__}: {ex}".strip().rstrip(":")
+        logging.warning("tgrass %s failed: %s", method, err)
+        return {"error": err}
 
 
 async def tgrass_offers(tgu) -> dict:
