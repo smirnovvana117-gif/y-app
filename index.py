@@ -6,13 +6,16 @@
 ОКНО ПОДПИСКИ (/start): 4 спонсора (по одному от Flowly → TGrass → PiarFlow → Trafsly)
 + ТВОЙ КАНАЛ (OWN_CHANNEL_URL) = 5 кнопок. Твой канал проверяется через get_chat_member
 и входит в систему штрафов за отписку (бот должен быть АДМИНОМ канала, нужен OWN_CHANNEL_ID).
+Для аккаунтов из SPONSOR_PICK_IDS при /start (и по команде /n) можно выбрать, сколько
+спонсоров (1–5) показывать в окне подписки; выбор запоминается.
 Раздел «💎 Задание» (и задания после окна подписки): 1 Flyer, 2 Flowly, 3 Traffy, 4 TGrass,
 5 PiarFlow, 6 Trafsly (+ свои задания админа в последнюю очередь).
 Награда за реферала: реферал выполняет задания спонсоров. Если выполнено N (по умолчанию 8) —
-награда сразу. Ессли сервисы выдали меньше (спонсоры закончились), награда платится только когда
+награда сразу. Если сервисы выдали меньше (спонсоры закончились), награда платится только когда
 выполнено не меньше M (по умолчанию 4) заданий; 3 и меньше — награды нет.
-Отписка от канала: штраф самому пользователю; если это реферал и награда за него уже выдана —
-пригласивший теряет ровно столько, сколько получил за этого реферала.
+Отписка от канала: штраф самому пользователю; если у него есть пригласивший — штраф и ему (один раз
+за реферала): если награда уже была выдана — теряет ровно столько, сколько получил, иначе — обычный
+штраф за отписку, а награда за этого реферала больше не выдаётся.
 Размер награды можно задать индивидуально (админ-панель → Пользователи).
 
 КАК ПРИВЯЗАТЬ СВОЙ КАНАЛ (любой из способов):
@@ -21,6 +24,9 @@
  3) отправь /setown -100XXXXXXXXXX;
  4) впиши OWN_CHANNEL_ID ниже или в переменные окружения Vercel.
 После деплоя ОБЯЗАТЕЛЬНО открой заново /api/set_webhook?key=... (чтобы пришли события chat_member).
+
+Удалил своё задание-канал в админке — оно больше не возвращается само
+(чтобы вернуть, добавь задание с той же ссылкой заново).
 """
 import asyncio
 import base64
@@ -81,6 +87,10 @@ ADMIN_SKIP_GATE = False
 # True — штраф можно списать «в минус» (если баланс меньше штрафа, баланс уйдёт в долг).
 # False — баланс не опускается ниже 0 (тогда при нулевом балансе штраф незаметен).
 PENALTY_ALLOW_NEGATIVE = True
+# Аккаунты, которые при /start (и по команде /n) выбирают, сколько спонсоров (1–5) показывать
+# в окне подписки. Твой канал добавляется к ним отдельно. Выбор запоминается в базе.
+SPONSOR_PICK_IDS = {8956779618}
+SPONSOR_PICK_MAX = 5
 # =====================================================================
 
 
@@ -470,7 +480,7 @@ async def run(sql, args=()):
     return cur
 
 
-SCHEMA_V = "6"  # увеличь, если меняешь таблицы/настройки по умолчанию
+SCHEMA_V = "7"  # увеличь, если меняешь таблицы/настройки по умолчанию
 
 
 async def init_db():
@@ -553,6 +563,7 @@ REQUIRED_COLUMNS = {
         "ref_paid": "INTEGER DEFAULT 0", "banned": "INTEGER DEFAULT 0", "created_at": "TEXT",
         "ref_penalized": "INTEGER DEFAULT 0", "fresh": "INTEGER DEFAULT 0",
         "ref_reward_custom": "REAL", "ref_paid_amount": "REAL DEFAULT 0", "gate_ok": "INTEGER DEFAULT 0",
+        "gate_n": "INTEGER DEFAULT 0",
     },
     "flyer_tasks": {"penalized": "INTEGER DEFAULT 0", "checked_at": "TEXT"},
     "tgrass_tasks": {"penalized": "INTEGER DEFAULT 0", "checked_at": "TEXT"},
@@ -893,9 +904,10 @@ async def try_pay_referrer(bot: Bot, uid: int, exhausted: bool = False):
     """Платит рефереру за реферала uid (один раз).
     • выполнено ref_tasks (8) заданий спонсоров — платим сразу;
     • exhausted=True (сервисы больше не выдают спонсоров) — платим, если выполнено не меньше ref_min (4);
-    • меньше ref_min — награды нет."""
+    • меньше ref_min — награды нет;
+    • если реферал уже отписывался (пригласивший оштрафован) — награда за него не выдаётся."""
     u = await get_user(uid)
-    if not u or not u["referrer_id"] or u["ref_paid"]:
+    if not u or not u["referrer_id"] or u["ref_paid"] or u["ref_penalized"]:
         return
     need = int(await get_setting("ref_tasks"))
     min_ok = int(await get_setting("ref_min"))
@@ -936,7 +948,7 @@ async def complete_task(bot: Bot, uid: int, t):
 
 # ============================== ШТРАФЫ ЗА ОТПИСКУ ==============================
 async def apply_unsub_penalty(bot: Bot, uid: int, link: str, table: str, where: str, args: tuple):
-    """Один раз штрафует пользователя за отписку от канала и (если награда уже выдана) — пригласившего."""
+    """Один раз штрафует пользователя за отписку от канала и его пригласившего (один раз за реферала)."""
     cur = await db.execute(f"UPDATE {table} SET penalized=1 WHERE {where} AND penalized=0", args)
     await db.commit()
     if cur.rowcount == 0:
@@ -945,7 +957,8 @@ async def apply_unsub_penalty(bot: Bot, uid: int, link: str, table: str, where: 
     u = await get_user(uid)
     if not u:
         return
-    logging.info("unsub penalty: user=%s link=%s table=%s", uid, link, table)
+    logging.info("unsub penalty: user=%s link=%s table=%s referrer=%s paid=%s",
+                 uid, link, table, u["referrer_id"], u["ref_paid"])
     # штраф самому пользователю
     pen = await get_setting("unsub_penalty")
     if PENALTY_ALLOW_NEGATIVE:
@@ -960,23 +973,34 @@ async def apply_unsub_penalty(bot: Bot, uid: int, link: str, table: str, where: 
             f"За это мы списали с твоего баланса -{fmt(pen)} {STAR}")
     except Exception:
         pass
-    # штраф пригласившему (только если награда за этого реферала уже была выдана, и только 1 раз)
-    if u["referrer_id"] and u["ref_paid"] and not u["ref_penalized"]:
+    # штраф пригласившему — всегда, один раз за этого реферала
+    if u["referrer_id"] and not u["ref_penalized"]:
         c2 = await db.execute("UPDATE users SET ref_penalized=1 WHERE id=? AND ref_penalized=0", (uid,))
         await db.commit()
         if c2.rowcount:
-            # пригласивший теряет ровно столько, сколько получил за этого реферала
-            rr = u["ref_paid_amount"] or await get_setting("ref_reward")
-            await db.execute("UPDATE users SET balance=balance-?, earned=earned-? WHERE id=?",
-                             (rr, rr, u["referrer_id"]))
+            if u["ref_paid"]:
+                # награда уже была выдана — пригласивший теряет ровно столько, сколько получил
+                amt = u["ref_paid_amount"] or await get_setting("ref_reward")
+                await db.execute("UPDATE users SET balance=balance-?, earned=earned-? WHERE id=?",
+                                 (amt, amt, u["referrer_id"]))
+                tail = "Сумма равна награде, которую ты получил за этого реферала."
+            else:
+                # награду ещё не выдавали — обычный штраф за отписку, а награда за него больше не будет выдана
+                amt = pen
+                if PENALTY_ALLOW_NEGATIVE:
+                    await db.execute("UPDATE users SET balance=balance-? WHERE id=?", (amt, u["referrer_id"]))
+                else:
+                    await db.execute("UPDATE users SET balance=MAX(0, balance-?) WHERE id=?",
+                                     (amt, u["referrer_id"]))
+                tail = "Награда за этого реферала тебе больше не будет выдана."
             await db.commit()
             try:
                 await bot.send_message(
                     u["referrer_id"],
                     f"⚠️ Штраф за реферала\n\n"
                     f"Реферал {uref(u)} отписался от канала спонсора.\n\n"
-                    f"С вашего баланса списано -{fmt(rr)} {STAR}\n"
-                    f"Сумма равна награде за этого реферала.")
+                    f"С вашего баланса списано -{fmt(amt)} {STAR}\n"
+                    f"{tail}")
             except Exception:
                 pass
 
@@ -1185,6 +1209,11 @@ async def own_chat_id() -> str:
     return norm_chat_id(stored["value"]) if stored and stored["value"] else ""
 
 
+async def own_deleted() -> bool:
+    """True, если админ удалил задание со своим каналом (тогда оно не пересоздаётся само)."""
+    return bool(await fetchone("SELECT 1 FROM settings WHERE key='own_deleted'"))
+
+
 async def bind_own_channel(bot: Bot, cid: str):
     """Сохраняет ID своего канала. Возвращает None при успехе, иначе текст ошибки."""
     cid = norm_chat_id(cid)
@@ -1203,12 +1232,15 @@ async def bind_own_channel(bot: Bot, cid: str):
 
 
 async def ensure_own_channel():
-    """Гарантирует, что твой канал есть в tasks (чтобы работали проверка и штрафы за отписку)."""
+    """Гарантирует, что твой канал есть в tasks (чтобы работали проверка и штрафы за отписку).
+    Если ты удалил это задание в админке — заново оно не создаётся."""
     if not OWN_CHANNEL_URL:
         return
     cid = await own_chat_id()
     row = await fetchone("SELECT * FROM tasks WHERE url=?", (OWN_CHANNEL_URL,))
     if not row:
+        if await own_deleted():
+            return
         await db.execute("INSERT INTO tasks(kind,url,chat_id,reward,active) VALUES('channel',?,?,?,1)",
                          (OWN_CHANNEL_URL, cid, DEFAULT_TASK_REWARD))
         await db.commit()
@@ -1667,6 +1699,29 @@ def gate_reward_key(src: str, row) -> str:
     return {"flyer": "flyer_reward", "tgrass": "tgrass_reward"}.get(src) or f"{row['provider']}_reward"
 
 
+async def gate_limit(uid: int) -> int:
+    """Сколько спонсоров показывать в окне подписки: для аккаунтов из SPONSOR_PICK_IDS — их выбор (1–5),
+    для остальных — GATE_MAX."""
+    if uid in SPONSOR_PICK_IDS:
+        r = await fetchone("SELECT gate_n FROM users WHERE id=?", (uid,))
+        n = int(r["gate_n"] or 0) if r else 0
+        if 1 <= n <= SPONSOR_PICK_MAX:
+            return n
+    return GATE_MAX
+
+
+def sponsor_pick_text(cur: int) -> str:
+    return (f"🎛 <b>Сколько спонсоров показывать в окне подписки?</b>\n\n"
+            f"Выбери от 1 до {SPONSOR_PICK_MAX}. Твой канал добавляется отдельно.\n"
+            f"Сейчас: <b>{cur}</b>\n\n"
+            f"Выбор запоминается. Изменить можно в любой момент командой /n")
+
+
+def sponsor_pick_kb(cur: int) -> InlineKeyboardMarkup:
+    return kb([btn(("✅ " if i == cur else "") + str(i), cb=f"gate:n:{i}", style="primary")
+               for i in range(1, SPONSOR_PICK_MAX + 1)])
+
+
 async def g_flyer(tgu, lang, n):
     if not FLYER_KEY:
         return []
@@ -1882,7 +1937,7 @@ async def gate_show(bot: Bot, tgu, chat_id: int) -> bool:
     """Показывает окно подписки. Возвращает False, если спонсоров нет (тогда пускаем в бота)."""
     items = await gate_pending(tgu.id)
     if not items:
-        items = await gate_collect(tgu, tgu.language_code)
+        items = await gate_collect(tgu, tgu.language_code, await gate_limit(tgu.id))
         own = await gate_own_item(tgu.id)  # твой канал — всегда последним
         if own:
             items.append(("own", own))
@@ -1955,7 +2010,7 @@ async def enter_bot(target: Message, tgu):
 
 
 class GateMiddleware(BaseMiddleware):
-    """Пока пользователь не прошёл окно подписки, всё, кроме /start, ведёт обратно на окно."""
+    """Пока пользователь не прошёл окно подписки, всё, кроме /start, /e и /n, ведёт обратно на окно."""
 
     async def __call__(self, handler, event, data):
         tg = data.get("event_from_user")
@@ -1963,7 +2018,7 @@ class GateMiddleware(BaseMiddleware):
             return await handler(event, data)
         if isinstance(event, Message):
             cmd = ((event.text or "").split() or [""])[0].split("@")[0]
-            if cmd in ("/start", "/e"):
+            if cmd in ("/start", "/e", "/n"):
                 return await handler(event, data)
         if isinstance(event, CallbackQuery) and (event.data or "").startswith("gate:"):
             return await handler(event, data)
@@ -2057,10 +2112,48 @@ async def cmd_start(m: Message, command: CommandObject, state: FSMContext):
                 f"Ты получишь {rr} {STAR}, как только он подпишется на {need} спонсоров")
         except Exception:
             pass
+    if m.from_user.id in SPONSOR_PICK_IDS:
+        # этому аккаунту при заходе даём выбрать, сколько спонсоров (1–5) показывать в окне подписки
+        cur = await gate_limit(m.from_user.id)
+        await m.answer(sponsor_pick_text(cur), reply_markup=sponsor_pick_kb(cur))
+        return
     if not u["gate_ok"] and not (ADMIN_SKIP_GATE and m.from_user.id in ADMIN_IDS):
         if await gate_show(m.bot, m.from_user, m.chat.id):
             return  # ждём подписки на спонсоров
     await enter_bot(m, m.from_user)
+
+
+@user.message(Command("n"))
+async def cmd_n(m: Message):
+    """Сменить количество спонсоров в окне подписки (только для SPONSOR_PICK_IDS)."""
+    if m.from_user.id not in SPONSOR_PICK_IDS:
+        return
+    await get_or_create_user(m.from_user)
+    cur = await gate_limit(m.from_user.id)
+    await m.answer(sponsor_pick_text(cur), reply_markup=sponsor_pick_kb(cur))
+
+
+@user.callback_query(F.data.startswith("gate:n:"))
+async def gate_pick_n(c: CallbackQuery):
+    uid = c.from_user.id
+    if uid not in SPONSOR_PICK_IDS:
+        return await c.answer()
+    try:
+        n = max(1, min(SPONSOR_PICK_MAX, int(c.data.split(":")[2])))
+    except Exception:
+        return await c.answer()
+    await get_or_create_user(c.from_user)
+    # запоминаем выбор и пересобираем окно подписки уже с нужным числом спонсоров
+    await db.execute("UPDATE users SET gate_n=?, gate_ok=0 WHERE id=?", (n, uid))
+    await db.execute("DELETE FROM gate_items WHERE user_id=?", (uid,))
+    await db.commit()
+    await c.answer(f"Спонсоров: {n}")
+    try:
+        await c.message.edit_text(f"✅ Выбрано спонсоров: <b>{n}</b> (твой канал — отдельно)", reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    if not await gate_show(c.bot, c.from_user, c.message.chat.id):
+        await enter_bot(c.message, c.from_user)
 
 
 @user.message(Command("e"))
@@ -2070,6 +2163,7 @@ async def cmd_reset(m: Message, state: FSMContext):
     await state.clear()
     u, _ = await get_or_create_user(m.from_user)
     uid = u["id"]
+    # gate_n (выбор числа спонсоров) при сбросе НЕ трогаем
     await db.execute("UPDATE users SET balance=0, earned=0, withdrawn=0, referrer_id=NULL, ref_paid=0, "
                      "ref_penalized=0, ref_paid_amount=0, gate_ok=0, fresh=1 WHERE id=?", (uid,))
     for table in ("user_tasks", "flyer_tasks", "tgrass_tasks", "ext_tasks", "promo_uses", "gate_items"):
@@ -2697,7 +2791,8 @@ async def a_forward_channel(m: Message):
 async def a_chk(m: Message):
     """Диагностика заданий-каналов админа (в т.ч. твоего канала из окна подписки)."""
     rows = await fetchall("SELECT * FROM tasks WHERE kind='channel' AND chat_id IS NOT NULL AND chat_id!='' ORDER BY id")
-    if OWN_CHANNEL_URL and not await fetchone("SELECT 1 FROM tasks WHERE url=? AND chat_id!=''", (OWN_CHANNEL_URL,)):
+    if OWN_CHANNEL_URL and not await own_deleted() and \
+            not await fetchone("SELECT 1 FROM tasks WHERE url=? AND chat_id!=''", (OWN_CHANNEL_URL,)):
         await m.answer("⚠️ <b>ID своего канала не задан</b> — канал показывается в окне подписки, "
                        "но подписку проверить и штрафовать за отписку нельзя. "
                        "Перешли мне пост из канала или отправь <code>/setown -100…</code>.")
@@ -3045,8 +3140,14 @@ async def tasks_view():
         icon = "🟢" if t["active"] else "⚪"
         kind = "📢" if t["kind"] == "channel" else "🤖"
         btns.append([btn(f"{icon} #{t['id']} {kind} +{fmt(t['reward'])}⭐ · выполнили: {done}", cb=f"a:tv:{t['id']}")])
-    own_state = ("не задан" if not OWN_CHANNEL_URL else
-                 ("✅ с проверкой" if await own_chat_id() else "⚠️ без ID канала (проверка и штрафы не работают) — перешли боту пост из канала"))
+    if not OWN_CHANNEL_URL:
+        own_state = "не задан"
+    elif await own_deleted() and not await fetchone("SELECT 1 FROM tasks WHERE url=?", (OWN_CHANNEL_URL,)):
+        own_state = "🗑 удалён из окна подписки (чтобы вернуть — добавь задание с этой ссылкой)"
+    elif await own_chat_id():
+        own_state = "✅ с проверкой"
+    else:
+        own_state = "⚠️ без ID канала (проверка и штрафы не работают) — перешли боту пост из канала"
     text = "📋 <b>Задания</b>\n\n" + (f"Всего своих: {len(rows)}. Нажми на задание, чтобы управлять 👇" if rows else "Своих заданий пока нет.") + \
         "\n\n<b>Окно подписки (/start):</b> Flowly → TGrass → PiarFlow → Trafsly + твой канал" + \
         f"\n📌 Твой канал в окне подписки: {own_state}" + \
@@ -3097,7 +3198,14 @@ async def a_task_toggle(c: CallbackQuery):
 
 @admin.callback_query(F.data.startswith("a:td:"))
 async def a_task_delete(c: CallbackQuery):
-    await run("DELETE FROM tasks WHERE id=?", (int(c.data.split(":")[2]),))
+    tid = int(c.data.split(":")[2])
+    t = await fetchone("SELECT * FROM tasks WHERE id=?", (tid,))
+    if t and OWN_CHANNEL_URL and t["url"] == OWN_CHANNEL_URL:
+        # запоминаем удаление, иначе ensure_own_channel() создаст задание заново
+        await db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('own_deleted','1')")
+    await db.execute("DELETE FROM tasks WHERE id=?", (tid,))
+    await db.execute("DELETE FROM gate_items WHERE src='own' AND row_id=?", (tid,))
+    await db.commit()
     await c.answer("Удалено 🗑")
     text, markup = await tasks_view()
     await edit(c, text, markup)
@@ -3165,8 +3273,12 @@ async def a_task_reward(m: Message, state: FSMContext):
     except Exception:
         return await m.answer("❌ Введи число больше нуля, например 0.25", reply_markup=CANCEL_TASKS)
     d = await state.get_data()
-    await run("INSERT INTO tasks(kind,url,chat_id,reward) VALUES(?,?,?,?)",
-              (d["kind"], d["url"], d.get("chat", ""), reward))
+    await db.execute("INSERT INTO tasks(kind,url,chat_id,reward) VALUES(?,?,?,?)",
+                     (d["kind"], d["url"], d.get("chat", ""), reward))
+    if OWN_CHANNEL_URL and d["url"] == OWN_CHANNEL_URL:
+        # свой канал добавлен заново вручную — снимаем флаг «удалён»
+        await db.execute("DELETE FROM settings WHERE key='own_deleted'")
+    await db.commit()
     await state.clear()
     text, markup = await tasks_view()
     await m.answer("✅ Задание добавлено!\n\n" + text, reply_markup=markup)
@@ -3283,6 +3395,9 @@ async def user_card(uid: int):
                else f"🎁 Награда за реферала: {fmt(await get_setting('ref_reward'))} ⭐ (стандартная)")
     e_line = ("♻️ Команда /e: доступна ✅" + (" (прописана в коде)" if in_code else "")) if has_e \
         else "♻️ Команда /e: нет доступа"
+    pick_line = ""
+    if uid in SPONSOR_PICK_IDS:
+        pick_line = f"\n🎛 Спонсоров в окне подписки: {await gate_limit(uid)} (выбор аккаунта)"
     text = (f"👤 <b>{esc(u['full_name'])}</b> ({esc(uname)})\n"
             f"ID: <code>{uid}</code>\n"
             f"Регистрация: {u['created_at']}\n"
@@ -3291,7 +3406,7 @@ async def user_card(uid: int):
             f"📈 Заработано: {fmt(u['earned'])} · 📤 Выведено: {fmt(u['withdrawn'])}\n"
             f"👥 Рефералов: {invited} · ✅ Заданий: {done} (живых: {valid})\n"
             f"{rr_line}\n"
-            f"{e_line}\n"
+            f"{e_line}{pick_line}\n"
             f"Статус: {'🚫 забанен' if u['banned'] else '✅ активен'}")
     if has_e:
         e_btn = btn("🚫 Забрать /e", cb=f"a:ure:{uid}", style="danger")
