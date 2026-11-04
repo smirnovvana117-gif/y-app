@@ -3,7 +3,9 @@
 Реферальный бот со звёздами — версия для Vercel (webhook + хранение базы в Redis/Upstash).
 Работает через api/index.py (FastAPI). Локально не запускается (нет polling).
 
-СПОНСОРЫ В ОКНЕ ПОДПИСКИ (/start): только 1 Flowly, 2 TGrass.
+ОКНО ПОДПИСКИ (/start): 4 спонсора (по одному от Flowly → TGrass → PiarFlow → Trafsly)
++ ТВОЙ КАНАЛ (OWN_CHANNEL_URL) = 5 кнопок. Твой канал проверяется через get_chat_member
+и входит в систему штрафов за отписку (бот должен быть АДМИНОМ канала, нужен OWN_CHANNEL_ID).
 Раздел «💎 Задание» (и задания после окна подписки): 1 Flyer, 2 Flowly, 3 Traffy, 4 TGrass,
 5 PiarFlow, 6 Trafsly (+ свои задания админа в последнюю очередь).
 Награда за реферала: реферал выполняет задания спонсоров. Если выполнено N (по умолчанию 8) —
@@ -12,18 +14,6 @@
 Отписка от канала: штраф самому пользователю; если это реферал и награда за него уже выдана —
 пригласивший теряет ровно столько, сколько получил за этого реферала.
 Размер награды можно задать индивидуально (админ-панель → Пользователи).
-Админ-панель → Пользователи → карточка: выдача/отзыв доступа к /e и список рефералов с прогрессом по спонсорам.
-
-ИЗМЕНЕНИЯ ЭТОЙ ВЕРСИИ:
- • Окно подписки берёт спонсоров ТОЛЬКО у Flowly и TGrass, а «💎 Задание» выдаёт задания от всех
-   сервисов по порядку: Flyer → Flowly → Traffy → TGrass → PiarFlow → Trafsly.
- • Админ-панель → «📥 Импорт пользователей»: загрузка старых пользователей (файл/список ID или прямо из старой
-   базы Turso) в текущую базу Redis — чтобы рассылка доходила до всех.
- • Проверка подписки на каналы, добавленные админом: учитывается статус restricted, числовой chat_id,
-   при ошибке проверки (бот не админ канала) пользователю показывается «не удалось проверить», а админам
-   приходит уведомление с причиной.
- • Штрафы за отписку теперь выдаются всем (UNSUB_ALL = True), а не только рефералам; регистр @username
-   в chat_member больше не мешает.
 """
 import asyncio
 import base64
@@ -70,6 +60,13 @@ PIARFLOW_KEY = "FNDvblihCM-RXnMX1U_UrErt_KuD8ujv"    # PiarFlow (piarflow.com)
 TRAFSLY_KEY = "at_99ddd0618296db80b905c92ff9adaa8c"     # Trafsly (токен бота at_... из @TrafslyBot)
 TRAFFY_KEY = "pk_live_iipu6bSNFs4PxIq9oF8he6trh8DUzqcL"      # Traffy (ключ pk_live_...)
 ADMIN_IDS = {619112100}  # ID админов через запятую, например {619112100, 123456789}
+
+# ---- ТВОЙ КАНАЛ В ОБЯЗАТЕЛЬНОЙ ПОДПИСКЕ (5-й канал в окне /start) ----
+OWN_CHANNEL_URL = "https://t.me/+w9k9vVbVOgc0ZWVl"   # ссылка-приглашение на твой канал
+# ЧИСЛОВОЙ ID канала вида -1001234567890 (у приватного канала нет @username, без ID проверить
+# подписку и штрафовать за отписку невозможно). БОТ ДОЛЖЕН БЫТЬ АДМИНОМ КАНАЛА.
+# Можно задать здесь или в переменной окружения OWN_CHANNEL_ID.
+OWN_CHANNEL_ID = ""
 # =====================================================================
 
 
@@ -94,6 +91,8 @@ TGRASS_KEY = TGRASS_KEY.strip() or key("TGRASS_KEY")
 PIARFLOW_KEY = PIARFLOW_KEY.strip() or key("PIARFLOW_KEY")
 TRAFSLY_KEY = TRAFSLY_KEY.strip() or key("TRAFSLY_KEY")
 TRAFFY_KEY = TRAFFY_KEY.strip() or key("TRAFFY_KEY")
+OWN_CHANNEL_URL = OWN_CHANNEL_URL.strip() or key("OWN_CHANNEL_URL")
+OWN_CHANNEL_ID = OWN_CHANNEL_ID.strip() or key("OWN_CHANNEL_ID")
 ADMIN_IDS = set(ADMIN_IDS) | {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
 WITHDRAW_CHANNEL = "@AvoReputation"
@@ -750,7 +749,7 @@ async def next_task(uid: int):
 
 
 # Раздел «💎 Задание»: сервисы опрашиваются СТРОГО в этом порядке (потом — свои задания админа).
-# В окне подписки (/start) работают только Flowly и TGrass — см. GATE_PROVIDERS ниже.
+# В окне подписки (/start) порядок свой — см. GATE_PROVIDERS ниже.
 TASK_ORDER = ("flyer", "flowly", "traffy", "tgrass", "piarflow", "trafsly")
 
 
@@ -1055,7 +1054,7 @@ async def check_unsubs(bot: Bot, budget: float = None) -> list:
                             lambda r, x: x[0] == "unsub" or (r["provider"] == "flowly" and x[0] == "no"),
                             lambda r, x: f"{r['provider']}:{x[0]}")
 
-    await section("Каналы админа", admin_tasks())
+    await section("Каналы админа (в т.ч. твой канал)", admin_tasks())
     if FLYER_KEY:
         await section("Flyer", flyer())
     if TGRASS_KEY:
@@ -1132,6 +1131,27 @@ class TursoStorage(BaseStorage):
         return None
 
 
+# ---------- Свой канал в обязательной подписке: запись в таблице tasks ----------
+async def ensure_own_channel():
+    """Гарантирует, что твой канал есть в tasks (чтобы работали проверка и штрафы за отписку)."""
+    if not OWN_CHANNEL_URL:
+        return
+    row = await fetchone("SELECT * FROM tasks WHERE url=?", (OWN_CHANNEL_URL,))
+    if not row:
+        await db.execute("INSERT INTO tasks(kind,url,chat_id,reward,active) VALUES('channel',?,?,?,1)",
+                         (OWN_CHANNEL_URL, OWN_CHANNEL_ID, DEFAULT_TASK_REWARD))
+        await db.commit()
+    elif OWN_CHANNEL_ID and (row["chat_id"] or "") != OWN_CHANNEL_ID:
+        await db.execute("UPDATE tasks SET chat_id=? WHERE id=?", (OWN_CHANNEL_ID, row["id"]))
+        await db.commit()
+
+
+async def get_own_task():
+    if not OWN_CHANNEL_URL:
+        return None
+    return await fetchone("SELECT * FROM tasks WHERE url=? AND active=1", (OWN_CHANNEL_URL,))
+
+
 # ---------- Инициализация (один раз на «тёплый» инстанс) ----------
 _READY = False
 
@@ -1139,6 +1159,7 @@ _READY = False
 async def ensure_ready(bot: Bot):
     global BOT_USERNAME
     await init_db()  # дешёвая проверка схемы: база каждый раз загружается из Redis
+    await ensure_own_channel()
     if not BOT_USERNAME:
         BOT_USERNAME = (await bot.get_me()).username
 
@@ -1559,15 +1580,16 @@ def ext_task_kb(et) -> InlineKeyboardMarkup:
 
 
 # ============================== ОБЯЗАТЕЛЬНАЯ ПОДПИСКА (окно при /start) ==============================
-GATE_MAX = 8                 # максимум спонсоров в окне подписки
+GATE_MAX = 4                 # максимум СПОНСОРОВ в окне подписки (+ твой канал = 5 кнопок)
+GATE_PER_PROVIDER = 1        # сначала берём по 1 спонсору от каждого сервиса (Flowly → TGrass → PiarFlow → Trafsly)
 GATE_PAYS_REWARD = False     # True — платить обычную награду за каждое задание из окна подписки
 GATE_TEXT = ('🤖 Для использования бота подпишись на каналы ниже\n\n'
              '🔻 После подписки нажимай на кнопку "Проверить подписку"')
-GATE_TABLES = {"flyer": "flyer_tasks", "tgrass": "tgrass_tasks", "ext": "ext_tasks"}
+GATE_TABLES = {"flyer": "flyer_tasks", "tgrass": "tgrass_tasks", "ext": "ext_tasks"}  # "own" — особый случай
 
 
 def gate_link(src: str, row) -> str:
-    return row["url"] if src == "flyer" else row["link"]
+    return row["url"] if src in ("flyer", "own") else row["link"]
 
 
 def gate_reward_key(src: str, row) -> str:
@@ -1711,36 +1733,61 @@ async def g_trafsly(tgu, lang, n):
     return out
 
 
-# Окно подписки (/start): ТОЛЬКО Flowly и TGrass, именно в таком порядке.
-# (g_flyer, g_traffy, g_piarflow, g_trafsly оставлены в коде — они используются в разделе «Задание»
-#  через TASK_ORDER; чтобы вернуть их в окно подписки, добавь в этот кортеж.)
-GATE_PROVIDERS = (g_flowly, g_tgrass)
+# Окно подписки (/start): Flowly → TGrass → PiarFlow → Trafsly, именно в таком порядке.
+# (g_flyer и g_traffy остаются в коде — они используются в разделе «Задание» через TASK_ORDER.)
+GATE_PROVIDERS = (g_flowly, g_tgrass, g_piarflow, g_trafsly)
 
 
 async def gate_collect(tgu, lang, limit: int = GATE_MAX):
-    """Набирает до `limit` спонсоров строго по порядку: Flowly → TGrass."""
+    """Набирает до `limit` спонсоров: сначала по GATE_PER_PROVIDER от каждого сервиса по порядку
+    Flowly → TGrass → PiarFlow → Trafsly; если какой-то сервис ничего не дал — добираем из остальных."""
     items, links = [], set()
-    for fn in GATE_PROVIDERS:
-        n = limit - len(items)
-        if n <= 0:
-            break
+
+    async def take(fn, n):
         try:
             got = await fn(tgu, lang, n)
         except Exception:
             logging.exception("gate collect %s", fn.__name__)
-            continue
+            return
         for src, row in got:
+            if len(items) >= limit:
+                return
             lk = gate_link(src, row)
             if lk in links:
                 continue
             links.add(lk)
             items.append((src, row))
+
+    for fn in GATE_PROVIDERS:               # проход 1: по одному от каждого
+        if len(items) >= limit:
+            break
+        await take(fn, GATE_PER_PROVIDER)
+    if len(items) < limit:                   # проход 2: добираем недостающих в том же порядке
+        for fn in GATE_PROVIDERS:
+            if len(items) >= limit:
+                break
+            await take(fn, limit)
     return items[:limit]
+
+
+async def gate_own_item(uid: int):
+    """Твой канал: возвращает строку tasks, если он включён и пользователь ещё не подписан (не выполнил)."""
+    t = await get_own_task()
+    if not t:
+        return None
+    if await fetchone("SELECT 1 FROM user_tasks WHERE user_id=? AND task_id=? AND status='done'", (uid, t["id"])):
+        return None
+    return t
 
 
 async def gate_pending(uid: int):
     out = []
     for g in await fetchall("SELECT * FROM gate_items WHERE user_id=? ORDER BY rowid", (uid,)):
+        if g["src"] == "own":
+            t = await gate_own_item(uid)
+            if t and t["id"] == g["row_id"]:
+                out.append(("own", t))
+            continue
         r = await fetchone(f"SELECT * FROM {GATE_TABLES[g['src']]} WHERE id=?", (g["row_id"],))
         if r and r["status"] == "shown":
             out.append((g["src"], r))
@@ -1765,6 +1812,9 @@ async def gate_show(bot: Bot, tgu, chat_id: int) -> bool:
     items = await gate_pending(tgu.id)
     if not items:
         items = await gate_collect(tgu, tgu.language_code)
+        own = await gate_own_item(tgu.id)  # твой канал — всегда последним
+        if own:
+            items.append(("own", own))
         await db.execute("DELETE FROM gate_items WHERE user_id=?", (tgu.id,))
         for src, r in items:
             await db.execute("INSERT OR IGNORE INTO gate_items(user_id,src,row_id) VALUES(?,?,?)",
@@ -1777,15 +1827,28 @@ async def gate_show(bot: Bot, tgu, chat_id: int) -> bool:
     return True
 
 
-async def gate_mark(src: str, row, status: str) -> int:
+async def gate_mark(src: str, row, status: str, uid: int = None) -> int:
+    if src == "own":
+        # выполненное задание-канал попадает в user_tasks -> работает система штрафов за отписку
+        cur = await db.execute(
+            "INSERT INTO user_tasks(user_id,task_id,status,day) VALUES(?,?,?,?) "
+            "ON CONFLICT(user_id,task_id) DO UPDATE SET status=excluded.status, day=excluded.day "
+            "WHERE user_tasks.status!='done'", (uid, row["id"], status, today()))
+        await db.commit()
+        return cur.rowcount
     cur = await db.execute(f"UPDATE {GATE_TABLES[src]} SET status=?, day=? WHERE id=? AND status='shown'",
                            (status, today(), row["id"]))
     await db.commit()
     return cur.rowcount
 
 
-async def gate_check_one(src: str, row, uid: int) -> str:
+async def gate_check_one(src: str, row, uid: int, bot: Bot = None) -> str:
     """-> ok / no / gone / wait"""
+    if src == "own":
+        res = await check_task(bot, uid, row)
+        if res is None:
+            return "wait"
+        return "ok" if res else "no"
     if src == "flyer":
         st = (await flyer_call("check_task", {"signature": row["signature"]})).get("result")
         if st in ("complete", "waiting"):
@@ -1947,7 +2010,8 @@ async def cmd_reset(m: Message, state: FSMContext):
 
 @user.chat_member()
 async def on_chat_member(ev: ChatMemberUpdated):
-    """Мгновенный штраф, если пользователь вышел из канала, где бот — админ (задания, добавленные админом)."""
+    """Мгновенный штраф, если пользователь вышел из канала, где бот — админ (задания, добавленные админом,
+    и твой канал из обязательной подписки)."""
     st = ev.new_chat_member.status
     left = st in ("left", "kicked") or (st == "restricted" and not getattr(ev.new_chat_member, "is_member", True))
     if not left:
@@ -2039,7 +2103,7 @@ async def task_skip(c: CallbackQuery):
     await send_task(c.message, c.from_user.id, edit=True, lang=c.from_user.language_code, tgu=c.from_user)
 
 
-# ---------- Задания Flyer (теперь выдаются в разделе «Задание» первыми) ----------
+# ---------- Задания Flyer (в разделе «Задание» выдаются первыми) ----------
 @user.callback_query(F.data.startswith("fc:"))
 async def flyer_confirm(c: CallbackQuery):
     lang = c.from_user.language_code
@@ -2180,16 +2244,18 @@ async def gate_check(c: CallbackQuery):
     if u and u["gate_ok"]:
         return await c.answer()
     items = await gate_pending(uid)
-    results = await asyncio.gather(*(gate_check_one(src, r, uid) for src, r in items), return_exceptions=True)
+    results = await asyncio.gather(*(gate_check_one(src, r, uid, c.bot) for src, r in items),
+                                   return_exceptions=True)
     no = 0
     for (src, r), st in zip(items, results):
         if isinstance(st, BaseException):
             st = "wait"
         if st == "ok":
-            if await gate_mark(src, r, "done") and GATE_PAYS_REWARD:
+            if await gate_mark(src, r, "done", uid) and GATE_PAYS_REWARD and src != "own":
                 await credit(uid, await get_setting(gate_reward_key(src, r)))
         elif st == "gone":
-            await gate_mark(src, r, "skip")
+            if src != "own":
+                await gate_mark(src, r, "skip", uid)
         elif st == "no":
             no += 1
     await try_pay_referrer(c.bot, uid)
@@ -2501,8 +2567,12 @@ async def a_tgrass(m: Message):
 
 @admin.message(Command("chk"))
 async def a_chk(m: Message):
-    """Диагностика заданий-каналов админа: /chk — для всех своих заданий показывает, что видит бот."""
+    """Диагностика заданий-каналов админа (в т.ч. твоего канала из окна подписки)."""
     rows = await fetchall("SELECT * FROM tasks WHERE kind='channel' AND chat_id IS NOT NULL AND chat_id!='' ORDER BY id")
+    if not OWN_CHANNEL_ID and OWN_CHANNEL_URL:
+        await m.answer("⚠️ <b>OWN_CHANNEL_ID не задан</b> — твой канал показывается в окне подписки, "
+                       "но подписку проверить и штрафовать за отписку нельзя. "
+                       "Впиши числовой ID канала (-100…) в начале кода или в переменную окружения OWN_CHANNEL_ID.")
     if not rows:
         return await m.answer("Нет заданий-каналов с проверкой подписки.")
     me = await m.bot.get_me()
@@ -2846,8 +2916,11 @@ async def tasks_view():
         icon = "🟢" if t["active"] else "⚪"
         kind = "📢" if t["kind"] == "channel" else "🤖"
         btns.append([btn(f"{icon} #{t['id']} {kind} +{fmt(t['reward'])}⭐ · выполнили: {done}", cb=f"a:tv:{t['id']}")])
+    own_state = ("не задан" if not OWN_CHANNEL_URL else
+                 ("✅ с проверкой" if OWN_CHANNEL_ID else "⚠️ без OWN_CHANNEL_ID (проверка и штрафы не работают)"))
     text = "📋 <b>Задания</b>\n\n" + (f"Всего своих: {len(rows)}. Нажми на задание, чтобы управлять 👇" if rows else "Своих заданий пока нет.") + \
-        "\n\n<b>Окно подписки (/start):</b> Flowly → TGrass" + \
+        "\n\n<b>Окно подписки (/start):</b> Flowly → TGrass → PiarFlow → Trafsly + твой канал" + \
+        f"\n📌 Твой канал в окне подписки: {own_state}" + \
         "\n<b>Раздел «💎 Задание»:</b> Flyer → Flowly → Traffy → TGrass → PiarFlow → Trafsly → свои задания" + \
         f"\n🛰 Flyer: {'подключён ✅' if FLYER_KEY else 'не подключён (нет FLYER_KEY)'}" + \
         f"\n📡 Flowly: {'✅' if FLOWLY_KEY else '—'} · Traffy: {'✅' if TRAFFY_KEY else '—'}" + \
