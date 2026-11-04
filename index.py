@@ -1354,7 +1354,7 @@ async def tgrass_call(method: str, payload: dict) -> dict:
     try:
         async with http.post(f"{TGRASS_URL}/{method}", json=payload,
                              headers={"Auth": TGRASS_KEY, "accept": "application/json"},
-                             timeout=aiohttp.ClientTimeout(total=10), ssl=TGRASS_VERIFY_SSL) as r:
+                             timeout=aiohttp.ClientTimeout(total=4), ssl=TGRASS_VERIFY_SSL) as r:
             data = await r.json(content_type=None)
             if r.status != 200:
                 return {"error": f"HTTP {r.status}: {data}"}
@@ -1885,13 +1885,19 @@ async def gate_collect(tgu, lang, limit: int = GATE_MAX, extra: bool = False):
     Flowly → TGrass → PiarFlow → Trafsly; если какой-то сервис ничего не дал — добираем из остальных.
     extra=True (только аккаунты с выбором числа спонсоров) — в конце ещё Flyer и Traffy."""
     items, links = [], set()
+    empty = set()  # сервисы, которые ничего не дали (пусто или ошибка) — второй раз их не опрашиваем
 
     async def take(fn, n):
+        if fn in empty:
+            return
         try:
             got = await fn(tgu, lang, n)
         except Exception:
             logging.exception("gate collect %s", fn.__name__)
+            empty.add(fn)
             return
+        if not got:
+            empty.add(fn)
         for src, row in got:
             if len(items) >= limit:
                 return
