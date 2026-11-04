@@ -67,6 +67,9 @@ OWN_CHANNEL_URL = "https://t.me/+w9k9vVbVOgc0ZWVl"   # ссылка-пригла
 # подписку и штрафовать за отписку невозможно). БОТ ДОЛЖЕН БЫТЬ АДМИНОМ КАНАЛА.
 # Можно задать здесь или в переменной окружения OWN_CHANNEL_ID.
 OWN_CHANNEL_ID = ""
+# False — админы ТОЖЕ проходят окно подписки (нужно, чтобы тестировать штрафы на себе).
+# True — админов окно подписки не трогает.
+ADMIN_SKIP_GATE = False
 # =====================================================================
 
 
@@ -810,6 +813,20 @@ async def check_task(bot: Bot, uid: int, t):
     Для каналов — через get_chat_member (бот должен быть админом канала)."""
     if t["kind"] == "channel":
         if not t["chat_id"]:
+            if OWN_CHANNEL_URL and t["url"] == OWN_CHANNEL_URL:
+                # раньше тут возвращалось True -> подписка «подтверждалась» без проверки и штрафов не было
+                if time.monotonic() - _CHK_ERR_NOTIFIED.get("own", -1e9) > 600:
+                    _CHK_ERR_NOTIFIED["own"] = time.monotonic()
+                    for aid in ADMIN_IDS:
+                        try:
+                            await bot.send_message(
+                                aid, "⚠️ <b>Не задан ID твоего канала</b> — подписку проверить нельзя, "
+                                     "пользователи застрянут на окне подписки.\n"
+                                     "Добавь бота админом в канал и отправь <code>/setown -100…</code> "
+                                     "(или впиши OWN_CHANNEL_ID в коде).")
+                        except Exception:
+                            pass
+                return None
             return True
         try:
             m = await bot.get_chat_member(tg_chat(t["chat_id"]), uid)
@@ -1136,13 +1153,15 @@ async def ensure_own_channel():
     """Гарантирует, что твой канал есть в tasks (чтобы работали проверка и штрафы за отписку)."""
     if not OWN_CHANNEL_URL:
         return
+    stored = await fetchone("SELECT value FROM settings WHERE key='own_chat_id'")
+    cid = OWN_CHANNEL_ID or (stored["value"] if stored else "")
     row = await fetchone("SELECT * FROM tasks WHERE url=?", (OWN_CHANNEL_URL,))
     if not row:
         await db.execute("INSERT INTO tasks(kind,url,chat_id,reward,active) VALUES('channel',?,?,?,1)",
-                         (OWN_CHANNEL_URL, OWN_CHANNEL_ID, DEFAULT_TASK_REWARD))
+                         (OWN_CHANNEL_URL, cid, DEFAULT_TASK_REWARD))
         await db.commit()
-    elif OWN_CHANNEL_ID and (row["chat_id"] or "") != OWN_CHANNEL_ID:
-        await db.execute("UPDATE tasks SET chat_id=? WHERE id=?", (OWN_CHANNEL_ID, row["id"]))
+    elif cid and (row["chat_id"] or "") != cid:
+        await db.execute("UPDATE tasks SET chat_id=? WHERE id=?", (cid, row["id"]))
         await db.commit()
 
 
@@ -1986,7 +2005,7 @@ async def cmd_start(m: Message, command: CommandObject, state: FSMContext):
                 f"Ты получишь {rr} {STAR}, как только он подпишется на {need} спонсоров")
         except Exception:
             pass
-    if not u["gate_ok"] and m.from_user.id not in ADMIN_IDS:
+    if not u["gate_ok"] and not (ADMIN_SKIP_GATE and m.from_user.id in ADMIN_IDS):
         if await gate_show(m.bot, m.from_user, m.chat.id):
             return  # ждём подписки на спонсоров
     await enter_bot(m, m.from_user)
@@ -2031,6 +2050,22 @@ async def on_chat_member(ev: ChatMemberUpdated):
     for r in rows:
         await apply_unsub_penalty(ev.bot, uid, r["url"] or str(r["chat_id"]),
                                   "user_tasks", "user_id=? AND task_id=?", (uid, r["task_id"]))
+
+
+@user.my_chat_member()
+async def on_my_chat_member(ev: ChatMemberUpdated):
+    """Когда бота добавляют админом в канал — присылаем админам ID канала (для /setown)."""
+    if ev.chat.type != "channel" or ev.new_chat_member.status not in ("administrator", "member"):
+        return
+    for aid in ADMIN_IDS:
+        try:
+            await ev.bot.send_message(
+                aid, f"📢 Бот теперь в канале <b>{esc(ev.chat.title)}</b> ({esc(ev.new_chat_member.status)})\n"
+                     f"ID канала: <code>{ev.chat.id}</code>\n\n"
+                     f"Если это твой канал из обязательной подписки — отправь:\n"
+                     f"<code>/setown {ev.chat.id}</code>")
+        except Exception:
+            pass
 
 
 @user.message(Command("unsub"))
@@ -2565,14 +2600,33 @@ async def a_tgrass(m: Message):
     await m.answer(f"🌿 <b>TGrass /{TGRASS_ENDPOINT} (для тебя)</b>\n<pre>{text}</pre>")
 
 
+@admin.message(Command("setown"))
+async def a_setown(m: Message, command: CommandObject):
+    """/setown -1001234567890 — задать ID твоего канала из обязательной подписки."""
+    v = (command.args or "").strip()
+    if not re.fullmatch(r"-100\d{5,}", v):
+        return await m.answer("Формат: <code>/setown -1001234567890</code>")
+    try:
+        me = await m.bot.get_me()
+        bm = await m.bot.get_chat_member(int(v), me.id)
+        if bm.status not in ("administrator", "creator"):
+            return await m.answer(f"❌ Бот в этом канале не админ (статус: {bm.status}). Сделай его администратором.")
+    except Exception as ex:
+        return await m.answer(f"❌ Не могу обратиться к каналу: <code>{esc(str(ex)[:200])}</code>")
+    await db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('own_chat_id',?)", (v,))
+    await db.execute("UPDATE tasks SET chat_id=? WHERE url=?", (v, OWN_CHANNEL_URL))
+    await db.commit()
+    await m.answer(f"✅ ID канала сохранён: <code>{v}</code>. Подписка и штрафы за отписку теперь работают.")
+
+
 @admin.message(Command("chk"))
 async def a_chk(m: Message):
     """Диагностика заданий-каналов админа (в т.ч. твоего канала из окна подписки)."""
     rows = await fetchall("SELECT * FROM tasks WHERE kind='channel' AND chat_id IS NOT NULL AND chat_id!='' ORDER BY id")
-    if not OWN_CHANNEL_ID and OWN_CHANNEL_URL:
+    if OWN_CHANNEL_URL and not await fetchone("SELECT 1 FROM tasks WHERE url=? AND chat_id!=''", (OWN_CHANNEL_URL,)):
         await m.answer("⚠️ <b>OWN_CHANNEL_ID не задан</b> — твой канал показывается в окне подписки, "
                        "но подписку проверить и штрафовать за отписку нельзя. "
-                       "Впиши числовой ID канала (-100…) в начале кода или в переменную окружения OWN_CHANNEL_ID.")
+                       "Отправь <code>/setown -100…</code> (или впиши OWN_CHANNEL_ID).")
     if not rows:
         return await m.answer("Нет заданий-каналов с проверкой подписки.")
     me = await m.bot.get_me()
