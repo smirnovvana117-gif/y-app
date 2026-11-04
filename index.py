@@ -7,15 +7,19 @@
 + ТВОЙ КАНАЛ (OWN_CHANNEL_URL) = 5 кнопок. Твой канал проверяется через get_chat_member
 и входит в систему штрафов за отписку (бот должен быть АДМИНОМ канала, нужен OWN_CHANNEL_ID).
 Для аккаунтов из SPONSOR_PICK_IDS при /start (и по команде /n) можно выбрать, сколько
-спонсоров (1–5) показывать в окне подписки; выбор запоминается.
+спонсоров (1–5) показывать в окне подписки; выбор запоминается, и показывается РОВНО столько,
+сколько выбрано (если сервисы дали меньше — добавляются тестовые спонсоры).
 Раздел «💎 Задание» (и задания после окна подписки): 1 Flyer, 2 Flowly, 3 Traffy, 4 TGrass,
 5 PiarFlow, 6 Trafsly (+ свои задания админа в последнюю очередь).
-Награда за реферала: реферал выполняет задания спонсоров. Если выполнено N (по умолчанию 8) —
-награда сразу. Если сервисы выдали меньше (спонсоры закончились), награда платится только когда
-выполнено не меньше M (по умолчанию 4) заданий; 3 и меньше — награды нет.
-Отписка от канала: штраф самому пользователю; если у него есть пригласивший — штраф и ему (один раз
-за реферала): если награда уже была выдана — теряет ровно столько, сколько получил, иначе — обычный
-штраф за отписку, а награда за этого реферала больше не выдаётся.
+
+НАГРАДА ЗА РЕФЕРАЛА: платится ОДИН раз, когда реферал прошёл окно подписки целиком
+(включая твой канал) и выполнил не меньше 2 спонсоров с сервисов (настройка ref_tasks, по умолчанию 2).
+Твой канал в этот счёт не входит. Если спонсоров меньше двух — награды нет.
+
+ШТРАФ ЗА ОТПИСКУ: штраф получает сам пользователь. Пригласивший штрафуется ТОЛЬКО если ему
+уже была выдана награда за этого реферала (теряет ровно столько, сколько получил). Если награду
+не выдавали — пригласивший не штрафуется, но награда за этого реферала больше не выдаётся.
+Отписка от канала Flyer в заданиях тоже штрафуется (проверка по cron).
 Размер награды можно задать индивидуально (админ-панель → Пользователи).
 
 КАК ПРИВЯЗАТЬ СВОЙ КАНАЛ (любой из способов):
@@ -89,6 +93,7 @@ ADMIN_SKIP_GATE = False
 PENALTY_ALLOW_NEGATIVE = True
 # Аккаунты, которые при /start (и по команде /n) выбирают, сколько спонсоров (1–5) показывать
 # в окне подписки. Твой канал добавляется к ним отдельно. Выбор запоминается в базе.
+# Для этих аккаунтов показывается РОВНО выбранное число спонсоров (недостающие — тестовые).
 SPONSOR_PICK_IDS = {8956779618}
 SPONSOR_PICK_MAX = 5
 # =====================================================================
@@ -148,19 +153,19 @@ POST_PAYOUTS_TO_CHANNEL = False  # True -> после выплаты бот пи
 # Настройки по умолчанию (потом меняются в админке: ⚙️ Настройки)
 DEFAULT_SETTINGS = {
     "ref_reward": "5",        # награда за реферала
-    "ref_tasks": "8",         # на скольких спонсоров должен подписаться реферал
-    "ref_min": "4",           # минимум выполненных спонсоров, если сервисы выдали меньше N (3 и меньше — награды нет)
+    "ref_tasks": "2",         # сколько спонсоров с сервисов должен выполнить реферал (меньше — награды нет)
+    "ref_min": "2",           # (не используется, оставлено для совместимости)
     "flyer_reward": "0.25",   # награда пользователю за одно задание от Flyer
     "flowly_reward": "0.25",  # награда за одно задание Flowly
     "tgrass_reward": "0.25",  # награда пользователю за одно задание от TGrass
     "trafsly_reward": "0.25",  # награда за одно задание Trafsly
     "piarflow_reward": "0.25",  # награда за одно задание PiarFlow
     "traffy_reward": "0.25",  # награда за одно задание Traffy
-    "unsub_penalty": "5",     # штраф рефералу за отписку от канала спонсора
+    "unsub_penalty": "5",     # штраф за отписку от канала спонсора
     "unsub_days": "3",        # сколько дней после выполнения задания следим за отпиской
 }
 # эти значения принудительно обновятся один раз при смене SCHEMA_V (потом меняются в админке)
-FORCE_SETTINGS = {}  # (в v3 уже применялись 5 / 8 / 4 / 5; теперь настройки из админки не трогаем)
+FORCE_SETTINGS = {"ref_tasks": "2", "ref_min": "2"}
 UNSUB_CHECK_INTERVAL = 5 * 60  # как часто проверять отписки (сек)
 DEFAULT_TASK_REWARD = 0.25
 
@@ -480,7 +485,7 @@ async def run(sql, args=()):
     return cur
 
 
-SCHEMA_V = "7"  # увеличь, если меняешь таблицы/настройки по умолчанию
+SCHEMA_V = "8"  # увеличь, если меняешь таблицы/настройки по умолчанию
 
 
 async def init_db():
@@ -536,7 +541,7 @@ async def init_db():
         await db.execute("UPDATE users SET gate_ok=0")
         await db.execute("DELETE FROM gate_items")
         await db.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('gate_reset','1')")
-    # «живые» выполненные задания (без отписки) — по ним решаем, платить ли за реферала
+    # «живые» выполненные задания (без отписки)
     await db.executescript("""
     DROP VIEW IF EXISTS done_valid;
     CREATE VIEW done_valid AS
@@ -689,7 +694,6 @@ async def ref_reward_for(u) -> float:
 
 async def ref_text(u) -> str:
     rr = fmt(await ref_reward_for(u))
-    need = int(await get_setting("ref_tasks"))
     cnt = await ref_count(u["id"])
     return (
         f"<b>Получай +{rr} {STAR} за каждого приглашенного друга!</b>\n\n"
@@ -699,7 +703,7 @@ async def ref_text(u) -> str:
         f"<b>Приглашено тобой:</b> {cnt} {USER_E}\n\n"
         f"{HEART}<b>Как это работает:</b>\n"
         f"╠ Отправь свою ссылку другу\n"
-        f"╠ Друг заходит и подпишется на {need} спонсоров\n"
+        f"╠ Друг заходит и подписывается на спонсоров\n"
         f"╚ Ты получаешь {rr}{STAR} сразу же!"
     )
 
@@ -815,8 +819,8 @@ async def send_task(target: Message, uid: int, edit: bool = False, lang: str = N
     # порядок: Flyer → Flowly → Traffy → TGrass → PiarFlow → Trafsly
     kind, row = await next_section_task(tgu, uid, lang)
     if kind is None:
-        # спонсоры закончились: платим рефереру, если реферал выполнил не меньше ref_min заданий
-        await try_pay_referrer(target.bot, uid, exhausted=True)
+        # спонсоры закончились: проверяем, не пора ли заплатить рефереру
+        await try_pay_referrer(target.bot, uid)
     t = None if kind else await next_task(uid)  # свои задания админа — в последнюю очередь
     if kind == "flyer":
         text, markup = flyer_task_text(row), flyer_task_kb(row)
@@ -900,19 +904,28 @@ async def credit(uid: int, amount: float):
     await db.commit()
 
 
+async def sponsors_done(uid: int) -> int:
+    """Сколько спонсоров с сервисов выполнено и не отменено отпиской.
+    Твой канал и свои задания админа не считаются."""
+    r = await fetchone(
+        "SELECT "
+        "(SELECT COUNT(*) FROM flyer_tasks WHERE user_id=? AND status='done' AND COALESCE(penalized,0)=0) + "
+        "(SELECT COUNT(*) FROM tgrass_tasks WHERE user_id=? AND status='done' AND COALESCE(penalized,0)=0) + "
+        "(SELECT COUNT(*) FROM ext_tasks WHERE user_id=? AND status='done' AND COALESCE(penalized,0)=0) AS c",
+        (uid, uid, uid))
+    return r["c"]
+
+
 async def try_pay_referrer(bot: Bot, uid: int, exhausted: bool = False):
-    """Платит рефереру за реферала uid (один раз).
-    • выполнено ref_tasks (8) заданий спонсоров — платим сразу;
-    • exhausted=True (сервисы больше не выдают спонсоров) — платим, если выполнено не меньше ref_min (4);
-    • меньше ref_min — награды нет;
-    • если реферал уже отписывался (пригласивший оштрафован) — награда за него не выдаётся."""
+    """Платит рефереру за реферала uid ОДИН раз, когда:
+    • реферал прошёл окно подписки целиком (gate_ok=1, включая твой канал);
+    • выполнено не меньше ref_tasks (по умолчанию 2) спонсоров с сервисов — меньше двух = награды нет;
+    • реферал не отписывался раньше (иначе награда за него не выдаётся)."""
     u = await get_user(uid)
-    if not u or not u["referrer_id"] or u["ref_paid"] or u["ref_penalized"]:
+    if not u or not u["referrer_id"] or u["ref_paid"] or u["ref_penalized"] or not u["gate_ok"]:
         return
-    need = int(await get_setting("ref_tasks"))
-    min_ok = int(await get_setting("ref_min"))
-    valid = (await fetchone("SELECT COUNT(*) c FROM done_valid WHERE user_id=?", (uid,)))["c"]
-    if valid < need and not (exhausted and valid >= min_ok):
+    need = max(1, int(await get_setting("ref_tasks")))
+    if await sponsors_done(uid) < need:
         return
     referrer = await get_user(u["referrer_id"])
     rr = await ref_reward_for(referrer)
@@ -948,7 +961,9 @@ async def complete_task(bot: Bot, uid: int, t):
 
 # ============================== ШТРАФЫ ЗА ОТПИСКУ ==============================
 async def apply_unsub_penalty(bot: Bot, uid: int, link: str, table: str, where: str, args: tuple):
-    """Один раз штрафует пользователя за отписку от канала и его пригласившего (один раз за реферала)."""
+    """Один раз штрафует пользователя за отписку от канала.
+    Пригласивший штрафуется ТОЛЬКО если ему уже была выдана награда за этого реферала
+    (один раз за реферала) — он теряет ровно столько, сколько получил."""
     cur = await db.execute(f"UPDATE {table} SET penalized=1 WHERE {where} AND penalized=0", args)
     await db.commit()
     if cur.rowcount == 0:
@@ -973,26 +988,16 @@ async def apply_unsub_penalty(bot: Bot, uid: int, link: str, table: str, where: 
             f"За это мы списали с твоего баланса -{fmt(pen)} {STAR}")
     except Exception:
         pass
-    # штраф пригласившему — всегда, один раз за этого реферала
+    # пригласивший: один раз за реферала
     if u["referrer_id"] and not u["ref_penalized"]:
         c2 = await db.execute("UPDATE users SET ref_penalized=1 WHERE id=? AND ref_penalized=0", (uid,))
         await db.commit()
-        if c2.rowcount:
-            if u["ref_paid"]:
-                # награда уже была выдана — пригласивший теряет ровно столько, сколько получил
-                amt = u["ref_paid_amount"] or await get_setting("ref_reward")
-                await db.execute("UPDATE users SET balance=balance-?, earned=earned-? WHERE id=?",
-                                 (amt, amt, u["referrer_id"]))
-                tail = "Сумма равна награде, которую ты получил за этого реферала."
-            else:
-                # награду ещё не выдавали — обычный штраф за отписку, а награда за него больше не будет выдана
-                amt = pen
-                if PENALTY_ALLOW_NEGATIVE:
-                    await db.execute("UPDATE users SET balance=balance-? WHERE id=?", (amt, u["referrer_id"]))
-                else:
-                    await db.execute("UPDATE users SET balance=MAX(0, balance-?) WHERE id=?",
-                                     (amt, u["referrer_id"]))
-                tail = "Награда за этого реферала тебе больше не будет выдана."
+        # ref_penalized=1 в любом случае блокирует награду за этого реферала в будущем,
+        # а штраф пригласившему — только если награда ему уже была выдана
+        if c2.rowcount and u["ref_paid"]:
+            amt = u["ref_paid_amount"] or await get_setting("ref_reward")
+            await db.execute("UPDATE users SET balance=balance-?, earned=earned-? WHERE id=?",
+                             (amt, amt, u["referrer_id"]))
             await db.commit()
             try:
                 await bot.send_message(
@@ -1000,7 +1005,7 @@ async def apply_unsub_penalty(bot: Bot, uid: int, link: str, table: str, where: 
                     f"⚠️ Штраф за реферала\n\n"
                     f"Реферал {uref(u)} отписался от канала спонсора.\n\n"
                     f"С вашего баланса списано -{fmt(amt)} {STAR}\n"
-                    f"{tail}")
+                    f"Сумма равна награде, которую ты получил за этого реферала.")
             except Exception:
                 pass
 
@@ -1114,7 +1119,7 @@ async def check_unsubs(bot: Bot, budget: float = None) -> list:
     async def ext():
         rows = await fetchall(
             "SELECT e.* FROM ext_tasks e JOIN users u ON u.id=e.user_id "
-            "WHERE e.status='done' AND e.penalized=0 AND e.kind='channel' "
+            "WHERE e.status='done' AND e.penalized=0 AND e.kind='channel' AND e.provider!='test' "
             f"{REFC} AND e.day>=? "
             "ORDER BY COALESCE(e.checked_at,'') ASC, e.id ASC LIMIT 200", (cutoff,))
         pairs = await probe(rows, lambda r: EXT_CHECK[r["provider"]](r["user_id"], r))
@@ -1645,8 +1650,18 @@ async def check_traffy(uid: int, row):
     return "gone", ""
 
 
+# ---------- Тестовый спонсор (только для аккаунтов из SPONSOR_PICK_IDS, чтобы окно подписки
+# всегда содержало ровно столько спонсоров, сколько выбрано) ----------
+TEST_SPONSOR_LINK = "https://t.me/telegram"
+
+
+async def check_test(uid: int, row):
+    return "ok", ""
+
+
 EXT_NEXT = {"flowly": next_flowly, "traffy": next_traffy, "piarflow": next_piarflow, "trafsly": next_trafsly}
-EXT_CHECK = {"flowly": check_flowly, "trafsly": check_trafsly, "piarflow": check_piarflow, "traffy": check_traffy}
+EXT_CHECK = {"flowly": check_flowly, "trafsly": check_trafsly, "piarflow": check_piarflow, "traffy": check_traffy,
+             "test": check_test}
 
 
 async def next_ext_task(tgu, providers=("flowly", "traffy", "piarflow", "trafsly")):
@@ -1860,13 +1875,15 @@ async def g_trafsly(tgu, lang, n):
 
 
 # Окно подписки (/start): Flowly → TGrass → PiarFlow → Trafsly, именно в таком порядке.
-# (g_flyer и g_traffy остаются в коде — они используются в разделе «Задание» через TASK_ORDER.)
+# (g_flyer и g_traffy остаются в коде — они используются в разделе «Задание» через TASK_ORDER
+# и как запасные для аккаунтов с выбором числа спонсоров.)
 GATE_PROVIDERS = (g_flowly, g_tgrass, g_piarflow, g_trafsly)
 
 
-async def gate_collect(tgu, lang, limit: int = GATE_MAX):
+async def gate_collect(tgu, lang, limit: int = GATE_MAX, extra: bool = False):
     """Набирает до `limit` спонсоров: сначала по GATE_PER_PROVIDER от каждого сервиса по порядку
-    Flowly → TGrass → PiarFlow → Trafsly; если какой-то сервис ничего не дал — добираем из остальных."""
+    Flowly → TGrass → PiarFlow → Trafsly; если какой-то сервис ничего не дал — добираем из остальных.
+    extra=True (только аккаунты с выбором числа спонсоров) — в конце ещё Flyer и Traffy."""
     items, links = [], set()
 
     async def take(fn, n):
@@ -1890,6 +1907,11 @@ async def gate_collect(tgu, lang, limit: int = GATE_MAX):
         await take(fn, GATE_PER_PROVIDER)
     if len(items) < limit:                   # проход 2: добираем недостающих в том же порядке
         for fn in GATE_PROVIDERS:
+            if len(items) >= limit:
+                break
+            await take(fn, limit)
+    if extra and len(items) < limit:         # проход 3 (только для тестового аккаунта): Flyer и Traffy
+        for fn in (g_flyer, g_traffy):
             if len(items) >= limit:
                 break
             await take(fn, limit)
@@ -1934,10 +1956,24 @@ def gate_kb(items) -> InlineKeyboardMarkup:
 
 
 async def gate_show(bot: Bot, tgu, chat_id: int) -> bool:
-    """Показывает окно подписки. Возвращает False, если спонсоров нет (тогда пускаем в бота)."""
+    """Показывает окно подписки. Возвращает False, если спонсоров нет (тогда пускаем в бота).
+    Для аккаунтов из SPONSOR_PICK_IDS показывается РОВНО выбранное число спонсоров:
+    если сервисы дали меньше — недостающие заменяются тестовыми (проверка всегда успешна)."""
     items = await gate_pending(tgu.id)
     if not items:
-        items = await gate_collect(tgu, tgu.language_code, await gate_limit(tgu.id))
+        picker = tgu.id in SPONSOR_PICK_IDS
+        limit = await gate_limit(tgu.id)
+        if picker:
+            await db.execute("DELETE FROM ext_tasks WHERE provider='test' AND user_id=? AND status='shown'",
+                             (tgu.id,))
+        items = await gate_collect(tgu, tgu.language_code, limit, extra=picker)
+        if picker:
+            while len(items) < limit:
+                cur = await db.execute(
+                    "INSERT INTO ext_tasks(user_id,provider,ext_id,link,kind,status) VALUES(?,?,?,?,?,'shown')",
+                    (tgu.id, "test", "t" + uuid.uuid4().hex[:10], TEST_SPONSOR_LINK, "bot"))
+                row = await fetchone("SELECT * FROM ext_tasks WHERE id=?", (cur.lastrowid,))
+                items.append(("ext", row))
         own = await gate_own_item(tgu.id)  # твой канал — всегда последним
         if own:
             items.append(("own", own))
@@ -2103,13 +2139,12 @@ async def cmd_start(m: Message, command: CommandObject, state: FSMContext):
             await run("UPDATE users SET referrer_id=?, fresh=0 WHERE id=?", (r["id"], u["id"]))
             u, is_new = await get_user(u["id"]), True
     if is_new and u["referrer_id"]:
-        need = int(await get_setting("ref_tasks"))
         rr = fmt(await ref_reward_for(await get_user(u["referrer_id"])))
         try:
             await m.bot.send_message(
                 u["referrer_id"],
                 f"{BOLT} Пользователь {uref(u)} присоединился по твоей ссылке!\n\n"
-                f"Ты получишь {rr} {STAR}, как только он подпишется на {need} спонсоров")
+                f"Ты получишь {rr} {STAR}, как только он подпишется на спонсоров")
         except Exception:
             pass
     if m.from_user.id in SPONSOR_PICK_IDS:
@@ -2443,14 +2478,14 @@ async def gate_check(c: CallbackQuery):
         if isinstance(st, BaseException):
             st = "wait"
         if st == "ok":
-            if await gate_mark(src, r, "done", uid) and GATE_PAYS_REWARD and src != "own":
+            is_test = src == "ext" and r["provider"] == "test"
+            if await gate_mark(src, r, "done", uid) and GATE_PAYS_REWARD and src != "own" and not is_test:
                 await credit(uid, await get_setting(gate_reward_key(src, r)))
         elif st == "gone":
             if src != "own":
                 await gate_mark(src, r, "skip", uid)
         elif st == "no":
             no += 1
-    await try_pay_referrer(c.bot, uid)
     remaining = await gate_pending(uid)
     if remaining:
         await c.answer("❌ Ты подписался не на все каналы. Подпишись и нажми «Проверить подписку» ещё раз"
@@ -2463,6 +2498,7 @@ async def gate_check(c: CallbackQuery):
     await db.execute("UPDATE users SET gate_ok=1 WHERE id=?", (uid,))
     await db.execute("DELETE FROM gate_items WHERE user_id=?", (uid,))
     await db.commit()
+    await try_pay_referrer(c.bot, uid)   # награда только после прохождения всего окна подписки
     days = int(await get_setting("unsub_days"))
     text = (f"{CHECK_E} Спасибо за подписку!\n\n{WARN_E} Не отписывайся от каналов в течение как минимум {days} дней. "
             f"В противном случае, ты получишь штраф или блокировку аккаунта.")
@@ -3669,21 +3705,19 @@ async def a_cast_go(c: CallbackQuery, state: FSMContext):
 # ---------- Настройки ----------
 async def settings_view():
     rr, rt = await get_setting("ref_reward"), int(await get_setting("ref_tasks"))
-    rm = int(await get_setting("ref_min"))
     pen = await get_setting("unsub_penalty")
     fr = await get_setting("flyer_reward")
     gr = await get_setting("tgrass_reward")
     xr = {k: await get_setting(f"{k}_reward") for k in EXT_NAMES}
     text = (f"⚙️ <b>Настройки</b>\n\n"
             f"💰 Награда за реферала: <b>{fmt(rr)}</b> ⭐\n"
-            f"🎯 Спонсоров для награды: <b>{rt}</b> (если выдано меньше — минимум: <b>{rm}</b>)\n"
+            f"🎯 Спонсоров с сервисов для награды: <b>{rt}</b> (меньше — награды нет)\n"
             f"😡 Штраф за отписку: <b>{fmt(pen)}</b> ⭐\n"
             f"🛰 Flyer: <b>{fmt(fr)}</b> ⭐ · 🌿 TGrass: <b>{fmt(gr)}</b> ⭐\n"
             f"📡 Flowly: <b>{fmt(xr['flowly'])}</b> ⭐ · Traffy: <b>{fmt(xr['traffy'])}</b> ⭐ · "
             f"PiarFlow: <b>{fmt(xr['piarflow'])}</b> ⭐ · Trafsly: <b>{fmt(xr['trafsly'])}</b> ⭐")
     return text, kb([btn("💰 Награда за реферала", cb="a:set:ref_reward", style="primary")],
-                    [btn("🎯 Кол-во спонсоров", cb="a:set:ref_tasks", style="primary"),
-                     btn("✅ Мин. спонсоров", cb="a:set:ref_min", style="primary")],
+                    [btn("🎯 Кол-во спонсоров", cb="a:set:ref_tasks", style="primary")],
                     [btn("😡 Штраф за отписку", cb="a:set:unsub_penalty", style="danger")],
                     [btn("🛰 Flyer", cb="a:set:flyer_reward", style="success"),
                      btn("🌿 TGrass", cb="a:set:tgrass_reward", style="success"),
