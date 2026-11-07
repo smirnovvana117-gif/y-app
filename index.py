@@ -15,8 +15,15 @@
 5 PiarFlow, 6 Trafsly (+ свои задания админа в последнюю очередь).
 
 НАГРАДА ЗА РЕФЕРАЛА: платится ОДИН раз, когда реферал прошёл окно подписки целиком
-(включая твои каналы) и выполнил не меньше 2 спонсоров с сервисов (настройка ref_tasks, по умолчанию 2).
-Твои каналы в этот счёт не входят. Если спонсоров меньше двух — награды нет.
+(включая твои каналы) и выполнил не меньше N спонсоров с сервисов (настройка ref_tasks, по умолчанию 2).
+Твои каналы в этот счёт не входят. Если спонсоров меньше порога — награды нет.
+
+ИНДИВИДУАЛЬНЫЕ НАСТРОЙКИ ПОЛЬЗОВАТЕЛЯ (Админ-панель → 👥 Пользователи → карточка):
+ • 🎁 Награда за реферала — сколько ⭐ получает ЭТОТ пользователь за каждого приглашённого;
+ • 🎯 Порог спонсоров — сколько спонсоров с сервисов должен выполнить КАЖДЫЙ его реферал,
+   чтобы пригласивший получил награду (0 = сразу после окна подписки);
+ • 🔢 Спонсоров в окне подписки — сколько спонсоров от интеграций видит ЭТОТ пользователь при /start.
+ Если индивидуальное значение не задано — действует общая настройка (⚙️ Настройки).
 
 ШТРАФ ЗА ОТПИСКУ: штраф получает сам пользователь. Пригласивший штрафуется ТОЛЬКО если ему
 уже была выдана награда за этого реферала (теряет ровно столько, сколько получил). Если награду
@@ -93,6 +100,8 @@ PENALTY_ALLOW_NEGATIVE = True
 # Для этих аккаунтов показывается РОВНО выбранное число спонсоров (недостающие — тестовые).
 SPONSOR_PICK_IDS = {8956779618}
 SPONSOR_PICK_MAX = 5
+# Максимум для индивидуальной настройки «спонсоров в окне подписки» из админ-панели
+GATE_CUSTOM_MAX = 10
 # =====================================================================
 
 
@@ -162,8 +171,8 @@ DEFAULT_SETTINGS = {
     "unsub_days": "3",        # сколько дней после выполнения задания следим за отпиской
     "gate_max": "3",          # сколько спонсоров от интеграций показывать в окне подписки
 }
-# эти значения принудительно обновятся один раз при смене SCHEMA_V (потом меняются в админке)
-FORCE_SETTINGS = {"ref_tasks": "2", "ref_min": "2"}
+# Принудительно перезаписываются при смене SCHEMA_V. Пусто — чтобы не сбрасывать настройки, выставленные в админке.
+FORCE_SETTINGS = {}
 UNSUB_CHECK_INTERVAL = 5 * 60  # как часто проверять отписки (сек)
 DEFAULT_TASK_REWARD = 0.25
 
@@ -483,7 +492,7 @@ async def run(sql, args=()):
     return cur
 
 
-SCHEMA_V = "9"  # увеличь, если меняешь таблицы/настройки по умолчанию
+SCHEMA_V = "10"  # увеличь, если меняешь таблицы/настройки по умолчанию
 
 
 async def init_db():
@@ -567,6 +576,9 @@ REQUIRED_COLUMNS = {
         "ref_penalized": "INTEGER DEFAULT 0", "fresh": "INTEGER DEFAULT 0",
         "ref_reward_custom": "REAL", "ref_paid_amount": "REAL DEFAULT 0", "gate_ok": "INTEGER DEFAULT 0",
         "gate_n": "INTEGER DEFAULT 0",
+        # индивидуальные настройки (NULL = действует общая настройка)
+        "ref_tasks_custom": "INTEGER",   # порог спонсоров для рефералов ЭТОГО пользователя
+        "gate_custom": "INTEGER",        # сколько спонсоров в окне подписки видит ЭТОТ пользователь
     },
     "flyer_tasks": {"penalized": "INTEGER DEFAULT 0", "checked_at": "TEXT"},
     "tgrass_tasks": {"penalized": "INTEGER DEFAULT 0", "checked_at": "TEXT"},
@@ -689,6 +701,14 @@ async def ref_reward_for(u) -> float:
     if u is not None and u["ref_reward_custom"] is not None:
         return float(u["ref_reward_custom"])
     return await get_setting("ref_reward")
+
+
+async def ref_tasks_for(u) -> int:
+    """Порог спонсоров для рефералов пригласившего u: индивидуальный (если задан в админке) или общий.
+    0 — награда сразу после прохождения окна подписки."""
+    if u is not None and u["ref_tasks_custom"] is not None:
+        return max(0, int(u["ref_tasks_custom"]))
+    return max(1, int(await get_setting("ref_tasks")))
 
 
 async def ref_text(u) -> str:
@@ -916,15 +936,16 @@ async def sponsors_done(uid: int) -> int:
 async def try_pay_referrer(bot: Bot, uid: int, exhausted: bool = False):
     """Платит рефереру за реферала uid ОДИН раз, когда:
     • реферал прошёл окно подписки целиком (gate_ok=1, включая твои каналы);
-    • выполнено не меньше ref_tasks (по умолчанию 2) спонсоров с сервисов — меньше двух = награды нет;
+    • выполнено не меньше порога спонсоров с сервисов — индивидуального порога пригласившего
+      (карточка пользователя в админке) или общего ref_tasks (по умолчанию 2);
     • реферал не отписывался раньше (иначе награда за него не выдаётся)."""
     u = await get_user(uid)
     if not u or not u["referrer_id"] or u["ref_paid"] or u["ref_penalized"] or not u["gate_ok"]:
         return
-    need = max(1, int(await get_setting("ref_tasks")))
-    if await sponsors_done(uid) < need:
-        return
     referrer = await get_user(u["referrer_id"])
+    need = await ref_tasks_for(referrer)
+    if need > 0 and await sponsors_done(uid) < need:
+        return
     rr = await ref_reward_for(referrer)
     cur = await db.execute("UPDATE users SET ref_paid=1, ref_paid_amount=? WHERE id=? AND ref_paid=0", (rr, uid))
     await db.commit()
@@ -1702,13 +1723,17 @@ def gate_reward_key(src: str, row) -> str:
 
 
 async def gate_limit(uid: int) -> int:
-    """Сколько спонсоров показывать в окне подписки: для аккаунтов из SPONSOR_PICK_IDS — их выбор (1–5),
-    для остальных — настройка gate_max (Админ-панель → 📌 Каналы в окне подписки)."""
-    if uid in SPONSOR_PICK_IDS:
-        r = await fetchone("SELECT gate_n FROM users WHERE id=?", (uid,))
-        n = int(r["gate_n"] or 0) if r else 0
+    """Сколько спонсоров показывать в окне подписки:
+    • аккаунты из SPONSOR_PICK_IDS — их собственный выбор (1–5);
+    • иначе индивидуальное значение из админки (карточка пользователя), если задано;
+    • иначе общая настройка gate_max (Админ-панель → 📌 Каналы в окне подписки)."""
+    r = await fetchone("SELECT gate_n, gate_custom FROM users WHERE id=?", (uid,))
+    if uid in SPONSOR_PICK_IDS and r:
+        n = int(r["gate_n"] or 0)
         if 1 <= n <= SPONSOR_PICK_MAX:
             return n
+    if r and r["gate_custom"] is not None and int(r["gate_custom"]) >= 1:
+        return int(r["gate_custom"])
     return max(1, int(await get_setting("gate_max")))
 
 
@@ -1870,7 +1895,7 @@ GATE_PROVIDERS = (g_flowly, g_tgrass, g_piarflow, g_trafsly)
 async def gate_collect(tgu, lang, limit: int = GATE_MAX, extra: bool = False):
     """Набирает до `limit` спонсоров: сначала по GATE_PER_PROVIDER от каждого сервиса по порядку
     Flowly → TGrass → PiarFlow → Trafsly; если какой-то сервис ничего не дал — добираем из остальных.
-    extra=True (только аккаунты с выбором числа спонсоров) — в конце ещё Flyer и Traffy."""
+    extra=True (аккаунты с выбором числа спонсоров) — в конце ещё Flyer и Traffy."""
     items, links = [], set()
     empty = set()  # сервисы, которые ничего не дали (пусто или ошибка) — второй раз их не опрашиваем
 
@@ -1903,7 +1928,7 @@ async def gate_collect(tgu, lang, limit: int = GATE_MAX, extra: bool = False):
             if len(items) >= limit:
                 break
             await take(fn, limit)
-    if extra and len(items) < limit:         # проход 3 (только для тестового аккаунта): Flyer и Traffy
+    if extra and len(items) < limit:         # проход 3 (для аккаунтов с выбором): Flyer и Traffy
         for fn in (g_flyer, g_traffy):
             if len(items) >= limit:
                 break
@@ -2096,7 +2121,9 @@ class Cast(StatesGroup):
 class UserAdm(StatesGroup):
     find = State()
     amount = State()
-    custom = State()
+    custom = State()      # индивидуальная награда за реферала
+    thr = State()         # индивидуальный порог спонсоров
+    gatec = State()       # индивидуальное число спонсоров в окне подписки
 
 
 class SetSt(StatesGroup):
@@ -2197,7 +2224,7 @@ async def cmd_reset(m: Message, state: FSMContext):
     await state.clear()
     u, _ = await get_or_create_user(m.from_user)
     uid = u["id"]
-    # gate_n (выбор числа спонсоров) при сбросе НЕ трогаем
+    # gate_n (выбор числа спонсоров) и индивидуальные настройки при сбросе НЕ трогаем
     await db.execute("UPDATE users SET balance=0, earned=0, withdrawn=0, referrer_id=NULL, ref_paid=0, "
                      "ref_penalized=0, ref_paid_amount=0, gate_ok=0, fresh=1 WHERE id=?", (uid,))
     for table in ("user_tasks", "flyer_tasks", "tgrass_tasks", "ext_tasks", "promo_uses", "gate_items"):
@@ -3306,7 +3333,8 @@ async def gate_ch_view():
         btns.append([btn(f"{icon} #{t['id']} {t['url'][:45]}", cb=f"a:gv:{t['id']}")])
     text = ("📌 <b>Каналы в окне подписки</b>\n\n"
             f"Твоих каналов: <b>{len(rows)}</b> (показываются все включённые)\n"
-            f"Спонсоров от интеграций: <b>{n}</b>\n\n"
+            f"Спонсоров от интеграций (по умолчанию): <b>{n}</b>\n"
+            f"<i>Для отдельного пользователя можно задать своё число: Пользователи → карточка → 🔢</i>\n\n"
             "Бот должен быть <b>админом</b> в каждом канале — иначе подписку не проверить.")
     btns.append([btn("➕ Добавить канал", cb="a:gadd", style="success")])
     btns.append([btn(f"🔢 Спонсоров от интеграций: {n}", cb="a:set:gate_max", style="primary")])
@@ -3518,23 +3546,34 @@ async def user_card(uid: int):
     in_code = uid in RESET_IDS
     has_e = in_code or bool(await fetchone("SELECT 1 FROM reset_access WHERE user_id=?", (uid,)))
     uname = f"@{u['username']}" if u["username"] else "—"
+
+    # --- индивидуальные настройки пользователя ---
     custom = u["ref_reward_custom"]
     rr_line = (f"🎁 Награда за реферала: <b>{fmt(custom)} ⭐</b> (индивидуальная)" if custom is not None
                else f"🎁 Награда за реферала: {fmt(await get_setting('ref_reward'))} ⭐ (стандартная)")
+    thr = u["ref_tasks_custom"]
+    thr_line = (f"🎯 Порог спонсоров для его рефералов: <b>{int(thr)}</b> (индивидуальный)" if thr is not None
+                else f"🎯 Порог спонсоров для его рефералов: {int(await get_setting('ref_tasks'))} (стандартный)")
+    gc = u["gate_custom"]
+    gc_line = (f"🔢 Спонсоров в его окне подписки: <b>{int(gc)}</b> (индивидуально)" if gc is not None
+               else f"🔢 Спонсоров в его окне подписки: {int(await get_setting('gate_max'))} (стандартно)")
+    if uid in SPONSOR_PICK_IDS:
+        gc_line = f"🔢 Спонсоров в окне подписки: {await gate_limit(uid)} (выбор аккаунта через /n)"
+
     e_line = ("♻️ Команда /e: доступна ✅" + (" (прописана в коде)" if in_code else "")) if has_e \
         else "♻️ Команда /e: нет доступа"
-    pick_line = ""
-    if uid in SPONSOR_PICK_IDS:
-        pick_line = f"\n🎛 Спонсоров в окне подписки: {await gate_limit(uid)} (выбор аккаунта)"
     text = (f"👤 <b>{esc(u['full_name'])}</b> ({esc(uname)})\n"
             f"ID: <code>{uid}</code>\n"
             f"Регистрация: {u['created_at']}\n"
             f"Пригласил: {u['referrer_id'] or '—'}\n\n"
             f"💰 Баланс: {fmt(u['balance'])} ⭐\n"
             f"📈 Заработано: {fmt(u['earned'])} · 📤 Выведено: {fmt(u['withdrawn'])}\n"
-            f"👥 Рефералов: {invited} · ✅ Заданий: {done} (живых: {valid})\n"
+            f"👥 Рефералов: {invited} · ✅ Заданий: {done} (живых: {valid})\n\n"
+            f"<b>Индивидуальные настройки:</b>\n"
             f"{rr_line}\n"
-            f"{e_line}{pick_line}\n"
+            f"{thr_line}\n"
+            f"{gc_line}\n\n"
+            f"{e_line}\n"
             f"Статус: {'🚫 забанен' if u['banned'] else '✅ активен'}")
     if has_e:
         e_btn = btn("🚫 Забрать /e", cb=f"a:ure:{uid}", style="danger")
@@ -3545,6 +3584,8 @@ async def user_card(uid: int):
          btn("➖ Списать", cb=f"a:usub:{uid}", style="danger")],
         [btn(f"👥 Рефералы ({invited})", cb=f"a:uref:{uid}:0", style="primary")],
         [btn("🎁 Награда за реферала", cb=f"a:ucr:{uid}", style="success")],
+        [btn("🎯 Порог спонсоров", cb=f"a:uct:{uid}", style="success")],
+        [btn("🔢 Спонсоров в окне подписки", cb=f"a:ugc:{uid}", style="success")],
         [e_btn],
         [btn("✅ Разбанить" if u["banned"] else "🚫 Забанить", cb=f"a:uban:{uid}", style="primary")],
         [btn("◀️ Назад", cb="a:users")])
@@ -3633,7 +3674,7 @@ async def a_user_refs(c: CallbackQuery):
     owner = await get_user(uid)
     if not owner:
         return await c.answer("Не найден")
-    need = int(await get_setting("ref_tasks"))
+    need = await ref_tasks_for(owner)   # индивидуальный порог этого пользователя (или общий)
     total = await ref_count(uid)
     rows = await fetchall(
         "SELECT u.id, u.username, u.full_name, u.ref_paid, u.ref_penalized, "
@@ -3713,6 +3754,108 @@ async def a_user_custom_value(m: Message, state: FSMContext):
         except Exception:
             return await m.answer("❌ Введи число больше нуля (или «-» чтобы вернуть стандартную)")
         await run("UPDATE users SET ref_reward_custom=? WHERE id=?", (r, d["uid"]))
+    await state.clear()
+    text, markup = await user_card(d["uid"])
+    await m.answer("✅ Сохранено\n\n" + text, reply_markup=markup)
+
+
+# ---------- Индивидуальный порог спонсоров (сколько спонсоров должен выполнить его реферал) ----------
+@admin.callback_query(F.data.startswith("a:uct:"))
+async def a_user_thr(c: CallbackQuery, state: FSMContext):
+    uid = int(c.data.split(":")[2])
+    u = await get_user(uid)
+    if not u:
+        return await c.answer("Не найден")
+    await state.set_state(UserAdm.thr)
+    await state.update_data(uid=uid)
+    gen = int(await get_setting("ref_tasks"))
+    cur = f"{int(u['ref_tasks_custom'])}" if u["ref_tasks_custom"] is not None else f"стандартный ({gen})"
+    await edit(c, f"🎯 <b>Порог спонсоров для рефералов {esc(u['full_name'])}</b>\n\n"
+                  f"Сейчас: <b>{cur}</b>\n\n"
+                  f"Введи, сколько спонсоров с сервисов должен выполнить <b>каждый приглашённый им</b> "
+                  f"пользователь, чтобы {esc(u['full_name'])} получил награду за реферала.\n"
+                  f"Например <code>1</code>, <code>3</code>, <code>5</code>. "
+                  f"<code>0</code> — награда сразу после окна подписки.\n"
+                  f"Применяется и к уже приглашённым, которым награда ещё не выдана.",
+               kb([btn("♻️ Вернуть стандартный", cb=f"a:uctx:{uid}", style="danger")],
+                  [btn("✖️ Отмена", cb=f"a:ucrc:{uid}", style="primary")]))
+    await c.answer()
+
+
+@admin.callback_query(F.data.startswith("a:uctx:"))
+async def a_user_thr_reset(c: CallbackQuery, state: FSMContext):
+    uid = int(c.data.split(":")[2])
+    await run("UPDATE users SET ref_tasks_custom=NULL WHERE id=?", (uid,))
+    await state.clear()
+    text, markup = await user_card(uid)
+    await edit(c, text, markup)
+    await c.answer("Стандартный порог ♻️")
+
+
+@admin.message(UserAdm.thr, F.text)
+async def a_user_thr_value(m: Message, state: FSMContext):
+    v = m.text.strip()
+    d = await state.get_data()
+    if v == "-":
+        await run("UPDATE users SET ref_tasks_custom=NULL WHERE id=?", (d["uid"],))
+    else:
+        try:
+            n = int(v)
+            assert 0 <= n <= 100
+        except Exception:
+            return await m.answer("❌ Введи целое число от 0 до 100 (или «-» чтобы вернуть стандартный)")
+        await run("UPDATE users SET ref_tasks_custom=? WHERE id=?", (n, d["uid"]))
+    await state.clear()
+    text, markup = await user_card(d["uid"])
+    await m.answer("✅ Сохранено\n\n" + text, reply_markup=markup)
+
+
+# ---------- Индивидуальное число спонсоров в окне подписки ----------
+@admin.callback_query(F.data.startswith("a:ugc:"))
+async def a_user_gate(c: CallbackQuery, state: FSMContext):
+    uid = int(c.data.split(":")[2])
+    u = await get_user(uid)
+    if not u:
+        return await c.answer("Не найден")
+    if uid in SPONSOR_PICK_IDS:
+        return await c.answer("У этого аккаунта число спонсоров выбирается самим через /n", show_alert=True)
+    await state.set_state(UserAdm.gatec)
+    await state.update_data(uid=uid)
+    gen = int(await get_setting("gate_max"))
+    cur = f"{int(u['gate_custom'])}" if u["gate_custom"] is not None else f"стандартно ({gen})"
+    await edit(c, f"🔢 <b>Спонсоров в окне подписки для {esc(u['full_name'])}</b>\n\n"
+                  f"Сейчас: <b>{cur}</b>\n\n"
+                  f"Введи, сколько спонсоров от интеграций показывать этому пользователю при /start "
+                  f"(от 1 до {GATE_CUSTOM_MAX}). Твои каналы добавляются отдельно.\n"
+                  f"Действует, когда окно подписки собирается заново (новый пользователь или после сброса).",
+               kb([btn("♻️ Вернуть стандартное", cb=f"a:ugcx:{uid}", style="danger")],
+                  [btn("✖️ Отмена", cb=f"a:ucrc:{uid}", style="primary")]))
+    await c.answer()
+
+
+@admin.callback_query(F.data.startswith("a:ugcx:"))
+async def a_user_gate_reset(c: CallbackQuery, state: FSMContext):
+    uid = int(c.data.split(":")[2])
+    await run("UPDATE users SET gate_custom=NULL WHERE id=?", (uid,))
+    await state.clear()
+    text, markup = await user_card(uid)
+    await edit(c, text, markup)
+    await c.answer("Стандартное число ♻️")
+
+
+@admin.message(UserAdm.gatec, F.text)
+async def a_user_gate_value(m: Message, state: FSMContext):
+    v = m.text.strip()
+    d = await state.get_data()
+    if v == "-":
+        await run("UPDATE users SET gate_custom=NULL WHERE id=?", (d["uid"],))
+    else:
+        try:
+            n = int(v)
+            assert 1 <= n <= GATE_CUSTOM_MAX
+        except Exception:
+            return await m.answer(f"❌ Введи целое число от 1 до {GATE_CUSTOM_MAX} (или «-» чтобы вернуть стандартное)")
+        await run("UPDATE users SET gate_custom=? WHERE id=?", (n, d["uid"]))
     await state.clear()
     text, markup = await user_card(d["uid"])
     await m.answer("✅ Сохранено\n\n" + text, reply_markup=markup)
@@ -3802,16 +3945,18 @@ async def settings_view():
     gr = await get_setting("tgrass_reward")
     gm = int(await get_setting("gate_max"))
     xr = {k: await get_setting(f"{k}_reward") for k in EXT_NAMES}
-    text = (f"⚙️ <b>Настройки</b>\n\n"
+    text = (f"⚙️ <b>Настройки (общие, для всех)</b>\n\n"
             f"💰 Награда за реферала: <b>{fmt(rr)}</b> ⭐\n"
-            f"🎯 Спонсоров с сервисов для награды: <b>{rt}</b> (меньше — награды нет)\n"
+            f"🎯 Порог спонсоров для награды: <b>{rt}</b> (меньше — награды нет)\n"
             f"🔢 Спонсоров от интеграций в окне подписки: <b>{gm}</b>\n"
             f"😡 Штраф за отписку: <b>{fmt(pen)}</b> ⭐\n"
             f"🛰 Flyer: <b>{fmt(fr)}</b> ⭐ · 🌿 TGrass: <b>{fmt(gr)}</b> ⭐\n"
             f"📡 Flowly: <b>{fmt(xr['flowly'])}</b> ⭐ · Traffy: <b>{fmt(xr['traffy'])}</b> ⭐ · "
-            f"PiarFlow: <b>{fmt(xr['piarflow'])}</b> ⭐ · Trafsly: <b>{fmt(xr['trafsly'])}</b> ⭐")
+            f"PiarFlow: <b>{fmt(xr['piarflow'])}</b> ⭐ · Trafsly: <b>{fmt(xr['trafsly'])}</b> ⭐\n\n"
+            f"<i>Для отдельного человека награда, порог и число спонсоров в окне задаются в "
+            f"👥 Пользователи → карточка пользователя.</i>")
     return text, kb([btn("💰 Награда за реферала", cb="a:set:ref_reward", style="primary")],
-                    [btn("🎯 Кол-во спонсоров", cb="a:set:ref_tasks", style="primary")],
+                    [btn("🎯 Порог спонсоров для награды", cb="a:set:ref_tasks", style="primary")],
                     [btn("😡 Штраф за отписку", cb="a:set:unsub_penalty", style="danger")],
                     [btn("🛰 Flyer", cb="a:set:flyer_reward", style="success"),
                      btn("🌿 TGrass", cb="a:set:tgrass_reward", style="success"),
@@ -3836,7 +3981,8 @@ async def a_set_key(c: CallbackQuery, state: FSMContext):
     key = c.data.split(":")[2]
     await state.set_state(SetSt.value)
     await state.update_data(key=key)
-    label = {"ref_reward": "награду за реферала (⭐)", "ref_tasks": "количество спонсоров",
+    label = {"ref_reward": "награду за реферала (⭐)",
+             "ref_tasks": "порог: сколько спонсоров должен выполнить реферал (шт.)",
              "ref_min": "минимум спонсоров, при котором платим (шт.)",
              "unsub_penalty": "штраф за отписку (⭐)",
              "flyer_reward": "награду за задание Flyer (⭐)",
