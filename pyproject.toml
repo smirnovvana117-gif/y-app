@@ -7,6 +7,3 @@ dependencies = [
     "aiogram",
     "aiohttp",
 ]
-
-[tool.vercel]
-entrypoint = "bot:app"
