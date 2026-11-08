@@ -2445,8 +2445,7 @@ async def _with_bot(fn):
         await http.close()
 
 
-@app.post("/api/webhook")
-async def tg_webhook(request: Request):
+async def _handle_webhook(request: Request):
     if WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
         raise HTTPException(403)
     data = await request.json()
@@ -2458,15 +2457,43 @@ async def tg_webhook(request: Request):
     return {"ok": True}
 
 
-@app.get("/api/cron")
-async def tg_cron(request: Request):
+async def _handle_cron(request: Request):
     if CRON_SECRET and request.headers.get("Authorization") != f"Bearer {CRON_SECRET}":
         raise HTTPException(403)
     return {"report": await _with_bot(check_unsubs)}
 
 
-@app.post("/api/hook/{provider}")
-async def tg_provider_hook(provider: str, request: Request):
+async def _handle_hook(provider: str, request: Request):
     payload = await request.json()
     n = await _with_bot(lambda bot: handle_provider_hook(bot, provider, payload))
     return {"penalized": n}
+
+
+@app.post("/api/webhook")
+async def tg_webhook(request: Request):
+    return await _handle_webhook(request)
+
+
+@app.get("/api/cron")
+async def tg_cron(request: Request):
+    return await _handle_cron(request)
+
+
+@app.post("/api/hook/{provider}")
+async def tg_provider_hook(provider: str, request: Request):
+    return await _handle_hook(provider, request)
+
+
+# Совместимость со старыми перезаписями vercel.json вида /api/index?route=webhook
+@app.api_route("/api/index", methods=["GET", "POST"])
+async def tg_legacy(request: Request):
+    route = (request.query_params.get("route") or "").strip("/")
+    if route == "webhook":
+        return await _handle_webhook(request)
+    if route == "cron":
+        return await _handle_cron(request)
+    if route.startswith("hook/"):
+        return await _handle_hook(route.split("/", 1)[1], request)
+    if route in ("piarflow", "trafsly", "traffy"):
+        return await _handle_hook(route, request)
+    raise HTTPException(404)
