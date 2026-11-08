@@ -68,10 +68,14 @@ TRAFFY_URL = "https://api.traffy.ai/publisher"
 RESET_IDS = {792875116, 8789146386, 8956779618}
 POST_PAYOUTS_TO_CHANNEL = False  # True -> после выплаты бот пишет в канал (бот должен быть админом)
 
+# Сколько заданий СПОНСОРОВ (Flyer / TGrass / PiarFlow / Trafsly / Traffy) должен выполнить реферал,
+# чтобы пригласивший получил награду. Свои задания админа в счёт не идут.
+REF_MIN_SPONSORS = 2
+
 # Настройки по умолчанию (потом меняются в админке: ⚙️ Настройки)
 DEFAULT_SETTINGS = {
     "ref_reward": "4.5",  # награда за реферала
-    "ref_tasks": "7",     # сколько заданий должен выполнить реферал, чтобы ты получил награду
+    "ref_tasks": "7",     # (больше не используется: порог задаётся константой REF_MIN_SPONSORS)
     "flyer_reward": "0.25",  # награда пользователю за одно задание от Flyer
     "tgrass_reward": "0.25",  # награда пользователю за одно задание от TGrass
     "trafsly_reward": "0.25",  # награда за одно задание Trafsly
@@ -501,6 +505,18 @@ async def ref_tasks_done(uid: int) -> int:
     return r["c"]
 
 
+async def sponsors_done(uid: int) -> int:
+    """Сколько заданий СПОНСОРОВ (Flyer/TGrass/PiarFlow/Trafsly/Traffy) выполнил пользователь.
+    Свои задания админа не считаются; задания, за отписку от которых был штраф, тоже."""
+    cond = "user_id=? AND status='done' AND COALESCE(penalized,0)=0"
+    r = await fetchone(
+        f"SELECT (SELECT COUNT(*) FROM flyer_tasks WHERE {cond}) + "
+        f"(SELECT COUNT(*) FROM tgrass_tasks WHERE {cond}) + "
+        f"(SELECT COUNT(*) FROM ext_tasks WHERE {cond}) AS c",
+        (uid, uid, uid))
+    return r["c"]
+
+
 # ============================== ТЕКСТЫ ==============================
 def ref_link(code: str) -> str:
     return f"https://t.me/{BOT_USERNAME}?start={code}"
@@ -508,7 +524,7 @@ def ref_link(code: str) -> str:
 
 async def ref_text(u) -> str:
     rr = fmt(await get_setting("ref_reward"))
-    need = int(await get_setting("ref_tasks"))
+    need = REF_MIN_SPONSORS
     cnt = await ref_count(u["id"])
     return (
         f"<b>Получай +{rr} {STAR} за каждого приглашенного друга!</b>\n\n"
@@ -518,7 +534,7 @@ async def ref_text(u) -> str:
         f"<b>Приглашено тобой:</b> {cnt} {USER_E}\n\n"
         f"{HEART}<b>Как это работает:</b>\n"
         f"╠ Отправь свою ссылку другу\n"
-        f"╠ Друг заходит и выполняет {need} заданий\n"
+        f"╠ Друг заходит и выполняет заданий спонсоров: {need}\n"
         f"╚ Ты получаешь {rr}{STAR} сразу же!"
     )
 
@@ -654,14 +670,16 @@ async def credit(uid: int, amount: float):
 
 
 async def after_task_done(bot: Bot, uid: int, reward: float):
-    """Начисляет награду за задание и, если нужно, награду рефереру."""
+    """Начисляет награду за задание и, если нужно, награду рефереру
+    (когда реферал выполнил REF_MIN_SPONSORS заданий спонсоров)."""
     await credit(uid, reward)
     u = await get_user(uid)
     if not u["referrer_id"] or u["ref_paid"]:
         return
-    need = int(await get_setting("ref_tasks"))
-    done = (await fetchone("SELECT COUNT(*) c FROM done_tasks WHERE user_id=?", (uid,)))["c"]
+    need = REF_MIN_SPONSORS
+    done = await sponsors_done(uid)
     if done < need:
+        logging.info("ref wait user=%s: спонсоров %s из %s", uid, done, need)
         return
     cur = await db.execute("UPDATE users SET ref_paid=1 WHERE id=? AND ref_paid=0", (uid,))
     await db.commit()
@@ -1333,13 +1351,13 @@ async def cmd_start(m: Message, command: CommandObject, state: FSMContext):
             await run("UPDATE users SET referrer_id=?, fresh=0 WHERE id=?", (r["id"], u["id"]))
             u, is_new = await get_user(u["id"]), True
     if is_new and u["referrer_id"]:
-        need = int(await get_setting("ref_tasks"))
+        need = REF_MIN_SPONSORS
         rr = fmt(await get_setting("ref_reward"))
         try:
             await m.bot.send_message(
                 u["referrer_id"],
                 f"{BOLT} Пользователь {uref(u)} присоединился по твоей ссылке!\n\n"
-                f"Ты получишь {rr} {STAR}, как только он выполнит {need} заданий")
+                f"Ты получишь {rr} {STAR}, как только он выполнит заданий спонсоров: {need}")
         except Exception:
             pass
     await set_menu(m)
@@ -1835,6 +1853,28 @@ async def a_tgrass(m: Message):
     await m.answer(f"🌿 <b>TGrass /{TGRASS_ENDPOINT} (для тебя)</b>\n<pre>{text}</pre>")
 
 
+@admin.message(Command("refdbg"))
+async def a_refdbg(m: Message, command: CommandObject):
+    """/refdbg <ID реферала> — почему не выдана награда пригласившему."""
+    try:
+        uid = int(command.args)
+    except Exception:
+        return await m.answer("Использование: /refdbg 123456789")
+    u = await get_user(uid)
+    if not u:
+        return await m.answer("Пользователь не найден")
+    done = await sponsors_done(uid)
+    parts = []
+    for t in ("flyer_tasks", "tgrass_tasks", "ext_tasks"):
+        rows = await fetchall(
+            f"SELECT status, COALESCE(penalized,0) p, COUNT(*) c FROM {t} WHERE user_id=? GROUP BY 1,2", (uid,))
+        parts.append(f"{t}: " + (", ".join(f"{r['status']}/pen={r['p']}x{r['c']}" for r in rows) or "-"))
+    await m.answer("<pre>" + html.escape(
+        f"referrer_id: {u['referrer_id']}\n"
+        f"ref_paid: {u['ref_paid']} | ref_penalized: {u['ref_penalized']}\n"
+        f"спонсоров засчитано: {done} / нужно: {REF_MIN_SPONSORS}\n\n" + "\n".join(parts)) + "</pre>")
+
+
 # ---------- Статистика ----------
 @admin.callback_query(F.data == "a:stats")
 async def a_stats(c: CallbackQuery, state: FSMContext):
@@ -2318,19 +2358,18 @@ async def a_cast_go(c: CallbackQuery, state: FSMContext):
 
 # ---------- Настройки ----------
 async def settings_view():
-    rr, rt = await get_setting("ref_reward"), int(await get_setting("ref_tasks"))
+    rr = await get_setting("ref_reward")
     fr = await get_setting("flyer_reward")
     gr = await get_setting("tgrass_reward")
     xr = {k: await get_setting(f"{k}_reward") for k in EXT_NAMES}
     text = (f"⚙️ <b>Настройки</b>\n\n"
             f"💰 Награда за реферала: <b>{fmt(rr)}</b> ⭐\n"
-            f"🎯 Заданий для получения награды: <b>{rt}</b>\n"
+            f"🎯 Заданий спонсоров для награды: <b>{REF_MIN_SPONSORS}</b> (задаётся в коде: REF_MIN_SPONSORS)\n"
             f"🛰 Награда за задание Flyer: <b>{fmt(fr)}</b> ⭐\n"
             f"🌿 Награда за задание TGrass: <b>{fmt(gr)}</b> ⭐\n"
             f"📡 Trafsly: <b>{fmt(xr['trafsly'])}</b> ⭐ · PiarFlow: <b>{fmt(xr['piarflow'])}</b> ⭐ · "
             f"Traffy: <b>{fmt(xr['traffy'])}</b> ⭐")
     return text, kb([btn("💰 Награда за реферала", cb="a:set:ref_reward", style="primary")],
-                    [btn("🎯 Кол-во заданий", cb="a:set:ref_tasks", style="primary")],
                     [btn("🛰 Награда за Flyer-задание", cb="a:set:flyer_reward", style="success")],
                     [btn("🌿 Награда за TGrass-задание", cb="a:set:tgrass_reward", style="success")],
                     [btn("📡 Trafsly", cb="a:set:trafsly_reward", style="success"),
