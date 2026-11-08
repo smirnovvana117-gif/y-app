@@ -2415,3 +2415,58 @@ async def a_set_value(m: Message, state: FSMContext):
     await state.clear()
     text, markup = await settings_view()
     await m.answer("✅ Сохранено\n\n" + text, reply_markup=markup)
+
+
+# ============================== ВЕБ-ЧАСТЬ ДЛЯ VERCEL (FastAPI) ==============================
+# Vercel ищет в этом файле переменную app.
+from aiogram.types import Update
+from fastapi import FastAPI, HTTPException, Request
+
+app = FastAPI()
+
+dp = Dispatcher(storage=TursoStorage())
+dp.message.outer_middleware(BanMiddleware())
+dp.callback_query.outer_middleware(BanMiddleware())
+dp.include_router(admin)
+dp.include_router(user)
+
+
+def make_bot() -> Bot:
+    return Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+
+async def _with_bot(fn):
+    bot = make_bot()
+    try:
+        await ensure_ready(bot)
+        return await fn(bot)
+    finally:
+        await bot.session.close()
+        await http.close()
+
+
+@app.post("/api/webhook")
+async def tg_webhook(request: Request):
+    if WEBHOOK_SECRET and request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+        raise HTTPException(403)
+    data = await request.json()
+
+    async def go(bot):
+        await dp.feed_update(bot, Update.model_validate(data, context={"bot": bot}))
+
+    await _with_bot(go)
+    return {"ok": True}
+
+
+@app.get("/api/cron")
+async def tg_cron(request: Request):
+    if CRON_SECRET and request.headers.get("Authorization") != f"Bearer {CRON_SECRET}":
+        raise HTTPException(403)
+    return {"report": await _with_bot(check_unsubs)}
+
+
+@app.post("/api/hook/{provider}")
+async def tg_provider_hook(provider: str, request: Request):
+    payload = await request.json()
+    n = await _with_bot(lambda bot: handle_provider_hook(bot, provider, payload))
+    return {"penalized": n}
