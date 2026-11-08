@@ -1,13 +1,5 @@
 {
-  "rewrites": [
-    {
-      "source": "/api/:route*",
-      "destination": "/api/index?route=:route*"
-    }
   "crons": [
-    {
-      "path": "/api/cron",
-      "schedule": "0 6 * * *"
-    }
+    { "path": "/api/cron", "schedule": "*/5 * * * *" }
   ]
 }
